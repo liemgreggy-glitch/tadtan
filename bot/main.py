@@ -1,0 +1,18280 @@
+"""
+bot.main - Main bot class (EnhancedBot) and entry point helpers
+"""
+import asyncio
+import csv
+import json
+import logging
+import os
+import random
+import re
+import shutil
+import string
+import sys
+import tempfile
+import threading
+import time
+import traceback
+import uuid
+import zipfile
+from datetime import datetime, timedelta, timezone
+from io import BytesIO
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional, Tuple
+
+from core.config import Config
+from core.constants import BEIJING_TZ
+from core.database import Database
+from managers.proxy_manager import ProxyManager
+from managers.device_params import DeviceParamsManager
+from managers.profile_manager import ProfileManager
+from managers.file_processor import FileProcessor
+from testers.proxy_tester import ProxyTester, ProxyRotator
+from services.spambot_checker import SpamBotChecker
+from services.format_converter import FormatConverter
+from services.two_factor_manager import TwoFactorManager
+from services.api_converter import APIFormatConverter
+from services.forget_2fa_manager import Forget2FAManager
+from services.batch_creator import BatchCreatorService
+from detectors.password_detector import PasswordDetector
+from utils.helpers import generate_progress_bar, format_time, utc_to_beijing
+
+logger = logging.getLogger(__name__)
+
+try:
+    from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Bot, InputFile
+    from telegram.ext import Updater, CommandHandler, CallbackQueryHandler, MessageHandler, Filters, CallbackContext
+    from telegram.error import RetryAfter, TimedOut, NetworkError, BadRequest
+    TELEGRAM_AVAILABLE = True
+except ImportError:
+    TELEGRAM_AVAILABLE = False
+
+try:
+    from telethon import TelegramClient, functions, types
+    from telethon.errors import (
+        FloodWaitError, SessionPasswordNeededError, RPCError,
+        UserDeactivatedBanError, UserDeactivatedError, AuthKeyUnregisteredError,
+        PhoneNumberBannedError, UserBannedInChannelError,
+        PasswordHashInvalidError, PhoneCodeInvalidError, AuthRestartError,
+        UsernameOccupiedError, UsernameInvalidError, PeerFloodError
+    )
+    from telethon.tl.types import User, CodeSettings, InputPhoneContact
+    from telethon.tl.functions.messages import SendMessageRequest, GetHistoryRequest, GetPeerSettingsRequest
+    from telethon.tl.functions.account import GetPasswordRequest, GetAuthorizationsRequest
+    from telethon.tl.functions.auth import ResetAuthorizationsRequest, SendCodeRequest
+    from telethon.tl.functions.users import GetFullUserRequest
+    from telethon.tl.functions.contacts import ImportContactsRequest, DeleteContactsRequest
+    TELETHON_AVAILABLE = True
+except ImportError:
+    TELETHON_AVAILABLE = False
+    class PasswordHashInvalidError(Exception): pass
+    class PhoneCodeInvalidError(Exception): pass
+    class AuthRestartError(Exception): pass
+
+try:
+    from opentele.api import API, UseCurrentSession
+    from opentele.td import TDesktop
+    from opentele.tl import TelegramClient as OpenTeleClient
+    OPENTELE_AVAILABLE = True
+except ImportError:
+    OPENTELE_AVAILABLE = False
+    class TDesktop:
+        pass
+    class UseCurrentSession:
+        pass
+
+try:
+    from account_classifier import AccountClassifier
+    CLASSIFY_AVAILABLE = True
+except Exception:
+    CLASSIFY_AVAILABLE = False
+    AccountClassifier = None
+
+try:
+    import phonenumbers
+except ImportError:
+    phonenumbers = None
+
+try:
+    from i18n import get_text as t, set_user_language, get_user_language
+except ImportError:
+    def t(user_id, key, **kwargs): return key
+    def set_user_language(u, l): pass
+    def get_user_language(u): return 'zh'
+
+
+class EnhancedBot:
+    """增强版机器人"""
+    
+    # 网络错误关键词，用于判断异常是否是网络相关的
+    NETWORK_ERROR_KEYWORDS = ['connection', 'timeout', 'reset', 'refused', 'aborted', 'urllib3', 'httperror']
+    
+    # 冻结账户错误关键词，用于判断账户是否被冻结
+    FROZEN_KEYWORDS = [
+        'FROZEN', 
+        'DEACTIVATED', 
+        'BANNED', 
+        'USERDEACTIVATED',
+        'AUTHKEYUNREGISTERED',
+        'PHONENUMBERBANNED'
+    ]
+    
+    # 消息发送重试相关常量
+    MESSAGE_RETRY_MAX = 3       # 默认最大重试次数
+    MESSAGE_RETRY_BACKOFF = 2   # 指数退避基数
+    
+    # 资料修改进度更新相关常量
+    PROGRESS_UPDATE_INTERVAL = 2.0  # 最小刷新间隔（秒）
+    MAX_ERROR_DISPLAY_LENGTH = 30   # 错误消息最大显示长度
+    
+    def _is_network_error(self, error: Exception) -> bool:
+        """判断异常是否是网络相关的错误
+        
+        Args:
+            error: 要检查的异常
+            
+        Returns:
+            如果是网络相关错误返回 True，否则返回 False
+        """
+        error_str = str(error).lower()
+        return any(keyword in error_str for keyword in self.NETWORK_ERROR_KEYWORDS)
+    
+    def __init__(self):
+        print("🤖 初始化增强版机器人...")
+        
+        global config
+        config = Config()
+        if not config.validate():
+            print("❌ 配置验证失败")
+            sys.exit(1)
+        
+        self.db = Database(config.DB_NAME)
+        self.proxy_manager = ProxyManager(config.PROXY_FILE)
+        self.proxy_tester = ProxyTester(self.proxy_manager)
+        self.device_params_manager = DeviceParamsManager()  # 初始化设备参数管理器
+        self.checker = SpamBotChecker(self.proxy_manager)
+        self.processor = FileProcessor(self.checker, self.db)
+        self.converter = FormatConverter(self.db)
+        self.two_factor_manager = TwoFactorManager(self.proxy_manager, self.db)
+        self.profile_manager = ProfileManager(self.proxy_manager, self.db)  # 初始化资料管理器
+        import inspect
+        print("DEBUG APIFormatConverter source:", inspect.getsourcefile(APIFormatConverter))
+        print("DEBUG APIFormatConverter signature:", str(inspect.signature(APIFormatConverter)))
+        # 初始化 API 格式转换器（带兜底，兼容无参老版本）
+        try:
+            # 首选：带参构造（新版本）
+            self.api_converter = APIFormatConverter(self.db, base_url=config.BASE_URL)
+        except TypeError as e:
+            print(f"⚠️ APIFormatConverter 带参构造失败：{e}，切换到兼容模式（无参+手动注入）")
+            self.api_converter = APIFormatConverter()   # 老版本：无参
+            self.api_converter.db = self.db
+            self.api_converter.base_url = config.BASE_URL
+
+
+        # API转换待处理任务池：上传ZIP后先问网页展示的2FA，等待用户回复
+        self.pending_api_tasks: Dict[int, Dict[str, Any]] = {}
+
+        # 启动验证码接收服务器（Flask）
+        try:
+            self.api_converter.start_web_server()
+        except Exception as e:
+            print(f"⚠️ 验证码服务器启动失败: {e}")
+
+        # 初始化账号分类器
+        self.classifier = AccountClassifier() if CLASSIFY_AVAILABLE else None
+        self.pending_classify_tasks: Dict[int, Dict[str, Any]] = {}
+        
+        # 广播消息待处理任务
+        self.pending_broadcasts: Dict[int, Dict[str, Any]] = {}
+        
+        # 人工开通会员待处理任务
+        self.pending_manual_open: Dict[int, int] = {}
+        
+        # 文件重命名待处理任务
+        self.pending_rename: Dict[int, Dict[str, Any]] = {}
+        
+        # 账户合并待处理任务
+        self.pending_merge: Dict[int, Dict[str, Any]] = {}
+        
+        # 添加2FA待处理任务
+        self.pending_add_2fa_tasks: Dict[int, Dict[str, Any]] = {}
+        
+        # 一键清理待处理任务
+        self.pending_cleanup: Dict[int, Dict[str, Any]] = {}
+        
+        # 批量创建待处理任务
+        self.pending_batch_create: Dict[int, Dict[str, Any]] = {}
+        
+        # 重新授权待处理任务
+        self.pending_reauthorize: Dict[int, Dict[str, Any]] = {}
+        
+        # 查询注册时间任务跟踪
+        self.pending_registration_check: Dict[int, Dict[str, Any]] = {}
+        
+        # 资料修改待处理任务
+        self.pending_profile_update: Dict[int, Dict[str, Any]] = {}
+        
+        # 通讯录限制检测待处理任务
+        self.pending_contact_limit_check: Dict[int, Dict[str, Any]] = {}
+        
+        # 常量定义
+        self.MAX_DISPLAY_ITEMS = 20  # 配置预览最大显示条目数
+        self.ALERT_TEXT_MAX_LENGTH = 200  # 弹出提示最大文本长度
+        
+        # 初始化设备参数加载器
+        self.device_loader = DeviceParamsLoader()
+        
+        # 初始化批量创建服务
+        if config.ENABLE_BATCH_CREATE:
+            try:
+                self.batch_creator = BatchCreatorService(self.db, self.proxy_manager, self.device_loader, config)
+                print("✅ 批量创建服务初始化成功")
+            except Exception as e:
+                print(f"⚠️ 批量创建服务初始化失败: {e}")
+                self.batch_creator = None
+        else:
+            self.batch_creator = None
+
+        self.updater = Updater(config.TOKEN, use_context=True)
+        self.dp = self.updater.dispatcher
+        
+        self.setup_handlers()
+        
+        print("✅ 增强版机器人初始化完成")
+    
+    def get_status_translation_key(self, status: str) -> str:
+        """Map internal status to translation key
+        
+        Args:
+            status: Internal status name (Chinese)
+            
+        Returns:
+            Translation key for the status
+        """
+        status_map = {
+            "无限制": "status_no_restriction",
+            "垃圾邮件": "status_spambot",
+            "冻结": "status_frozen",
+            "封禁": "status_banned",
+            "连接错误": "status_connection_error",
+        }
+        return status_map.get(status, "status_no_restriction")
+    
+    def get_zip_name_translation_key(self, status: str) -> str:
+        """Map internal status to ZIP file name translation key
+        
+        Args:
+            status: Internal status name (Chinese)
+            
+        Returns:
+            Translation key for ZIP file naming
+        """
+        zip_map = {
+            "无限制": "zip_no_restriction",
+            "垃圾邮件": "zip_spambot",
+            "冻结": "zip_frozen",
+            "封禁": "zip_banned",
+            "连接错误": "zip_connection_error",
+        }
+        return zip_map.get(status, "zip_no_restriction")
+    
+    def get_file_desc_translation_key(self, status: str) -> str:
+        """Map internal status to file description translation key
+        
+        Args:
+            status: Internal status name (Chinese)
+            
+        Returns:
+            Translation key for file description
+        """
+        desc_map = {
+            "无限制": "file_desc_no_restriction",
+            "垃圾邮件": "file_desc_spambot",
+            "冻结": "file_desc_frozen",
+            "封禁": "file_desc_banned",
+            "连接错误": "file_desc_connection_error",
+        }
+        return desc_map.get(status, "file_desc_no_restriction")
+    
+    def get_translated_file_info(self, user_id: int, status: str, count: int) -> tuple:
+        """Get translated filename and caption for a status file
+        
+        Args:
+            user_id: User ID for language selection
+            status: Internal status name (Chinese)
+            count: Number of accounts
+            
+        Returns:
+            Tuple of (filename, caption_text, check_time_display, check_mode)
+        """
+        zip_name_key = self.get_zip_name_translation_key(status)
+        file_desc_key = self.get_file_desc_translation_key(status)
+        
+        zip_filename = f"{t(user_id, zip_name_key).format(count=count)}.zip"
+        file_caption_text = t(user_id, file_desc_key).format(count=count)
+        
+        actual_proxy_mode = self.proxy_manager.is_proxy_mode_active(self.db)
+        check_mode = t(user_id, 'check_mode_proxy') if actual_proxy_mode else t(user_id, 'check_mode_local')
+        check_time_display = datetime.now(BEIJING_TZ).strftime('%Y-%m-%d %H:%M:%S CST')
+        
+        return zip_filename, file_caption_text, check_time_display, check_mode
+    
+    def setup_handlers(self):
+        self.dp.add_handler(CommandHandler("start", self.start_command))
+        self.dp.add_handler(CommandHandler("help", self.help_command))
+        self.dp.add_handler(CommandHandler("addadmin", self.add_admin_command))
+        self.dp.add_handler(CommandHandler("removeadmin", self.remove_admin_command))
+        self.dp.add_handler(CommandHandler("listadmins", self.list_admins_command))
+        self.dp.add_handler(CommandHandler("payment_stats", self.payment_stats_command))
+        self.dp.add_handler(CommandHandler("proxy", self.proxy_command))
+        self.dp.add_handler(CommandHandler("testproxy", self.test_proxy_command))
+        self.dp.add_handler(CommandHandler("cleanproxy", self.clean_proxy_command))
+        self.dp.add_handler(CommandHandler("convert", self.convert_command))
+        # 新增：API格式转换命令
+        self.dp.add_handler(CommandHandler("api", self.api_command))
+        # 新增：账号分类命令
+        self.dp.add_handler(CommandHandler("classify", self.classify_command))
+        # 新增：返回主菜单（优先于通用回调）
+        self.dp.add_handler(CallbackQueryHandler(self.on_back_to_main, pattern=r"^back_to_main$"))
+        
+        # 专用：广播消息回调处理器（必须在通用回调之前注册）
+        self.dp.add_handler(CallbackQueryHandler(self.handle_broadcast_callbacks_router, pattern=r"^broadcast_"))
+
+        # 通用回调处理（需放在特定回调之后）
+        self.dp.add_handler(CallbackQueryHandler(self.handle_callbacks))
+        self.dp.add_handler(MessageHandler(Filters.document, self.handle_file))
+        # 新增：广播媒体上传处理
+        self.dp.add_handler(MessageHandler(Filters.photo, self.handle_photo))
+        self.dp.add_handler(MessageHandler(Filters.text & ~Filters.command, self.handle_text))
+    
+    def safe_send_message(self, update, text, parse_mode=None, reply_markup=None, max_retries=None):
+        """安全发送消息（带网络错误重试机制）
+        
+        Args:
+            update: Telegram update 对象
+            text: 要发送的消息文本
+            parse_mode: 解析模式（如 'HTML'）
+            reply_markup: 回复键盘标记
+            max_retries: 最大重试次数（默认使用 MESSAGE_RETRY_MAX）
+            
+        Returns:
+            发送的消息对象，失败时返回 None
+        """
+        if max_retries is None:
+            max_retries = self.MESSAGE_RETRY_MAX
+            
+        last_error = None
+        
+        for attempt in range(max_retries):
+            try:
+                # 检查 update.message 是否存在
+                if update.message:
+                    return update.message.reply_text(
+                        text=text,
+                        parse_mode=parse_mode,
+                        reply_markup=reply_markup
+                    )
+                # 如果 update.message 不存在（例如来自回调查询），使用 bot.send_message
+                elif update.effective_chat:
+                    return self.updater.bot.send_message(
+                        chat_id=update.effective_chat.id,
+                        text=text,
+                        parse_mode=parse_mode,
+                        reply_markup=reply_markup
+                    )
+                else:
+                    print("❌ 无法发送消息: update 对象缺少 message 和 effective_chat")
+                    return None
+                    
+            except RetryAfter as e:
+                print(f"⚠️ 频率限制，等待 {e.retry_after} 秒")
+                time.sleep(e.retry_after + 1)
+                last_error = e
+                continue
+                
+            except (NetworkError, TimedOut) as e:
+                # 网络错误，使用指数退避重试
+                last_error = e
+                if attempt < max_retries - 1:
+                    wait_time = self.MESSAGE_RETRY_BACKOFF ** attempt
+                    print(f"⚠️ 网络错误，{wait_time}秒后重试 ({attempt + 1}/{max_retries}): {e}")
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    print(f"❌ 发送消息失败（已重试{max_retries}次）: {e}")
+                    return None
+                    
+            except Exception as e:
+                # 检查是否是网络相关的错误（urllib3, ConnectionError等）
+                if self._is_network_error(e):
+                    last_error = e
+                    if attempt < max_retries - 1:
+                        wait_time = self.MESSAGE_RETRY_BACKOFF ** attempt
+                        print(f"⚠️ 连接错误，{wait_time}秒后重试 ({attempt + 1}/{max_retries}): {e}")
+                        time.sleep(wait_time)
+                        continue
+                    else:
+                        print(f"❌ 发送消息失败（已重试{max_retries}次）: {e}")
+                        return None
+                else:
+                    # 非网络错误，直接返回
+                    try:
+                        error_str = str(e) if str(e) else "(空错误消息)"
+                        error_msg = f"❌ 发送消息失败: {type(e).__name__}: {error_str}"
+                    except:
+                        error_msg = f"❌ 发送消息失败: {type(e).__name__} (无法获取错误详情)"
+                    print(error_msg, flush=True)
+                    import traceback
+                    import sys
+                    print(f"详细堆栈跟踪:", flush=True)
+                    traceback.print_exc()
+                    sys.stdout.flush()
+                    sys.stderr.flush()
+                    return None
+        
+        # 所有重试都失败
+        if last_error:
+            print(f"❌ 发送消息失败（已重试{max_retries}次）: {last_error}")
+        return None
+    
+    def safe_edit_message(self, query, text, parse_mode=None, reply_markup=None, max_retries=None):
+        """安全编辑消息（带网络错误重试机制）
+        
+        Args:
+            query: Telegram callback query 对象
+            text: 要编辑的消息文本
+            parse_mode: 解析模式（如 'HTML'）
+            reply_markup: 回复键盘标记
+            max_retries: 最大重试次数（默认使用 MESSAGE_RETRY_MAX）
+            
+        Returns:
+            编辑后的消息对象，失败时返回 None
+        """
+        if max_retries is None:
+            max_retries = self.MESSAGE_RETRY_MAX
+            
+        last_error = None
+        
+        for attempt in range(max_retries):
+            try:
+                return query.edit_message_text(
+                    text=text,
+                    parse_mode=parse_mode,
+                    reply_markup=reply_markup
+                )
+                
+            except RetryAfter as e:
+                print(f"⚠️ 频率限制，等待 {e.retry_after} 秒")
+                time.sleep(e.retry_after + 1)
+                last_error = e
+                continue
+                
+            except BadRequest as e:
+                if "message is not modified" in str(e).lower():
+                    return None
+                print(f"❌ 编辑消息失败: {e}")
+                return None
+                
+            except (NetworkError, TimedOut) as e:
+                # 网络错误，使用指数退避重试
+                last_error = e
+                if attempt < max_retries - 1:
+                    wait_time = self.MESSAGE_RETRY_BACKOFF ** attempt
+                    print(f"⚠️ 网络错误，{wait_time}秒后重试 ({attempt + 1}/{max_retries}): {e}")
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    print(f"❌ 编辑消息失败（已重试{max_retries}次）: {e}")
+                    return None
+                    
+            except Exception as e:
+                # 检查是否是网络相关的错误（urllib3, ConnectionError等）
+                if self._is_network_error(e):
+                    last_error = e
+                    if attempt < max_retries - 1:
+                        wait_time = self.MESSAGE_RETRY_BACKOFF ** attempt
+                        print(f"⚠️ 连接错误，{wait_time}秒后重试 ({attempt + 1}/{max_retries}): {e}")
+                        time.sleep(wait_time)
+                        continue
+                    else:
+                        print(f"❌ 编辑消息失败（已重试{max_retries}次）: {e}")
+                        return None
+                else:
+                    # 非网络错误，直接返回
+                    print(f"❌ 编辑消息失败: {e}")
+                    return None
+        
+        # 所有重试都失败
+        if last_error:
+            print(f"❌ 编辑消息失败（已重试{max_retries}次）: {last_error}")
+        return None
+    
+    def safe_edit_message_text(self, message, text, parse_mode=None, reply_markup=None, max_retries=None):
+        """安全编辑消息对象（带网络错误重试机制）
+        
+        Args:
+            message: Telegram message 对象
+            text: 要编辑的消息文本
+            parse_mode: 解析模式（如 'HTML'）
+            reply_markup: 回复键盘标记
+            max_retries: 最大重试次数（默认使用 MESSAGE_RETRY_MAX）
+            
+        Returns:
+            编辑后的消息对象，失败时返回 None
+        """
+        if not message:
+            return None
+            
+        if max_retries is None:
+            max_retries = self.MESSAGE_RETRY_MAX
+            
+        last_error = None
+        
+        for attempt in range(max_retries):
+            try:
+                return message.edit_text(
+                    text=text,
+                    parse_mode=parse_mode,
+                    reply_markup=reply_markup
+                )
+                
+            except RetryAfter as e:
+                print(f"⚠️ 频率限制，等待 {e.retry_after} 秒")
+                time.sleep(e.retry_after + 1)
+                last_error = e
+                continue
+                
+            except BadRequest as e:
+                if "message is not modified" in str(e).lower():
+                    return message
+                print(f"❌ 编辑消息失败: {e}")
+                return None
+                
+            except (NetworkError, TimedOut) as e:
+                # 网络错误，使用指数退避重试
+                last_error = e
+                if attempt < max_retries - 1:
+                    wait_time = self.MESSAGE_RETRY_BACKOFF ** attempt
+                    print(f"⚠️ 网络错误，{wait_time}秒后重试 ({attempt + 1}/{max_retries}): {e}")
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    print(f"❌ 编辑消息失败（已重试{max_retries}次）: {e}")
+                    return None
+                    
+            except Exception as e:
+                # 检查是否是网络相关的错误（urllib3, ConnectionError等）
+                if self._is_network_error(e):
+                    last_error = e
+                    if attempt < max_retries - 1:
+                        wait_time = self.MESSAGE_RETRY_BACKOFF ** attempt
+                        print(f"⚠️ 连接错误，{wait_time}秒后重试 ({attempt + 1}/{max_retries}): {e}")
+                        time.sleep(wait_time)
+                        continue
+                    else:
+                        print(f"❌ 编辑消息失败（已重试{max_retries}次）: {e}")
+                        return None
+                else:
+                    # 非网络错误，直接返回
+                    error_str = str(e) if str(e) else "(空错误消息)"
+                    print(f"❌ 编辑消息失败: {type(e).__name__}: {error_str}", flush=True)
+                    import traceback
+                    import sys
+                    print(f"详细堆栈跟踪:", flush=True)
+                    traceback.print_exc()
+                    sys.stdout.flush()
+                    sys.stderr.flush()
+                    return None
+        
+        # 所有重试都失败
+        if last_error:
+            print(f"❌ 编辑消息失败（已重试{max_retries}次）: {last_error}")
+        return None
+    
+    def sanitize_filename(self, filename: str) -> str:
+        """清理文件名，保留 Emoji 和括号
+        
+        只移除文件系统不允许的字符，保留所有Unicode字符包括Emoji。
+        
+        移除的字符（Windows和Unix文件系统不允许）:
+        - 反斜杠 (\)、正斜杠 (/)、冒号 (:)
+        - 星号 (*)、问号 (?)、引号 (")
+        - 小于号 (<)、大于号 (>)、竖线 (|)
+        
+        保留的字符:
+        - Emoji (如 🇮🇳, 🎉)
+        - 中文括号 （）
+        - 所有Unicode字符（中文、日文、俄文等）
+        - 加号 (+)、下划线 (_)、连字符 (-) 等
+        
+        示例:
+        - '🇮🇳 随机混合国家（有密码）' -> '🇮🇳 随机混合国家（有密码）'
+        - 'test/file:name' -> 'testfilename'
+        """
+        # 只移除文件系统不允许的字符
+        # Windows和Unix都不允许这些字符: \ / : * ? " < > |
+        invalid_chars = r'[\\/:*?"<>|]'
+        filename = re.sub(invalid_chars, '', filename)
+        
+        # 限制长度（保留扩展名空间）
+        max_length = 200
+        if len(filename) > max_length:
+            filename = filename[:max_length]
+        
+        # 去除首尾空格和点号
+        filename = filename.strip('. ')
+        
+        # 如果文件名为空，使用默认名
+        if not filename:
+            filename = 'unnamed_file'
+        
+        return filename
+    
+    def send_document_safely(self, chat_id: int, file_path: str, caption: str = None, filename: str = None) -> bool:
+        """安全发送文档，处理 RetryAfter 错误"""
+        max_retries = 3
+        retry_count = 0
+        
+        while retry_count < max_retries:
+            try:
+                with open(file_path, 'rb') as doc:
+                    self.updater.bot.send_document(
+                        chat_id=chat_id,
+                        document=doc,
+                        caption=caption,
+                        filename=filename,
+                        parse_mode='HTML'
+                    )
+                return True
+            except RetryAfter as e:
+                print(f"⚠️ 频率限制，等待 {e.retry_after} 秒")
+                time.sleep(e.retry_after + 1)
+                retry_count += 1
+            except Exception as e:
+                print(f"❌ 发送文档失败: {e}")
+                return False
+        
+        return False
+    
+    def create_status_count_separate_buttons(self, results: Dict[str, List], processed: int, total: int, user_id: int = None) -> InlineKeyboardMarkup:
+        """创建状态|数量分离按钮布局"""
+        buttons = []
+        
+        # Status names for results dictionary (internal keys, keep in Chinese for compatibility)
+        status_info = [
+            ("无限制", "🟢", len(results['无限制'])),
+            ("垃圾邮件", "🟡", len(results['垃圾邮件'])),
+            ("冻结", "🔴", len(results['冻结'])),
+            ("封禁", "🟠", len(results['封禁'])),
+            ("连接错误", "⚫", len(results['连接错误']))
+        ]
+        
+        # 每一行显示：状态名称 | 数量
+        for status, emoji, count in status_info:
+            # Translate status text for display if user_id is provided
+            if user_id:
+                status_key = self.get_status_translation_key(status)
+                status_display = t(user_id, status_key)
+            else:
+                status_display = status  # Fallback to Chinese if no user_id
+            
+            row = [
+                InlineKeyboardButton(f"{emoji} {status_display}", callback_data=f"status_{status}"),
+                InlineKeyboardButton(f"{count}", callback_data=f"count_{status}")
+            ]
+            buttons.append(row)
+        
+        return InlineKeyboardMarkup(buttons)
+    def start_command(self, update: Update, context: CallbackContext):
+        """处理 /start 命令"""
+        user_id = update.effective_user.id
+        username = update.effective_user.username or ""
+        first_name = update.effective_user.first_name or ""
+        
+        # 保存用户数据到数据库
+        self.db.save_user(user_id, username, first_name, "")
+        
+        self.show_main_menu(update, user_id)
+    
+    def show_main_menu(self, update: Update, user_id: int):
+        """显示主菜单（统一方法）"""
+        # 获取用户信息
+        if update.callback_query:
+            first_name = update.callback_query.from_user.first_name or t(user_id, 'default_user')
+        else:
+            first_name = update.effective_user.first_name or t(user_id, 'default_user')
+        
+        # 获取会员状态（使用 check_membership 方法）
+        is_member, level, expiry = self.db.check_membership(user_id)
+        
+        if self.db.is_admin(user_id):
+            member_status = t(user_id, 'status_admin')
+        elif is_member:
+            # 翻译会员等级
+            if level == "会员":
+                translated_level = t(user_id, 'member_level_member')
+            elif level == "管理员":
+                translated_level = t(user_id, 'member_level_admin')
+            else:
+                translated_level = level  # 保留其他未知等级
+            member_status = f"🎁 {translated_level}"
+        else:
+            member_status = t(user_id, 'status_no_member')
+        
+        # 翻译到期时间
+        if expiry == "永久有效":
+            expiry = t(user_id, 'expiry_permanent')
+        
+        # 构建翻译后的欢迎文本
+        proxy_mode_text = t(user_id, 'proxy_mode_enabled') if self.proxy_manager.is_proxy_mode_active(self.db) else t(user_id, 'proxy_mode_local')
+        proxy_count_text = t(user_id, 'proxy_count_value').format(count=len(self.proxy_manager.proxies))
+        
+        welcome_text = f"""
+<b>{t(user_id, 'bot_title')}</b>
+
+👤 <b>{t(user_id, 'user_info')}</b>
+• {t(user_id, 'user_nickname')}: {first_name}
+• {t(user_id, 'user_id')}: <code>{user_id}</code>
+• {t(user_id, 'user_membership')}: {member_status}
+• {t(user_id, 'user_expiry')}: {expiry}
+• {t(user_id, 'current_time')}: {datetime.now(BEIJING_TZ).strftime('%Y-%m-%d %H:%M:%S CST')}
+        """
+        
+        
+
+        # 创建横排2x2布局的主菜单按钮（在原有两行后新增一行"🔗 API转换"）
+        buttons = [
+            [
+                InlineKeyboardButton(t(user_id, 'btn_account_check'), callback_data="start_check"),
+                InlineKeyboardButton(t(user_id, 'btn_format_conversion'), callback_data="format_conversion")
+            ],
+            [
+                InlineKeyboardButton(t(user_id, 'btn_change_2fa'), callback_data="change_2fa"),
+                InlineKeyboardButton(t(user_id, 'btn_batch_create'), callback_data="batch_create_start")
+            ],
+            [
+                InlineKeyboardButton(t(user_id, 'btn_forget_2fa'), callback_data="forget_2fa"),
+                InlineKeyboardButton(t(user_id, 'btn_remove_2fa'), callback_data="remove_2fa")
+            ],
+            [
+                InlineKeyboardButton(t(user_id, 'btn_add_2fa'), callback_data="add_2fa"),
+                InlineKeyboardButton(t(user_id, 'btn_classify_menu'), callback_data="classify_menu")
+            ],
+            [
+                InlineKeyboardButton(t(user_id, 'btn_api_conversion'), callback_data="api_conversion"),
+                InlineKeyboardButton(t(user_id, 'btn_rename_file'), callback_data="rename_start")
+            ],
+            [
+                InlineKeyboardButton(t(user_id, 'btn_merge_account'), callback_data="merge_start"),
+                InlineKeyboardButton(t(user_id, 'btn_cleanup'), callback_data="cleanup_start")
+            ],
+            [
+                InlineKeyboardButton(t(user_id, 'btn_reauthorize'), callback_data="reauthorize_start"),
+                InlineKeyboardButton(t(user_id, 'btn_check_registration'), callback_data="check_registration_start")
+            ],
+            [
+                InlineKeyboardButton(t(user_id, 'btn_profile_update'), callback_data="profile_update_start"),
+                InlineKeyboardButton(t(user_id, 'btn_check_contact_limit'), callback_data="check_contact_limit")
+            ],
+            [
+                InlineKeyboardButton(t(user_id, 'btn_vip_menu'), callback_data="vip_menu")
+            ]
+        ]
+
+
+        # 管理员按钮
+        if self.db.is_admin(user_id):
+            buttons.append([
+                InlineKeyboardButton(t(user_id, 'btn_admin_panel'), callback_data="admin_panel"),
+                InlineKeyboardButton(t(user_id, 'btn_proxy_panel'), callback_data="proxy_panel")
+            ])
+
+        # 语言切换按钮（改为打开语言选择菜单）
+        if I18N_AVAILABLE:
+            buttons.append([
+                InlineKeyboardButton(t(user_id, 'btn_language_menu'), callback_data="language_menu")
+            ])
+
+
+        
+        keyboard = InlineKeyboardMarkup(buttons)
+        
+        # 判断是编辑消息还是发送新消息
+        if update.callback_query:
+            update.callback_query.answer()
+            try:
+                update.callback_query.edit_message_text(
+                    text=welcome_text,
+                    reply_markup=keyboard,
+                    parse_mode='HTML'
+                )
+            except Exception as e:
+                print(f"⚠️ 编辑消息失败: {e}")
+        else:
+            self.safe_send_message(update, welcome_text, 'HTML', keyboard)
+    
+    def show_language_menu(self, update: Update, user_id: int):
+        """显示语言选择菜单"""
+        query = update.callback_query
+        if query:
+            query.answer()
+        
+        # 构建语言选择菜单
+        menu_text = t(user_id, 'language_menu_title')
+        
+        buttons = [
+            [InlineKeyboardButton(t(user_id, 'language_chinese'), callback_data="set_language_zh")],
+            [InlineKeyboardButton(t(user_id, 'language_english'), callback_data="set_language_en")],
+            [InlineKeyboardButton(t(user_id, 'language_russian'), callback_data="set_language_ru")],
+            [InlineKeyboardButton(t(user_id, 'btn_back_to_menu'), callback_data="back_to_main")]
+        ]
+        
+        keyboard = InlineKeyboardMarkup(buttons)
+        
+        try:
+            query.edit_message_text(
+                text=menu_text,
+                reply_markup=keyboard,
+                parse_mode='HTML'
+            )
+        except Exception as e:
+            print(f"⚠️ 编辑语言菜单失败: {e}")
+    
+    def api_command(self, update: Update, context: CallbackContext):
+        """API格式转换命令"""
+        user_id = update.effective_user.id
+
+        # 权限检查
+        is_member, level, _ = self.db.check_membership(user_id)
+        if not is_member and not self.db.is_admin(user_id):
+            self.safe_send_message(update, "❌ 需要会员权限才能使用API转换功能")
+            return
+
+        if not 'FLASK_AVAILABLE' in globals() or not FLASK_AVAILABLE:
+            self.safe_send_message(update, "❌ API转换功能不可用\n\n原因: Flask库未安装\n💡 请安装: pip install flask jinja2")
+            return
+
+        text = f"""
+{t(user_id, 'api_title')}
+
+<b>{t(user_id, 'api_core_features')}</b>
+{t(user_id, 'api_feature1')}
+{t(user_id, 'api_feature2')}
+{t(user_id, 'api_feature3')}
+{t(user_id, 'api_feature4')}
+
+<b>{t(user_id, 'api_verification_features')}</b>
+{t(user_id, 'api_verify_feature1')}
+{t(user_id, 'api_verify_feature2')}
+{t(user_id, 'api_verify_feature3')}
+{t(user_id, 'api_verify_feature4')}
+
+<b>{t(user_id, 'api_usage')}</b>
+{t(user_id, 'api_usage_step1')}
+{t(user_id, 'api_usage_step2')}
+{t(user_id, 'api_usage_step3')}
+{t(user_id, 'api_usage_step4')}
+
+{t(user_id, 'api_upload_prompt')}
+        """
+
+        buttons = [
+            [InlineKeyboardButton(t(user_id, 'btn_back_to_menu'), callback_data="back_to_main")]
+        ]
+
+        keyboard = InlineKeyboardMarkup(buttons)
+        self.safe_send_message(update, text, 'HTML', keyboard)
+
+        # 设置用户状态
+        self.db.save_user(
+            user_id,
+            update.effective_user.username or "",
+            update.effective_user.first_name or "",
+            "waiting_api_file"
+        ) 
+
+    def handle_api_conversion(self, query):
+        """处理API转换选项"""
+        query.answer()
+        user_id = query.from_user.id
+
+        # 权限检查
+        is_member, level, _ = self.db.check_membership(user_id)
+        if not is_member and not self.db.is_admin(user_id):
+            self.safe_edit_message(query, "❌ 需要会员权限才能使用API转换功能")
+            return
+
+        if not 'FLASK_AVAILABLE' in globals() or not FLASK_AVAILABLE:
+            self.safe_edit_message(query, "❌ API转换功能不可用\n\n原因: Flask库未安装\n💡 请安装: pip install flask jinja2")
+            return
+
+        text = f"""
+{t(user_id, 'api_title')}
+
+<b>{t(user_id, 'api_core_features')}</b>
+{t(user_id, 'api_feature1')}
+{t(user_id, 'api_feature2')}
+{t(user_id, 'api_feature3')}
+{t(user_id, 'api_feature4')}
+
+<b>{t(user_id, 'api_verification_features')}</b>
+{t(user_id, 'api_verify_feature1')}
+{t(user_id, 'api_verify_feature2')}
+{t(user_id, 'api_verify_feature3')}
+{t(user_id, 'api_verify_feature4')}
+
+<b>{t(user_id, 'api_usage')}</b>
+{t(user_id, 'api_usage_step1')}
+{t(user_id, 'api_usage_step2')}
+{t(user_id, 'api_usage_step3')}
+{t(user_id, 'api_usage_step4')}
+
+{t(user_id, 'api_upload_prompt')}
+        """
+
+        self.safe_edit_message(query, text, 'HTML', reply_markup=get_back_to_menu_keyboard(user_id))
+
+        # 设置用户状态
+        self.db.save_user(
+            user_id,
+            query.from_user.username or "",
+            query.from_user.first_name or "",
+            "waiting_api_file"
+        )        
+    def help_command(self, update: Update, context: CallbackContext):
+        """处理 /help 命令和帮助按钮"""
+        user_id = update.effective_user.id
+        
+        help_text = """
+📖 <b>使用帮助</b>
+
+<b>🚀 主要功能</b>
+• 代理连接模式自动检测账号状态
+• 实时进度显示和自动文件发送
+• 支持Session和TData格式
+• Tdata与Session格式互转
+
+<b>📁 支持格式</b>
+• Session文件 (.session)
+• Session+JSON文件 (.session + .json)
+• TData文件夹
+• ZIP压缩包
+
+<b>🔄 格式转换</b>
+• Tdata → Session: 转换为Session格式
+• Session → Tdata: 转换为Tdata格式
+• 批量并发处理，提高效率
+
+<b>📡 代理功能</b>
+• 自动读取proxy.txt文件
+• 支持HTTP/SOCKS4/SOCKS5代理
+• 代理失败自动切换到本地连接
+
+<b>📋 使用流程</b>
+1. 准备proxy.txt文件（可选）
+2. 点击"🚀 开始检测"或"🔄 格式转换"
+3. 上传ZIP文件
+4. 观看实时进度
+5. 自动接收分类文件
+        """
+        
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton(f"🔙 {t(user_id, 'btn_back_to_menu')}", callback_data="back_to_main")]
+        ])
+        
+        if update.callback_query:
+            update.callback_query.answer()
+            update.callback_query.edit_message_text(
+                text=help_text,
+                reply_markup=keyboard,
+                parse_mode='HTML'
+            )
+        else:
+            update.message.reply_text(
+                text=help_text,
+                reply_markup=keyboard,
+                parse_mode='HTML'
+            )
+        if self.db.is_admin(user_id):
+            help_text += f"""
+
+<b>👑 管理员命令</b>
+• /addadmin [ID/用户名] - 添加管理员
+• /removeadmin [ID] - 移除管理员
+• /listadmins - 查看管理员列表
+• /proxy - 代理状态管理
+• /testproxy - 测试代理连接性能
+• /cleanproxy - 清理失效代理（自动优化）
+• /convert - 格式转换功能
+
+<b>⚡ 速度优化功能</b>
+• 快速模式: {config.PROXY_FAST_MODE}
+• 并发检测: {config.PROXY_CHECK_CONCURRENT} 个
+• 智能重试: {config.PROXY_RETRY_COUNT} 次
+• 自动清理: {config.PROXY_AUTO_CLEANUP}
+            """
+        
+        self.safe_send_message(update, help_text, 'HTML')
+    
+    def add_admin_command(self, update: Update, context: CallbackContext):
+        """添加管理员命令"""
+        user_id = update.effective_user.id
+        
+        if not self.db.is_admin(user_id):
+            self.safe_send_message(update, "❌ 仅管理员可以使用此命令")
+            return
+        
+        if not context.args:
+            self.safe_send_message(update, 
+                "📝 使用方法:\n"
+                "/addadmin [用户ID]\n"
+                "/addadmin [用户名]\n\n"
+                "示例:\n"
+                "/addadmin 123456789\n"
+                "/addadmin @username"
+            )
+            return
+        
+        target = context.args[0].strip()
+        
+        # 尝试解析为用户ID
+        try:
+            target_user_id = int(target)
+            target_username = "未知"
+            target_first_name = "未知"
+        except ValueError:
+            # 尝试按用户名查找
+            target = target.replace("@", "")
+            user_info = self.db.get_user_by_username(target)
+            if not user_info:
+                self.safe_send_message(update, f"❌ 找不到用户名 @{target}\n请确保用户已使用过机器人")
+                return
+            
+            target_user_id, target_username, target_first_name = user_info
+        
+        # 检查是否已经是管理员
+        if self.db.is_admin(target_user_id):
+            self.safe_send_message(update, f"⚠️ 用户 {target_user_id} 已经是管理员")
+            return
+        
+        # 添加管理员
+        if self.db.add_admin(target_user_id, target_username, target_first_name, user_id):
+            self.safe_send_message(update, 
+                f"✅ 成功添加管理员\n\n"
+                f"👤 用户ID: {target_user_id}\n"
+                f"📝 用户名: @{target_username}\n"
+                f"🏷️ 昵称: {target_first_name}\n"
+                f"⏰ 添加时间: {datetime.now(BEIJING_TZ).strftime('%Y-%m-%d %H:%M:%S CST')}"
+            )
+        else:
+            self.safe_send_message(update, "❌ 添加管理员失败")
+    
+    def remove_admin_command(self, update: Update, context: CallbackContext):
+        """移除管理员命令"""
+        user_id = update.effective_user.id
+        
+        if not self.db.is_admin(user_id):
+            self.safe_send_message(update, "❌ 仅管理员可以使用此命令")
+            return
+        
+        if not context.args:
+            self.safe_send_message(update, 
+                "📝 使用方法:\n"
+                "/removeadmin [用户ID]\n\n"
+                "示例:\n"
+                "/removeadmin 123456789"
+            )
+            return
+        
+        try:
+            target_user_id = int(context.args[0])
+        except ValueError:
+            self.safe_send_message(update, "❌ 请提供有效的用户ID")
+            return
+        
+        # 不能移除配置文件中的管理员
+        if target_user_id in config.ADMIN_IDS:
+            self.safe_send_message(update, "❌ 无法移除配置文件中的管理员")
+            return
+        
+        # 不能移除自己
+        if target_user_id == user_id:
+            self.safe_send_message(update, "❌ 无法移除自己的管理员权限")
+            return
+        
+        if not self.db.is_admin(target_user_id):
+            self.safe_send_message(update, f"⚠️ 用户 {target_user_id} 不是管理员")
+            return
+        
+        if self.db.remove_admin(target_user_id):
+            self.safe_send_message(update, f"✅ 已移除管理员: {target_user_id}")
+        else:
+            self.safe_send_message(update, "❌ 移除管理员失败")
+    
+    def list_admins_command(self, update: Update, context: CallbackContext):
+        """查看管理员列表命令"""
+        user_id = update.effective_user.id
+        
+        if not self.db.is_admin(user_id):
+            self.safe_send_message(update, "❌ 仅管理员可以使用此命令")
+            return
+        
+        admins = self.db.get_all_admins()
+        
+        if not admins:
+            self.safe_send_message(update, "📝 暂无管理员")
+            return
+        
+        admin_text = "<b>👑 管理员列表</b>\n\n"
+        
+        for i, (admin_id, username, first_name, added_time) in enumerate(admins, 1):
+            admin_text += f"<b>{i}.</b> "
+            if admin_id in config.ADMIN_IDS:
+                admin_text += f"👑 <code>{admin_id}</code> (超级管理员)\n"
+            else:
+                admin_text += f"🔧 <code>{admin_id}</code>\n"
+            
+            if username and username != "配置文件管理员":
+                admin_text += f"   📝 @{username}\n"
+            if first_name and first_name != "":
+                admin_text += f"   🏷️ {first_name}\n"
+            if added_time != "系统内置":
+                admin_text += f"   ⏰ {added_time}\n"
+            admin_text += "\n"
+        
+        admin_text += f"<b>📊 总计: {len(admins)} 个管理员</b>"
+        
+        self.safe_send_message(update, admin_text, 'HTML')
+    
+    def proxy_command(self, update: Update, context: CallbackContext):
+        """代理管理命令"""
+        user_id = update.effective_user.id
+        
+        if not self.db.is_admin(user_id):
+            self.safe_send_message(update, "❌ 仅管理员可以使用此命令")
+            return
+        
+        # 获取当前代理状态
+        proxy_enabled_db = self.db.get_proxy_enabled()
+        proxy_mode_active = self.proxy_manager.is_proxy_mode_active(self.db)
+        
+        # 统计住宅代理数量
+        residential_count = sum(1 for p in self.proxy_manager.proxies if p.get('is_residential', False))
+        
+        proxy_text = f"""
+<b>📡 代理管理面板</b>
+
+<b>📊 当前状态</b>
+• 系统配置: {'🟢USE_PROXY=true' if config.USE_PROXY else '🔴USE_PROXY=false'}
+• 代理开关: {'🟢已启用' if proxy_enabled_db else '🔴已禁用'}
+• 代理文件: {config.PROXY_FILE}
+• 可用代理: {len(self.proxy_manager.proxies)}个
+• 住宅代理: {residential_count}个
+• 普通超时: {config.PROXY_TIMEOUT}秒
+• 住宅超时: {config.RESIDENTIAL_PROXY_TIMEOUT}秒
+• 实际模式: {'🟢代理模式' if proxy_mode_active else '🔴本地模式'}
+
+<b>📝 代理格式支持</b>
+• HTTP: ip:port
+• HTTP认证: ip:port:username:password  
+• SOCKS5: socks5:ip:port:username:password
+• SOCKS4: socks4:ip:port
+• ABCProxy住宅代理: host.abcproxy.vip:port:username:password
+        """
+        
+        # 创建交互按钮
+        buttons = []
+        
+        # 代理开关控制按钮
+        if proxy_enabled_db:
+            buttons.append([InlineKeyboardButton("🔴 关闭代理", callback_data="proxy_disable")])
+        else:
+            buttons.append([InlineKeyboardButton("🟢 开启代理", callback_data="proxy_enable")])
+        
+        # 其他操作按钮
+        buttons.extend([
+            [
+                InlineKeyboardButton("🔄 刷新代理列表", callback_data="proxy_reload"),
+                InlineKeyboardButton("📊 查看代理状态", callback_data="proxy_status")
+            ],
+            [
+                InlineKeyboardButton("🧪 测试代理", callback_data="proxy_test"),
+                InlineKeyboardButton("📈 代理统计", callback_data="proxy_stats")
+            ],
+            [InlineKeyboardButton("🔙 返回管理面板", callback_data="admin_panel")]
+        ])
+        
+        keyboard = InlineKeyboardMarkup(buttons)
+        
+        if context.args:
+            if context.args[0] == "reload":
+                self.proxy_manager.load_proxies()
+                self.safe_send_message(update, f"✅ 已重新加载代理文件\n📡 新代理数量: {len(self.proxy_manager.proxies)}个")
+                return
+            elif context.args[0] == "status":
+                self.show_proxy_detailed_status(update)
+                return
+        
+        self.safe_send_message(update, proxy_text, 'HTML', keyboard)
+    
+    def show_proxy_detailed_status(self, update: Update):
+        """显示代理详细状态"""
+        if self.proxy_manager.proxies:
+            status_text = "<b>📡 代理详细状态</b>\n\n"
+            # 隐藏代理详细地址，只显示数量和类型
+            proxy_count = len(self.proxy_manager.proxies)
+            proxy_types = {}
+            for proxy in self.proxy_manager.proxies:
+                ptype = proxy.get('type', 'http')
+                proxy_types[ptype] = proxy_types.get(ptype, 0) + 1
+            
+            status_text += f"📊 已加载 {proxy_count} 个代理\n\n"
+            for ptype, count in proxy_types.items():
+                status_text += f"• {ptype.upper()}: {count}个\n"
+            
+            # 添加代理设置信息
+            enabled, updated_time, updated_by = self.db.get_proxy_setting_info()
+            status_text += f"\n<b>📊 代理开关状态</b>\n"
+            status_text += f"• 当前状态: {'🟢启用' if enabled else '🔴禁用'}\n"
+            status_text += f"• 更新时间: {updated_time}\n"
+            if updated_by:
+                status_text += f"• 操作人员: {updated_by}\n"
+            
+            self.safe_send_message(update, status_text, 'HTML')
+        else:
+            self.safe_send_message(update, "❌ 没有可用的代理")
+    
+    def test_proxy_command(self, update: Update, context: CallbackContext):
+        """测试代理命令"""
+        user_id = update.effective_user.id
+        
+        if not self.db.is_admin(user_id):
+            self.safe_send_message(update, "❌ 仅管理员可以使用此命令")
+            return
+        
+        if not self.proxy_manager.proxies:
+            self.safe_send_message(update, "❌ 没有可用的代理进行测试")
+            return
+        
+        # 异步处理代理测试
+        def process_test():
+            asyncio.run(self.process_proxy_test(update, context))
+        
+        thread = threading.Thread(target=process_test)
+        thread.start()
+        
+        self.safe_send_message(
+            update, 
+            f"🧪 开始测试 {len(self.proxy_manager.proxies)} 个代理...\n"
+            f"⚡ 快速模式: {'开启' if config.PROXY_FAST_MODE else '关闭'}\n"
+            f"🚀 并发数: {config.PROXY_CHECK_CONCURRENT}\n\n"
+            "请稍等，测试结果将自动发送..."
+        )
+    
+    async def process_proxy_test(self, update, context):
+        """处理代理测试"""
+        try:
+            # 发送进度消息
+            progress_msg = self.safe_send_message(
+                update,
+                "🧪 <b>代理测试中...</b>\n\n📊 正在初始化测试环境...",
+                'HTML'
+            )
+            
+            # 进度回调函数
+            async def test_progress_callback(tested, total, stats):
+                try:
+                    progress = int(tested / total * 100)
+                    elapsed = time.time() - stats['start_time']
+                    speed = tested / elapsed if elapsed > 0 else 0
+                    
+                    progress_text = f"""
+🧪 <b>代理测试进行中...</b>
+
+📊 <b>测试进度</b>
+• 进度: {progress}% ({tested}/{total})
+• 速度: {speed:.1f} 代理/秒
+• 可用: {stats['working']} 个
+• 失效: {stats['failed']} 个
+• 平均响应: {stats['avg_response_time']:.2f}s
+
+⏱️ 已耗时: {elapsed:.1f} 秒
+                    """
+                    
+                    if progress_msg:
+                        try:
+                            progress_msg.edit_text(progress_text, parse_mode='HTML')
+                        except:
+                            pass
+                except:
+                    pass
+            
+            # 执行测试
+            working_proxies, failed_proxies, stats = await self.proxy_tester.test_all_proxies(test_progress_callback)
+            
+            # 显示最终结果
+            total_time = time.time() - stats['start_time']
+            test_speed = stats['total'] / total_time if total_time > 0 else 0
+            
+            final_text = f"""
+✅ <b>代理测试完成！</b>
+
+📊 <b>测试结果</b>
+• 总计代理: {stats['total']} 个
+• 🟢 可用代理: {stats['working']} 个 ({stats['working']/stats['total']*100:.1f}%)
+• 🔴 失效代理: {stats['failed']} 个 ({stats['failed']/stats['total']*100:.1f}%)
+• 📈 平均响应: {stats['avg_response_time']:.2f} 秒
+• ⚡ 测试速度: {test_speed:.1f} 代理/秒
+• ⏱️ 总耗时: {total_time:.1f} 秒
+
+💡 使用 /cleanproxy 命令可自动清理失效代理
+            """
+            
+            if progress_msg:
+                try:
+                    progress_msg.edit_text(final_text, parse_mode='HTML')
+                except:
+                    pass
+            
+        except Exception as e:
+            self.safe_send_message(update, f"❌ 代理测试失败: {e}")
+    
+    def clean_proxy_command(self, update: Update, context: CallbackContext):
+        """清理代理命令"""
+        user_id = update.effective_user.id
+        
+        if not self.db.is_admin(user_id):
+            self.safe_send_message(update, "❌ 仅管理员可以使用此命令")
+            return
+        
+        if not self.proxy_manager.proxies:
+            self.safe_send_message(update, "❌ 没有可用的代理进行清理")
+            return
+        
+        # 检查是否有确认参数
+        auto_confirm = len(context.args) > 0 and context.args[0].lower() in ['yes', 'y', 'confirm']
+        
+        if not auto_confirm:
+            # 显示确认界面
+            confirm_text = f"""
+⚠️ <b>代理清理确认</b>
+
+📊 <b>当前状态</b>
+• 代理文件: {config.PROXY_FILE}
+• 代理数量: {len(self.proxy_manager.proxies)} 个
+• 自动清理: {'启用' if config.PROXY_AUTO_CLEANUP else '禁用'}
+
+🔧 <b>清理操作</b>
+• 备份原始代理文件
+• 测试所有代理连接性
+• 自动删除失效代理
+• 更新代理文件为可用代理
+• 生成详细分类报告
+
+⚠️ <b>注意事项</b>
+• 此操作将修改代理文件
+• 失效代理将被自动删除
+• 原始文件会自动备份
+
+确认执行清理吗？
+            """
+            
+            buttons = [
+                [
+                    InlineKeyboardButton("✅ 确认清理", callback_data="confirm_proxy_cleanup"),
+                    InlineKeyboardButton("❌ 取消", callback_data="cancel_proxy_cleanup")
+                ],
+                [InlineKeyboardButton("🧪 仅测试不清理", callback_data="test_only_proxy")]
+            ]
+            
+            keyboard = InlineKeyboardMarkup(buttons)
+            self.safe_send_message(update, confirm_text, 'HTML', keyboard)
+        else:
+            # 直接执行清理
+            self._execute_proxy_cleanup(update, context, True)
+    
+    def _execute_proxy_cleanup(self, update, context, confirmed: bool):
+        """执行代理清理"""
+        if not confirmed:
+            self.safe_send_message(update, "❌ 代理清理已取消")
+            return
+        
+        # 异步处理代理清理
+        def process_cleanup():
+            asyncio.run(self.process_proxy_cleanup(update, context))
+        
+        thread = threading.Thread(target=process_cleanup)
+        thread.start()
+        
+        self.safe_send_message(
+            update, 
+            f"🧹 开始清理 {len(self.proxy_manager.proxies)} 个代理...\n"
+            f"⚡ 快速模式: {'开启' if config.PROXY_FAST_MODE else '关闭'}\n"
+            f"🚀 并发数: {config.PROXY_CHECK_CONCURRENT}\n\n"
+            "请稍等，清理过程可能需要几分钟..."
+        )
+    
+    async def process_proxy_cleanup(self, update, context):
+        """处理代理清理过程"""
+        try:
+            # 发送进度消息
+            progress_msg = self.safe_send_message(
+                update,
+                "🧹 <b>代理清理中...</b>\n\n📊 正在备份原始文件...",
+                'HTML'
+            )
+            
+            # 执行清理
+            success, result_msg = await self.proxy_tester.cleanup_and_update_proxies(auto_confirm=True)
+            
+            if success:
+                # 显示成功结果
+                if progress_msg:
+                    try:
+                        progress_msg.edit_text(
+                            f"🎉 <b>代理清理成功！</b>\n\n{result_msg}",
+                            parse_mode='HTML'
+                        )
+                    except:
+                        pass
+                
+                # 发送额外的总结信息
+                summary_text = f"""
+📈 <b>优化效果预估</b>
+
+⚡ <b>速度提升</b>
+• 清理前代理数: {len(self.proxy_manager.proxies)} 个（包含失效）
+• 清理后代理数: {len([p for p in self.proxy_manager.proxies])} 个可用代理
+• 预计检测速度提升: 2-5倍
+
+🎯 <b>建议</b>
+• 定期运行 /testproxy 检查代理状态
+• 使用 /cleanproxy 定期清理失效代理
+• 在 .env 中调整 PROXY_CHECK_CONCURRENT 优化并发数
+
+💡 现在可以开始使用优化后的代理进行账号检测了！
+                """
+                
+                self.safe_send_message(update, summary_text, 'HTML')
+            else:
+                # 显示失败结果
+                if progress_msg:
+                    try:
+                        progress_msg.edit_text(
+                            f"❌ <b>代理清理失败</b>\n\n{result_msg}",
+                            parse_mode='HTML'
+                        )
+                    except:
+                        pass
+                
+        except Exception as e:
+            self.safe_send_message(update, f"❌ 代理清理过程失败: {e}")
+    
+    def convert_command(self, update: Update, context: CallbackContext):
+        """格式转换命令"""
+        user_id = update.effective_user.id
+        
+        # 检查权限
+        is_member, level, _ = self.db.check_membership(user_id)
+        if not is_member and not self.db.is_admin(user_id):
+            self.safe_send_message(update, "❌ 需要会员权限才能使用格式转换功能")
+            return
+        
+        if not OPENTELE_AVAILABLE:
+            self.safe_send_message(update, "❌ 格式转换功能不可用\n\n原因: opentele库未安装\n💡 请安装: pip install opentele")
+            return
+        
+        text = f"""
+<b>{t(user_id, 'format_conversion_title')}</b>
+
+<b>{t(user_id, 'format_conversion_supported')}</b>
+<b>{t(user_id, 'format_conversion_tdata_to_session')}</b>
+   {t(user_id, 'format_conversion_tdata_to_session_desc1')}
+   {t(user_id, 'format_conversion_tdata_to_session_desc2')}
+
+<b>{t(user_id, 'format_conversion_session_to_tdata')}</b>
+   {t(user_id, 'format_conversion_session_to_tdata_desc1')}
+   {t(user_id, 'format_conversion_session_to_tdata_desc2')}
+
+<b>{t(user_id, 'format_conversion_features')}</b>
+{t(user_id, 'format_conversion_feature_batch')}
+{t(user_id, 'format_conversion_feature_progress')}
+{t(user_id, 'format_conversion_feature_classify')}
+{t(user_id, 'format_conversion_feature_error')}
+
+<b>{t(user_id, 'format_conversion_instructions')}</b>
+{t(user_id, 'format_conversion_select_type')}
+        """
+        
+        buttons = [
+            [InlineKeyboardButton(f"📤 {t(user_id, 'format_conversion_tdata_to_session')}", callback_data="convert_tdata_to_session")],
+            [InlineKeyboardButton(f"📥 {t(user_id, 'format_conversion_session_to_tdata')}", callback_data="convert_session_to_tdata")],
+            [InlineKeyboardButton(t(user_id, 'btn_back_to_menu'), callback_data="back_to_main")]
+        ]
+        
+        keyboard = InlineKeyboardMarkup(buttons)
+        self.safe_send_message(update, text, 'HTML', keyboard)
+    
+    def handle_proxy_callbacks(self, query, data):
+        """处理代理相关回调"""
+        user_id = query.from_user.id
+        
+        if not self.db.is_admin(user_id):
+            query.answer("❌ 仅管理员可以操作")
+            return
+        
+        if data == "proxy_enable":
+            # 启用代理
+            if self.db.set_proxy_enabled(True, user_id):
+                query.answer("✅ 代理已启用")
+                self.refresh_proxy_panel(query)
+            else:
+                query.answer("❌ 启用失败")
+        
+        elif data == "proxy_disable":
+            # 禁用代理
+            if self.db.set_proxy_enabled(False, user_id):
+                query.answer("✅ 代理已禁用")
+                self.refresh_proxy_panel(query)
+            else:
+                query.answer("❌ 禁用失败")
+        
+        elif data == "proxy_reload":
+            # 重新加载代理列表
+            old_count = len(self.proxy_manager.proxies)
+            self.proxy_manager.load_proxies()
+            new_count = len(self.proxy_manager.proxies)
+            
+            query.answer(f"✅ 重新加载完成: {old_count}→{new_count}个代理")
+            self.refresh_proxy_panel(query)
+        
+        elif data == "proxy_status":
+            # 查看详细状态
+            self.show_proxy_status_popup(query)
+        
+        elif data == "proxy_test":
+            # 测试代理连接
+            self.test_proxy_connection(query)
+        
+        elif data == "proxy_stats":
+            # 显示代理统计
+            self.show_proxy_statistics(query)
+        
+        elif data == "proxy_cleanup":
+            # 清理失效代理
+            self.show_cleanup_confirmation(query)
+        
+        elif data == "proxy_optimize":
+            # 显示速度优化信息
+            self.show_speed_optimization_info(query)
+    
+    def refresh_proxy_panel(self, query):
+        """刷新代理面板"""
+        proxy_enabled_db = self.db.get_proxy_enabled()
+        proxy_mode_active = self.proxy_manager.is_proxy_mode_active(self.db)
+        
+        # 统计住宅代理数量
+        residential_count = sum(1 for p in self.proxy_manager.proxies if p.get('is_residential', False))
+        
+        proxy_text = f"""
+<b>📡 代理管理面板</b>
+
+<b>📊 当前状态</b>
+• 系统配置: {'🟢USE_PROXY=true' if config.USE_PROXY else '🔴USE_PROXY=false'}
+• 代理开关: {'🟢已启用' if proxy_enabled_db else '🔴已禁用'}
+• 代理文件: {config.PROXY_FILE}
+• 可用代理: {len(self.proxy_manager.proxies)}个
+• 住宅代理: {residential_count}个
+• 普通超时: {config.PROXY_TIMEOUT}秒
+• 住宅超时: {config.RESIDENTIAL_PROXY_TIMEOUT}秒
+• 实际模式: {'🟢代理模式' if proxy_mode_active else '🔴本地模式'}
+
+<b>📝 代理格式支持</b>
+• HTTP: ip:port
+• HTTP认证: ip:port:username:password  
+• SOCKS5: socks5:ip:port:username:password
+• SOCKS4: socks4:ip:port
+• ABCProxy住宅代理: host.abcproxy.vip:port:username:password
+        """
+        
+        # 创建交互按钮
+        buttons = []
+        
+        # 代理开关控制按钮
+        if proxy_enabled_db:
+            buttons.append([InlineKeyboardButton("🔴 关闭代理", callback_data="proxy_disable")])
+        else:
+            buttons.append([InlineKeyboardButton("🟢 开启代理", callback_data="proxy_enable")])
+        
+        # 其他操作按钮
+        buttons.extend([
+            [
+                InlineKeyboardButton("🔄 刷新代理列表", callback_data="proxy_reload"),
+                InlineKeyboardButton("📊 查看代理状态", callback_data="proxy_status")
+            ],
+            [
+                InlineKeyboardButton("🧪 测试代理", callback_data="proxy_test"),
+                InlineKeyboardButton("📈 代理统计", callback_data="proxy_stats")
+            ],
+            [InlineKeyboardButton("🔙 返回管理面板", callback_data="admin_panel")]
+        ])
+        
+        keyboard = InlineKeyboardMarkup(buttons)
+        self.safe_edit_message(query, proxy_text, 'HTML', keyboard)
+    
+    def show_proxy_status_popup(self, query):
+        """显示代理状态弹窗"""
+        if self.proxy_manager.proxies:
+            status_text = f"📡 可用代理: {len(self.proxy_manager.proxies)}个\n"
+            enabled, updated_time, updated_by = self.db.get_proxy_setting_info()
+            status_text += f"🔧 代理开关: {'启用' if enabled else '禁用'}\n"
+            status_text += f"⏰ 更新时间: {updated_time}"
+        else:
+            status_text = "❌ 没有可用的代理"
+        
+        query.answer(status_text, show_alert=True)
+    
+    def test_proxy_connection(self, query):
+        """测试代理连接"""
+        if not self.proxy_manager.proxies:
+            query.answer("❌ 没有可用的代理进行测试", show_alert=True)
+            return
+        
+        # 简单测试：尝试获取一个代理
+        proxy = self.proxy_manager.get_next_proxy()
+        if proxy:
+            # 隐藏代理详细地址
+            query.answer(f"🧪 测试代理: {proxy['type'].upper()}代理", show_alert=True)
+        else:
+            query.answer("❌ 获取测试代理失败", show_alert=True)
+    
+    def show_proxy_statistics(self, query):
+        """显示代理统计信息"""
+        proxies = self.proxy_manager.proxies
+        if not proxies:
+            query.answer("❌ 没有代理数据", show_alert=True)
+            return
+        
+        # 统计代理类型
+        type_count = {}
+        for proxy in proxies:
+            proxy_type = proxy['type']
+            type_count[proxy_type] = type_count.get(proxy_type, 0) + 1
+        
+        stats_text = f"📊 代理统计\n总数: {len(proxies)}个\n\n"
+        for proxy_type, count in type_count.items():
+            stats_text += f"{proxy_type.upper()}: {count}个\n"
+        
+        enabled, _, _ = self.db.get_proxy_setting_info()
+        stats_text += f"\n状态: {'🟢启用' if enabled else '🔴禁用'}"
+        
+        query.answer(stats_text, show_alert=True)
+    
+    def show_cleanup_confirmation(self, query):
+        """显示清理确认对话框"""
+        query.answer()
+        confirm_text = f"""
+⚠️ <b>快速清理确认</b>
+
+📊 <b>当前状态</b>
+• 代理数量: {len(self.proxy_manager.proxies)} 个
+• 快速模式: {'开启' if config.PROXY_FAST_MODE else '关闭'}
+• 自动清理: {'启用' if config.PROXY_AUTO_CLEANUP else '禁用'}
+
+🔧 <b>将执行以下操作</b>
+• 备份原始代理文件
+• 快速测试所有代理
+• 自动删除失效代理
+• 更新为可用代理
+
+确认执行清理吗？
+        """
+        
+        buttons = [
+            [
+                InlineKeyboardButton("✅ 确认清理", callback_data="confirm_proxy_cleanup"),
+                InlineKeyboardButton("❌ 取消", callback_data="proxy_panel")
+            ]
+        ]
+        
+        keyboard = InlineKeyboardMarkup(buttons)
+        self.safe_edit_message(query, confirm_text, 'HTML', keyboard)
+    
+    def show_speed_optimization_info(self, query):
+        """显示速度优化信息"""
+        query.answer()
+        current_concurrent = config.PROXY_CHECK_CONCURRENT if config.PROXY_FAST_MODE else config.MAX_CONCURRENT_CHECKS
+        current_timeout = config.PROXY_CHECK_TIMEOUT if config.PROXY_FAST_MODE else config.CHECK_TIMEOUT
+        
+        optimization_text = f"""
+⚡ <b>速度优化配置</b>
+
+<b>🚀 当前设置</b>
+• 快速模式: {'🟢开启' if config.PROXY_FAST_MODE else '🔴关闭'}
+• 并发数: {current_concurrent} 个
+• 检测超时: {current_timeout} 秒
+• 智能重试: {config.PROXY_RETRY_COUNT} 次
+• 自动清理: {'🟢启用' if config.PROXY_AUTO_CLEANUP else '🔴禁用'}
+
+<b>📈 优化效果</b>
+• 标准模式: ~1-2 账号/秒
+• 快速模式: ~3-8 账号/秒
+• 预计提升: 3-5倍
+
+<b>🔧 环境变量配置</b>
+• PROXY_FAST_MODE={config.PROXY_FAST_MODE}
+• PROXY_CHECK_CONCURRENT={config.PROXY_CHECK_CONCURRENT}
+• PROXY_CHECK_TIMEOUT={config.PROXY_CHECK_TIMEOUT}
+• PROXY_AUTO_CLEANUP={config.PROXY_AUTO_CLEANUP}
+• PROXY_RETRY_COUNT={config.PROXY_RETRY_COUNT}
+
+<b>💡 优化建议</b>
+• 定期清理失效代理以提升速度
+• 使用高质量代理获得最佳性能
+• 根据网络状况调整并发数和超时
+        """
+        
+        buttons = [
+            [InlineKeyboardButton("🔙 返回代理面板", callback_data="proxy_panel")]
+        ]
+        
+        keyboard = InlineKeyboardMarkup(buttons)
+        self.safe_edit_message(query, optimization_text, 'HTML', keyboard)
+    
+    def show_proxy_panel(self, update: Update, query):
+        """Display Proxy Management Panel"""
+        user_id = query.from_user.id
+        
+        # Permission check (Admin only)
+        if not self.db.is_admin(user_id):
+            query.answer(t(user_id, 'admin_panel_access_denied'))
+            return
+        
+        query.answer()
+        
+        # Get proxy status information
+        proxy_enabled_db = self.db.get_proxy_enabled()
+        proxy_mode_active = self.proxy_manager.is_proxy_mode_active(self.db)
+        
+        # Count residential proxies
+        residential_count = sum(1 for p in self.proxy_manager.proxies if p.get('is_residential', False))
+        
+        # Build proxy management panel information
+        proxy_text = f"""
+<b>{t(user_id, 'proxy_panel_title')}</b>
+
+<b>{t(user_id, 'proxy_clean_current_status')}</b>
+• System Config: {'🟢USE_PROXY=true' if config.USE_PROXY else '🔴USE_PROXY=false'}
+• Proxy Switch: {'🟢Enabled' if proxy_enabled_db else '🔴Disabled'}
+• Proxy File: {config.PROXY_FILE}
+• {t(user_id, 'proxy_panel_available')}: {len(self.proxy_manager.proxies)}
+• Residential Proxies: {residential_count}
+• Normal Timeout: {config.PROXY_TIMEOUT}s
+• Residential Timeout: {config.RESIDENTIAL_PROXY_TIMEOUT}s
+• Actual Mode: {'🟢Proxy Mode' if proxy_mode_active else '🔴Local Mode'}
+
+<b>📝 Supported Proxy Formats</b>
+• HTTP: ip:port
+• HTTP Auth: ip:port:username:password  
+• SOCKS5: socks5:ip:port:username:password
+• SOCKS4: socks4:ip:port
+• ABCProxy Residential: host.abcproxy.vip:port:username:password
+
+<b>🛠️ Operation Instructions</b>
+• Enable/Disable: Control proxy switch
+• Reload: Reload proxy list from file
+• Test: Check proxy connectivity
+• View Status: Show detailed proxy info
+• Statistics: View usage data
+        """
+        
+        # Create operation buttons
+        buttons = []
+        
+        # Proxy switch control button
+        if proxy_enabled_db:
+            buttons.append([InlineKeyboardButton("🔴 Disable Proxy", callback_data="proxy_disable")])
+        else:
+            buttons.append([InlineKeyboardButton("🟢 Enable Proxy", callback_data="proxy_enable")])
+        
+        # Proxy management operation buttons
+        buttons.extend([
+            [
+                InlineKeyboardButton("🔄 Reload Proxies", callback_data="proxy_reload"),
+                InlineKeyboardButton(t(user_id, 'proxy_panel_btn_status'), callback_data="proxy_status")
+            ],
+            [
+                InlineKeyboardButton(t(user_id, 'proxy_panel_btn_test'), callback_data="proxy_test"),
+                InlineKeyboardButton(t(user_id, 'proxy_panel_btn_stats'), callback_data="proxy_stats")
+            ],
+            [
+                InlineKeyboardButton(t(user_id, 'proxy_panel_btn_clean'), callback_data="proxy_cleanup"),
+                InlineKeyboardButton(t(user_id, 'proxy_panel_btn_optimize'), callback_data="proxy_optimize")
+            ],
+            [InlineKeyboardButton(t(user_id, 'admin_btn_back_panel'), callback_data="admin_panel")]
+        ])
+        
+        keyboard = InlineKeyboardMarkup(buttons)
+        
+        # Send/edit message to display proxy management panel
+        try:
+            self.safe_edit_message(query, proxy_text, 'HTML', keyboard)
+        except Exception as e:
+            # If edit fails, try sending new message
+            self.safe_send_message(update, proxy_text, 'HTML', keyboard)
+    
+    def handle_callbacks(self, update: Update, context: CallbackContext):
+        query = update.callback_query
+        data = query.data
+        user_id = query.from_user.id  # ← 添加这一行
+        if data == "start_check":
+            self.handle_start_check(query)
+        elif data == "format_conversion":
+            self.handle_format_conversion(query)
+        elif data == "change_2fa":
+            self.handle_change_2fa(query)
+        elif data == "forget_2fa":
+            self.handle_forget_2fa(query)
+        elif data == "remove_2fa":
+            self.handle_remove_2fa(query)
+        elif data == "add_2fa":
+            self.handle_add_2fa(query)
+        elif data == "remove_2fa_auto":
+            # 自动识别密码
+            query.answer()
+            user_id = query.from_user.id
+            if user_id in self.two_factor_manager.pending_2fa_tasks:
+                task_info = self.two_factor_manager.pending_2fa_tasks[user_id]
+                if task_info.get('operation') == 'remove':
+                    # 使用 None 表示自动识别
+                    def process_remove():
+                        asyncio.run(self.complete_remove_2fa(update, context, user_id, None))
+                    threading.Thread(target=process_remove, daemon=True).start()
+                else:
+                    query.answer("❌ 操作类型不匹配")
+            else:
+                query.answer("❌ 没有待处理的任务")
+        elif data == "remove_2fa_manual":
+            # 手动输入密码
+            query.answer()
+            user_id = query.from_user.id
+            if user_id in self.two_factor_manager.pending_2fa_tasks:
+                task_info = self.two_factor_manager.pending_2fa_tasks[user_id]
+                if task_info.get('operation') == 'remove':
+                    # 请求用户输入密码
+                    try:
+                        progress_msg = task_info['progress_msg']
+                        total_files = len(task_info['files'])
+                        progress_msg.edit_text(
+                            f"{t(user_id, 'delete_2fa_found_files').format(count=total_files)}\n\n"
+                            f"{t(user_id, 'delete_2fa_enter_password')}\n\n"
+                            f"{t(user_id, 'delete_2fa_enter_desc1')}\n"
+                            f"{t(user_id, 'delete_2fa_enter_desc2')}\n"
+                            f"{t(user_id, 'delete_2fa_enter_desc3')}\n\n"
+                            f"{t(user_id, 'delete_2fa_cancel_hint')}",
+                            parse_mode='HTML'
+                        )
+                        # 设置用户状态为等待输入密码
+                        self.db.save_user(user_id, query.from_user.username or "", 
+                                        query.from_user.first_name or "", "waiting_remove_2fa_input")
+                    except Exception as e:
+                        print(f"❌ 更新消息失败: {e}")
+                        query.answer("❌ 操作失败")
+                else:
+                    query.answer("❌ 操作类型不匹配")
+            else:
+                query.answer("❌ 没有待处理的任务")
+        elif data == "convert_tdata_to_session":
+            self.handle_convert_tdata_to_session(query)
+        elif data == "convert_session_to_tdata":
+            self.handle_convert_session_to_tdata(query)
+        elif data == "api_conversion":
+            self.handle_api_conversion(query)
+        elif data.startswith("classify_") or data == "classify_menu":
+            self.handle_classify_callbacks(update, context, query, data)
+        elif data == "rename_start":
+            self.handle_rename_start(query)
+        elif data == "merge_start":
+            self.handle_merge_start(query)
+        elif data == "merge_continue":
+            self.handle_merge_continue(query)
+        elif data == "merge_finish":
+            self.handle_merge_finish(update, context, query)
+        elif data == "merge_cancel":
+            self.handle_merge_cancel(query)
+        elif data == "cleanup_start":
+            self.handle_cleanup_start(query)
+        elif data == "cleanup_confirm":
+            self.handle_cleanup_confirm(update, context, query)
+        elif data == "cleanup_cancel":
+            query.answer()
+            # Clean up any pending cleanup task
+            if user_id in self.pending_cleanup:
+                self.cleanup_cleanup_task(user_id)
+            self.show_main_menu(update, user_id)
+        elif data == "batch_create_start":
+            self.handle_batch_create_start(query)
+        elif data.startswith("batch_create_"):
+            self.handle_batch_create_callbacks(update, context, query, data)
+        elif data == "reauthorize_start":
+            self.handle_reauthorize_start(query)
+        elif data.startswith("reauthorize_") or data.startswith("reauth_"):
+            self.handle_reauthorize_callbacks(update, context, query, data)
+        elif data == "check_registration_start":
+            self.handle_check_registration_start(query)
+        elif data.startswith("check_reg_"):
+            self.handle_check_registration_callbacks(update, context, query, data)
+        elif data == "profile_update_start":
+            self.handle_profile_update_start(query)
+        elif data.startswith("profile_"):
+            self.handle_profile_update_callbacks(update, context, query, data)
+        elif data == "check_contact_limit":
+            self.handle_check_contact_limit(query)
+        elif data == "language_menu":
+            # 显示语言选择菜单
+            self.show_language_menu(update, user_id)
+        elif data.startswith("set_language_"):
+            # 设置语言
+            query.answer()
+            if I18N_AVAILABLE:
+                lang = data.replace("set_language_", "")
+                set_user_language(user_id, lang)
+                # 显示语言切换成功消息并刷新主菜单
+                self.show_main_menu(update, user_id)
+        elif query.data == "back_to_main":
+            self.show_main_menu(update, user_id)
+            # 返回主菜单 - 横排2x2布局
+            query.answer()
+            user = query.from_user
+            user_id = user.id
+            
+            # 如果当前消息是图片消息（来自取消订单），先删除再发送新消息
+            message_was_photo = query.message and query.message.photo
+            if message_was_photo:
+                try:
+                    query.message.delete()
+                except Exception as e:
+                    logger.warning(f"删除图片消息失败: {e}")
+            
+            first_name = user.first_name or t(user_id, 'default_user')
+            is_member, level, expiry = self.db.check_membership(user_id)
+            
+            if self.db.is_admin(user_id):
+                member_status = t(user_id, 'status_admin')
+            elif is_member:
+                # 翻译会员等级
+                if level == "会员":
+                    translated_level = t(user_id, 'member_level_member')
+                elif level == "管理员":
+                    translated_level = t(user_id, 'member_level_admin')
+                else:
+                    translated_level = level  # 保留其他未知等级
+                member_status = f"🎁 {translated_level}"
+            else:
+                member_status = t(user_id, 'status_no_member')
+            
+            # 翻译到期时间
+            if expiry == "永久有效":
+                expiry = t(user_id, 'expiry_permanent')
+            
+            proxy_mode_text = t(user_id, 'proxy_mode_enabled') if self.proxy_manager.is_proxy_mode_active(self.db) else t(user_id, 'proxy_mode_local')
+            proxy_count_text = t(user_id, 'proxy_count_value').format(count=len(self.proxy_manager.proxies))
+            
+            welcome_text = f"""
+<b>{t(user_id, 'bot_title')}</b>
+
+👤 <b>{t(user_id, 'user_info')}</b>
+• {t(user_id, 'user_nickname')}: {first_name}
+• {t(user_id, 'user_id')}: <code>{user_id}</code>
+• {t(user_id, 'user_membership')}: {member_status}
+• {t(user_id, 'user_expiry')}: {expiry}
+• {t(user_id, 'current_time')}: {datetime.now(BEIJING_TZ).strftime('%Y-%m-%d %H:%M:%S CST')}
+            """
+            
+            # 创建横排2x2布局的主菜单按钮
+            buttons = [
+                [
+                    InlineKeyboardButton(t(user_id, 'btn_account_check'), callback_data="start_check"),
+                    InlineKeyboardButton(t(user_id, 'btn_format_conversion'), callback_data="format_conversion")
+                ],
+                [
+                    InlineKeyboardButton(t(user_id, 'btn_change_2fa'), callback_data="change_2fa"),
+                    InlineKeyboardButton(t(user_id, 'btn_batch_create'), callback_data="batch_create_start")
+                ],
+                [
+                    InlineKeyboardButton(t(user_id, 'btn_forget_2fa'), callback_data="forget_2fa"),
+                    InlineKeyboardButton(t(user_id, 'btn_remove_2fa'), callback_data="remove_2fa")
+                ],
+                [
+                    InlineKeyboardButton(t(user_id, 'btn_add_2fa'), callback_data="add_2fa"),
+                    InlineKeyboardButton(t(user_id, 'btn_api_conversion'), callback_data="api_conversion")
+                ],
+                [
+                    InlineKeyboardButton(t(user_id, 'btn_classify_menu'), callback_data="classify_menu"),
+                    InlineKeyboardButton(t(user_id, 'btn_rename_file'), callback_data="rename_start")
+                ],
+                [
+                    InlineKeyboardButton(t(user_id, 'btn_merge_account'), callback_data="merge_start"),
+                    InlineKeyboardButton(t(user_id, 'btn_cleanup'), callback_data="cleanup_start")
+                ],
+                [
+                    InlineKeyboardButton(t(user_id, 'btn_reauthorize'), callback_data="reauthorize_start"),
+                    InlineKeyboardButton(t(user_id, 'btn_check_registration'), callback_data="check_registration_start")
+                ],
+                [
+                    InlineKeyboardButton(t(user_id, 'btn_profile_update'), callback_data="profile_update_start"),
+                    InlineKeyboardButton("🔍 检查通讯录限制", callback_data="check_contact_limit")
+                ],
+                [
+                    InlineKeyboardButton("💳 开通/兑换会员", callback_data="vip_menu")
+                ]
+            ]
+            
+            # 管理员按钮
+            if self.db.is_admin(user_id):
+                buttons.append([
+                    InlineKeyboardButton("👑 管理员面板", callback_data="admin_panel"),
+                    InlineKeyboardButton("📡 代理管理", callback_data="proxy_panel")
+                ])
+            
+            keyboard = InlineKeyboardMarkup(buttons)
+            
+            # 如果删除了图片，发送新消息；否则编辑现有消息
+            if message_was_photo:
+                from telegram import Bot
+                bot = query.bot if hasattr(query, 'bot') else Bot(token=os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN"))
+                bot.send_message(
+                    chat_id=user_id,
+                    text=welcome_text,
+                    parse_mode='HTML',
+                    reply_markup=keyboard
+                )
+            else:
+                query.edit_message_text(
+                    text=welcome_text,
+                    reply_markup=keyboard,
+                    parse_mode='HTML'
+                )
+        elif data == "help":
+            self.handle_help_callback(query)
+        elif data == "status":
+            self.handle_status_callback(query)
+        elif data == "admin_panel":
+            self.handle_admin_panel(query)
+        elif data == "proxy_panel":
+            self.show_proxy_panel(update, query)
+        elif data.startswith("proxy_"):
+            self.handle_proxy_callbacks(query, data)
+        elif data == "confirm_proxy_cleanup":
+            query.answer()
+            self._execute_proxy_cleanup(update, context, True)
+        elif data == "cancel_proxy_cleanup":
+            query.answer()
+            self.safe_edit_message(query, "❌ 代理清理已取消")
+        elif data == "test_only_proxy":
+            # 仅测试不清理
+            query.answer()
+            def process_test():
+                asyncio.run(self.process_proxy_test(update, context))
+            thread = threading.Thread(target=process_test)
+            thread.start()
+            self.safe_edit_message(query, "🧪 开始测试代理（仅测试不清理）...")
+        elif data == "admin_users":
+            self.handle_admin_users(query)
+        elif data == "admin_stats":
+            self.handle_admin_stats(query)
+        elif data == "admin_manage":
+            self.handle_admin_manage(query)
+        elif data == "admin_search":
+            self.handle_admin_search(query)
+        elif data == "admin_recent":
+            self.handle_admin_recent(query)
+        elif data == "admin_payment_stats":
+            self.handle_admin_payment_stats(query)
+        elif data == "admin_payment_orders":
+            self.handle_admin_payment_orders(query, 1)  # First page
+        elif data.startswith("admin_orders_page_"):
+            page = int(data.split("_")[-1])
+            self.handle_admin_payment_orders(query, page)
+        elif data == "admin_payment_export":
+            self.handle_admin_payment_export(query)
+        elif data.startswith("admin_export_"):
+            export_type = data.split("_")[-1]  # today, week, month, all
+            self.handle_admin_export_generate(query, export_type)
+        elif data == "admin_query_by_date":
+            self.handle_admin_query_by_date(query)
+        elif data == "admin_query_by_user":
+            self.handle_admin_query_by_user(query)
+        elif data.startswith("user_detail_"):
+            user_id_to_view = int(data.split("_")[2])
+            self.handle_user_detail(query, user_id_to_view)
+        elif data.startswith("grant_membership_"):
+            user_id_to_grant = int(data.split("_")[2])
+            self.handle_grant_membership(query, user_id_to_grant)
+        elif data.startswith("make_admin_"):
+            user_id_to_make = int(data.split("_")[2])
+            self.handle_make_admin(query, user_id_to_make)
+        # VIP会员回调
+        elif data == "vip_menu":
+            self.handle_vip_menu(query)
+        elif data == "vip_redeem":
+            self.handle_vip_redeem(query)
+        elif data == "usdt_payment":
+            self.handle_usdt_payment(query)
+        elif data.startswith("usdt_plan_"):
+            plan_id = "plan_" + data.split("_")[-1]  # usdt_plan_7d -> plan_7d
+            self.handle_usdt_plan_select(query, plan_id)
+        elif data.startswith("cancel_order"):
+            # Support both formats: cancel_order_ID and cancel_order:ID
+            if ":" in data:
+                order_id = data.split(":", 1)[1]
+            else:
+                order_id = data.replace("cancel_order_", "")
+            self.handle_cancel_order(query, order_id)
+        elif data == "admin_card_menu":
+            self.handle_admin_card_menu(query)
+        elif data.startswith("admin_card_days_"):
+            days = int(data.split("_")[-1])
+            self.handle_admin_card_generate(query, days)
+        elif data == "admin_manual_menu":
+            self.handle_admin_manual_menu(query)
+        elif data == "admin_revoke_menu":
+            self.handle_admin_revoke_menu(query)
+        elif data.startswith("admin_manual_days_"):
+            days = int(data.split("_")[-1])
+            self.handle_admin_manual_grant(query, context, days)
+        elif data.startswith("admin_revoke_confirm_"):
+            target_user_id = int(data.split("_")[-1])
+            self.handle_admin_revoke_confirm(query, context, target_user_id)
+        elif data == "admin_revoke_cancel":
+            self.handle_admin_revoke_cancel(query)
+        # 广播消息回调
+        elif data.startswith("broadcast_"):
+            self.handle_broadcast_callbacks(update, context, query, data)
+        elif data.startswith("broadcast_alert_"):
+            # 处理广播按钮回调 - 显示提示信息
+            # 注意：实际的alert文本需要从按钮配置中获取，这里只是示例
+            query.answer("✨ 感谢您的关注！", show_alert=True)
+        elif data.startswith("status_") or data.startswith("count_"):
+            query.answer("ℹ️ 这是状态信息")
+    
+    def handle_start_check(self, query):
+        """处理开始检测"""
+        query.answer()
+        user_id = query.from_user.id
+        
+        # 检查权限
+        is_member, level, _ = self.db.check_membership(user_id)
+        if not is_member and not self.db.is_admin(user_id):
+            self.safe_edit_message(query, "❌ 需要会员权限才能使用检测功能")
+            return
+        
+        if not TELETHON_AVAILABLE:
+            self.safe_edit_message(query, "❌ 检测功能不可用\n\n原因: Telethon库未安装")
+            return
+        
+        proxy_info = ""
+        if config.USE_PROXY:
+            proxy_count = len(self.proxy_manager.proxies)
+            proxy_info = f"\n{t(user_id, 'account_check_proxy_enabled').format(count=proxy_count)}"
+        else:
+            proxy_info = f"\n{t(user_id, 'account_check_proxy_disabled')}"
+        
+        text = f"""
+{t(user_id, 'account_check_upload_title')}
+
+{t(user_id, 'account_check_supported_formats')}
+{t(user_id, 'account_check_format_zip')}
+{t(user_id, 'account_check_format_session')}
+{t(user_id, 'account_check_format_session_json')}
+{t(user_id, 'account_check_format_tdata')}{proxy_info}
+
+{t(user_id, 'account_check_upload_hint')}
+        """
+        
+        self.safe_edit_message(query, text, 'HTML', reply_markup=get_back_to_menu_keyboard(user_id))
+        
+        # 设置用户状态
+        self.db.save_user(user_id, query.from_user.username or "", 
+                         query.from_user.first_name or "", "waiting_file")
+    
+    def handle_format_conversion(self, query):
+        """处理格式转换选项"""
+        query.answer()
+        user_id = query.from_user.id
+        
+        # 检查权限
+        is_member, level, _ = self.db.check_membership(user_id)
+        if not is_member and not self.db.is_admin(user_id):
+            self.safe_edit_message(query, "❌ 需要会员权限才能使用格式转换功能")
+            return
+        
+        if not OPENTELE_AVAILABLE:
+            self.safe_edit_message(query, "❌ 格式转换功能不可用\n\n原因: opentele库未安装\n💡 请安装: pip install opentele")
+            return
+        
+        text = f"""
+<b>{t(user_id, 'format_conversion_title')}</b>
+
+<b>{t(user_id, 'format_conversion_supported')}</b>
+<b>{t(user_id, 'format_conversion_tdata_to_session')}</b>
+   {t(user_id, 'format_conversion_tdata_to_session_desc1')}
+   {t(user_id, 'format_conversion_tdata_to_session_desc2')}
+
+<b>{t(user_id, 'format_conversion_session_to_tdata')}</b>
+   {t(user_id, 'format_conversion_session_to_tdata_desc1')}
+   {t(user_id, 'format_conversion_session_to_tdata_desc2')}
+
+<b>{t(user_id, 'format_conversion_features')}</b>
+{t(user_id, 'format_conversion_feature_batch')}
+{t(user_id, 'format_conversion_feature_progress')}
+{t(user_id, 'format_conversion_feature_classify')}
+{t(user_id, 'format_conversion_feature_error')}
+
+<b>{t(user_id, 'format_conversion_instructions')}</b>
+{t(user_id, 'format_conversion_select_type')}
+        """
+        
+        buttons = [
+            [InlineKeyboardButton(f"📤 {t(user_id, 'format_conversion_tdata_to_session')}", callback_data="convert_tdata_to_session")],
+            [InlineKeyboardButton(f"📥 {t(user_id, 'format_conversion_session_to_tdata')}", callback_data="convert_session_to_tdata")],
+            [InlineKeyboardButton(t(user_id, 'btn_back_to_menu'), callback_data="back_to_main")]
+        ]
+        
+        keyboard = InlineKeyboardMarkup(buttons)
+        self.safe_edit_message(query, text, 'HTML', keyboard)
+    
+    def handle_convert_tdata_to_session(self, query):
+        """处理Tdata转Session"""
+        query.answer()
+        user_id = query.from_user.id
+        
+        text = f"""
+<b>{t(user_id, 'tdata_to_session_title')}</b>
+
+<b>{t(user_id, 'tdata_to_session_prepare')}</b>
+{t(user_id, 'tdata_to_session_prepare1')}
+{t(user_id, 'tdata_to_session_prepare2')}
+
+<b>{t(user_id, 'conversion_info')}</b>
+{t(user_id, 'tdata_to_session_info1')}
+{t(user_id, 'tdata_to_session_info2')}
+{t(user_id, 'tdata_to_session_info3')}
+
+<b>{t(user_id, 'high_performance')}</b>
+{t(user_id, 'high_performance_concurrent')}
+{t(user_id, 'high_performance_realtime')}
+{t(user_id, 'high_performance_classify')}
+
+{t(user_id, 'upload_zip_prompt')}
+        """
+        
+        self.safe_edit_message(query, text, 'HTML', reply_markup=get_back_to_menu_keyboard(user_id))
+        
+        # 设置用户状态
+        self.db.save_user(user_id, query.from_user.username or "", 
+                         query.from_user.first_name or "", "waiting_convert_tdata")
+    
+    def handle_convert_session_to_tdata(self, query):
+        """处理Session转Tdata"""
+        query.answer()
+        user_id = query.from_user.id
+        
+        text = f"""
+<b>{t(user_id, 'session_to_tdata_title')}</b>
+
+<b>{t(user_id, 'session_to_tdata_prepare')}</b>
+{t(user_id, 'session_to_tdata_prepare1')}
+{t(user_id, 'session_to_tdata_prepare2')}
+
+<b>{t(user_id, 'conversion_info')}</b>
+{t(user_id, 'session_to_tdata_info1')}
+{t(user_id, 'session_to_tdata_info2')}
+{t(user_id, 'session_to_tdata_info3')}
+
+<b>{t(user_id, 'high_performance')}</b>
+{t(user_id, 'high_performance_concurrent')}
+{t(user_id, 'high_performance_realtime')}
+{t(user_id, 'high_performance_classify')}
+
+{t(user_id, 'upload_zip_prompt')}
+        """
+        
+        self.safe_edit_message(query, text, 'HTML', reply_markup=get_back_to_menu_keyboard(user_id))
+        
+        # 设置用户状态
+        self.db.save_user(user_id, query.from_user.username or "", 
+                         query.from_user.first_name or "", "waiting_convert_session")
+    
+    def handle_change_2fa(self, query):
+        """处理修改2FA"""
+        query.answer()
+        user_id = query.from_user.id
+        
+        # 检查权限
+        is_member, level, _ = self.db.check_membership(user_id)
+        if not is_member and not self.db.is_admin(user_id):
+            self.safe_edit_message(query, "❌ 需要会员权限才能使用2FA修改功能")
+            return
+        
+        if not TELETHON_AVAILABLE:
+            self.safe_edit_message(query, "❌ 2FA修改功能不可用\n\n原因: Telethon库未安装")
+            return
+        
+        text = f"""
+<b>{t(user_id, 'change_2fa_title')}</b>
+
+<b>{t(user_id, 'change_2fa_core_features')}</b>
+• <b>{t(user_id, 'change_2fa_auto_detect')}</b>
+  - {t(user_id, 'change_2fa_tdata_detect')}
+  - {t(user_id, 'change_2fa_session_detect')}
+  - {t(user_id, 'change_2fa_smart_fallback')}
+
+• <b>{t(user_id, 'change_2fa_interactive_input')}</b>
+  - {t(user_id, 'change_2fa_input_prompt')}
+  - {t(user_id, 'change_2fa_two_formats')}
+  - {t(user_id, 'change_2fa_auto_detect_old')}
+  - {t(user_id, 'change_2fa_timeout')}
+
+• <b>{t(user_id, 'change_2fa_auto_update')}</b>
+  - {t(user_id, 'change_2fa_session_update')}
+  - {t(user_id, 'change_2fa_tdata_update')}
+  - {t(user_id, 'change_2fa_sync_update')}
+  - {t(user_id, 'change_2fa_no_manual_edit')}
+
+<b>{t(user_id, 'change_2fa_notes')}</b>
+• {t(user_id, 'change_2fa_note1')}
+• {t(user_id, 'change_2fa_note2')}
+• {t(user_id, 'change_2fa_note3')}
+• {t(user_id, 'change_2fa_note4')}
+• {t(user_id, 'change_2fa_note5')}
+• {t(user_id, 'change_2fa_note6')}
+
+{t(user_id, 'change_2fa_upload_prompt')}
+        """
+        
+        self.safe_edit_message(query, text, 'HTML', reply_markup=get_back_to_menu_keyboard(user_id))
+        
+        # 设置用户状态 - 等待上传文件
+        self.db.save_user(user_id, query.from_user.username or "", 
+                         query.from_user.first_name or "", "waiting_2fa_file")
+    
+    
+    def handle_forget_2fa(self, query):
+        """处理忘记2FA"""
+        query.answer()
+        user_id = query.from_user.id
+        
+        # 检查权限
+        is_member, level, _ = self.db.check_membership(user_id)
+        if not is_member and not self.db.is_admin(user_id):
+            self.safe_edit_message(query, "❌ 需要会员权限才能使用忘记2FA功能")
+            return
+        
+        if not TELETHON_AVAILABLE:
+            self.safe_edit_message(query, "❌ 忘记2FA功能不可用\n\n原因: Telethon库未安装")
+            return
+        
+        # 检查代理是否可用
+        proxy_count = len(self.proxy_manager.proxies)
+        proxy_warning = ""
+        if proxy_count < 3:
+            proxy_warning = f"\n⚠️ <b>{t(user_id, 'forget_2fa_proxy_warning').format(count=proxy_count)}</b>\n"
+        
+        # 构建代理模式状态文本
+        proxy_mode_text = t(user_id, 'forget_2fa_proxy_mode_enabled') if self.proxy_manager.is_proxy_mode_active(self.db) else t(user_id, 'forget_2fa_proxy_mode_disabled')
+        
+        text = f"""
+{t(user_id, 'forget_2fa_title')}
+
+<b>{t(user_id, 'forget_2fa_important')}</b>
+{t(user_id, 'forget_2fa_note1')}
+{t(user_id, 'forget_2fa_note2')}
+{t(user_id, 'forget_2fa_note3')}
+{t(user_id, 'forget_2fa_note4')}
+{t(user_id, 'forget_2fa_note5')}
+{proxy_warning}
+<b>{t(user_id, 'forget_2fa_proxy_status')}</b>
+{proxy_mode_text}
+{t(user_id, 'forget_2fa_proxy_available').format(count=proxy_count)}
+
+<b>{t(user_id, 'forget_2fa_upload_prompt')}</b>
+{t(user_id, 'forget_2fa_upload_support')}
+{t(user_id, 'forget_2fa_upload_auto')}
+
+<b>{t(user_id, 'forget_2fa_result_categories')}</b>
+{t(user_id, 'forget_2fa_category_reset')}
+{t(user_id, 'forget_2fa_category_no_reset')}
+{t(user_id, 'forget_2fa_category_cooling')}
+{t(user_id, 'forget_2fa_category_failed')}
+        """
+        
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔙 " + t(user_id, 'forget_2fa_back_menu'), callback_data="back_to_main")]
+        ])
+        
+        self.safe_edit_message(query, text, 'HTML', keyboard)
+        
+        # 设置用户状态 - 等待上传文件
+        self.db.save_user(user_id, query.from_user.username or "", 
+                         query.from_user.first_name or "", "waiting_forget_2fa_file")
+    
+    def handle_add_2fa(self, query):
+        """处理添加2FA功能"""
+        query.answer()
+        user_id = query.from_user.id
+        
+        # 检查权限
+        is_member, level, _ = self.db.check_membership(user_id)
+        if not is_member and not self.db.is_admin(user_id):
+            self.safe_edit_message(query, t(user_id, 'add_2fa_need_member'))
+            return
+        
+        text = f"""
+{t(user_id, 'add_2fa_title')}
+
+<b>{t(user_id, 'add_2fa_features')}</b>
+{t(user_id, 'add_2fa_feature1')}
+{t(user_id, 'add_2fa_feature2')}
+{t(user_id, 'add_2fa_feature3')}
+
+<b>{t(user_id, 'add_2fa_formats')}</b>
+{t(user_id, 'add_2fa_format1')}
+{t(user_id, 'add_2fa_format2')}
+
+<b>{t(user_id, 'add_2fa_rules')}</b>
+{t(user_id, 'add_2fa_rule1')}
+{t(user_id, 'add_2fa_rule2')}
+
+<b>{t(user_id, 'add_2fa_upload_prompt')}</b>
+        """
+        
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton(f"🔙 {t(user_id, 'add_2fa_back_menu')}", callback_data="back_to_main")]
+        ])
+        
+        self.safe_edit_message(query, text, 'HTML', keyboard)
+        
+        # 设置用户状态 - 等待上传文件
+        self.db.save_user(user_id, query.from_user.username or "", 
+                         query.from_user.first_name or "", "waiting_add_2fa_file")
+    
+    def handle_remove_2fa(self, query):
+        """处理删除2FA入口"""
+        query.answer()
+        user_id = query.from_user.id
+        
+        # 检查权限
+        is_member, level, _ = self.db.check_membership(user_id)
+        if not is_member and not self.db.is_admin(user_id):
+            self.safe_edit_message(query, "❌ 需要会员权限才能使用删除2FA功能")
+            return
+        
+        if not TELETHON_AVAILABLE:
+            self.safe_edit_message(query, "❌ 删除2FA功能不可用\n\n原因: Telethon库未安装")
+            return
+        
+        text = f"""
+{t(user_id, 'delete_2fa_title')}
+
+<b>{t(user_id, 'delete_2fa_core_features')}</b>
+• <b>{t(user_id, 'delete_2fa_auto_detect')}</b>
+  - {t(user_id, 'delete_2fa_tdata_detect')}
+  - {t(user_id, 'delete_2fa_session_detect')}
+  - {t(user_id, 'delete_2fa_smart_fallback')}
+
+• <b>{t(user_id, 'delete_2fa_interactive_input')}</b>
+  - {t(user_id, 'delete_2fa_input_choice')}
+  - {t(user_id, 'delete_2fa_auto_read')}
+  - {t(user_id, 'delete_2fa_manual_input')}
+  - {t(user_id, 'delete_2fa_timeout')}
+
+• <b>{t(user_id, 'delete_2fa_auto_update')}</b>
+  - {t(user_id, 'delete_2fa_session_update')}
+  - {t(user_id, 'delete_2fa_tdata_update')}
+  - {t(user_id, 'delete_2fa_sync_update')}
+  - {t(user_id, 'delete_2fa_no_manual_edit')}
+
+<b>{t(user_id, 'delete_2fa_notes')}</b>
+• {t(user_id, 'delete_2fa_note1')}
+• {t(user_id, 'delete_2fa_note2')}
+• {t(user_id, 'delete_2fa_note3')}
+• {t(user_id, 'delete_2fa_note4')}
+• {t(user_id, 'delete_2fa_note5')}
+• {t(user_id, 'delete_2fa_note6')}
+
+{t(user_id, 'delete_2fa_upload_prompt')}
+        """
+        
+        self.safe_edit_message(query, text, 'HTML', reply_markup=get_back_to_menu_keyboard(user_id))
+        
+        # 设置用户状态 - 等待上传文件
+        self.db.save_user(user_id, query.from_user.username or "", 
+                         query.from_user.first_name or "", "waiting_remove_2fa_file")
+    
+    def handle_help_callback(self, query):
+        query.answer()
+        help_text = """
+<b>📖 详细说明</b>
+
+<b>🚀 增强功能</b>
+• 代理连接模式自动检测
+• 状态|数量分离实时显示
+• 检测完成后自动发送分类文件
+
+<b>📡 代理优势</b>
+• 提高检测成功率
+• 避免IP限制
+• 自动故障转移
+        """
+        
+        self.safe_edit_message(query, help_text, 'HTML')
+    
+    def handle_status_callback(self, query):
+        query.answer()
+        user_id = query.from_user.id
+        
+        status_text = f"""
+<b>⚙️ 系统状态</b>
+
+<b>🤖 机器人信息</b>
+• 版本: 8.0 (完整版)
+• 状态: ✅正常运行
+• 当前时间: {datetime.now(BEIJING_TZ).strftime('%Y-%m-%d %H:%M:%S CST')}
+
+"""
+        
+        self.safe_edit_message(query, status_text, 'HTML')
+    
+    def handle_admin_panel(self, query):
+        """Admin Panel"""
+        user_id = query.from_user.id
+        
+        if not self.db.is_admin(user_id):
+            query.answer(t(user_id, 'admin_panel_access_denied'))
+            return
+        
+        # Get statistics
+        stats = self.db.get_user_statistics()
+        admin_count = len(self.db.get_all_admins()) if self.db.get_all_admins() else 0
+        
+        admin_permission = t(user_id, 'admin_super_admin') if user_id in config.ADMIN_IDS else t(user_id, 'admin_normal_admin')
+        
+        admin_text = f"""
+<b>{t(user_id, 'admin_panel_title')}</b>
+
+<b>{t(user_id, 'admin_system_stats')}</b>
+• {t(user_id, 'admin_total_users')}: {stats.get('total_users', 0)}
+• {t(user_id, 'admin_today_active')}: {stats.get('today_active', 0)}
+• {t(user_id, 'admin_week_active')}: {stats.get('week_active', 0)}
+• {t(user_id, 'admin_active_members')}: {stats.get('active_members', 0)}
+• {t(user_id, 'admin_trial_members')}: {stats.get('trial_members', 0)}
+• {t(user_id, 'admin_recent_users')}: {stats.get('recent_users', 0)}
+
+<b>{t(user_id, 'admin_info')}</b>
+• {t(user_id, 'admin_count')}: {admin_count}
+• {t(user_id, 'admin_your_permission')}: {admin_permission}
+• {t(user_id, 'admin_system_time')}: {datetime.now(BEIJING_TZ).strftime('%Y-%m-%d %H:%M:%S CST')}
+
+<b>{t(user_id, 'admin_quick_actions')}</b>
+{t(user_id, 'admin_quick_actions_desc')}
+        """
+        
+        # Create admin buttons
+        buttons = [
+            [
+                InlineKeyboardButton(t(user_id, 'admin_btn_user_management'), callback_data="admin_users"),
+                InlineKeyboardButton(t(user_id, 'admin_btn_user_stats'), callback_data="admin_stats")
+            ],
+            [
+                InlineKeyboardButton(t(user_id, 'admin_btn_proxy_management'), callback_data="proxy_panel"),
+                InlineKeyboardButton(t(user_id, 'admin_btn_admin_management'), callback_data="admin_manage")
+            ],
+            [
+                InlineKeyboardButton(t(user_id, 'admin_btn_search_user'), callback_data="admin_search"),
+                InlineKeyboardButton(t(user_id, 'admin_btn_recent_users'), callback_data="admin_recent")
+            ],
+            [
+                InlineKeyboardButton(t(user_id, 'btn_admin_payment_stats'), callback_data="admin_payment_stats"),
+                InlineKeyboardButton(t(user_id, 'btn_admin_payment_orders'), callback_data="admin_payment_orders")
+            ],
+            [
+                InlineKeyboardButton(t(user_id, 'btn_admin_payment_export'), callback_data="admin_payment_export")
+            ],
+            [
+                InlineKeyboardButton(t(user_id, 'admin_btn_card_activation'), callback_data="admin_card_menu"),
+                InlineKeyboardButton(t(user_id, 'admin_btn_manual_activation'), callback_data="admin_manual_menu")
+            ],
+            [
+                InlineKeyboardButton(t(user_id, 'admin_btn_revoke_membership'), callback_data="admin_revoke_menu")
+            ],
+            [
+                InlineKeyboardButton(t(user_id, 'admin_btn_broadcast'), callback_data="broadcast_menu")
+            ],
+            [InlineKeyboardButton(f"🔙 {t(user_id, 'btn_back_to_menu')}", callback_data="back_to_main")]
+        ]
+        
+        keyboard = InlineKeyboardMarkup(buttons)
+        self.safe_edit_message(query, admin_text, 'HTML', keyboard)
+    def handle_admin_users(self, query):
+        """User Management Interface"""
+        user_id = query.from_user.id
+        
+        if not self.db.is_admin(user_id):
+            query.answer(t(user_id, 'admin_panel_access_denied'))
+            return
+        
+        query.answer()
+        
+        # Get active user list
+        active_users = self.db.get_active_users(days=7, limit=15)
+        
+        text = f"<b>{t(user_id, 'user_management_title')}</b>\n\n<b>{t(user_id, 'user_management_recent_active')}</b>\n\n"
+        
+        if active_users:
+            for i, (uid, username, first_name, register_time, last_active, status) in enumerate(active_users[:10], 1):
+                # Check membership status
+                is_member, level, _ = self.db.check_membership(uid)
+                member_icon = "💎" if is_member else "❌"
+                admin_icon = "👑" if self.db.is_admin(uid) else ""
+                
+                display_name = first_name or username or f"{t(user_id, 'user_management_user_prefix')}{uid}"
+                if len(display_name) > 15:
+                    display_name = display_name[:15] + "..."
+                
+                text += f"{i}. {admin_icon}{member_icon} <code>{uid}</code> - {display_name}\n"
+                if last_active:
+                    try:
+                        # Database stores naive datetime strings, compare with naive Beijing time
+                        last_time = datetime.strptime(last_active, '%Y-%m-%d %H:%M:%S')
+                        time_diff = datetime.now(BEIJING_TZ).replace(tzinfo=None) - last_time
+                        if time_diff.days == 0:
+                            time_str = t(user_id, 'user_management_time_hours_ago').format(hours=time_diff.seconds//3600)
+                        else:
+                            time_str = t(user_id, 'user_management_time_days_ago').format(days=time_diff.days)
+                        text += f"   🕒 {time_str}\n"
+                    except:
+                        text += f"   🕒 {last_active}\n"
+                text += "\n"
+        else:
+            text += t(user_id, 'user_management_no_active') + "\n"
+        
+        text += f"\n{t(user_id, 'user_management_legend')}\n{t(user_id, 'user_management_legend_admin')} | {t(user_id, 'user_management_legend_vip')} | {t(user_id, 'user_management_legend_normal')}"
+        
+        buttons = [
+            [
+                InlineKeyboardButton(t(user_id, 'user_management_btn_search'), callback_data="admin_search"),
+                InlineKeyboardButton(t(user_id, 'user_management_btn_recent'), callback_data="admin_recent")
+            ],
+            [
+                InlineKeyboardButton(t(user_id, 'user_management_btn_stats'), callback_data="admin_stats"),
+                InlineKeyboardButton(t(user_id, 'user_management_btn_refresh'), callback_data="admin_users")
+            ],
+            [InlineKeyboardButton(t(user_id, 'admin_btn_back_panel'), callback_data="admin_panel")]
+        ]
+        
+        keyboard = InlineKeyboardMarkup(buttons)
+        self.safe_edit_message(query, text, 'HTML', keyboard)
+
+    def handle_admin_stats(self, query):
+        """User Statistics Interface"""
+        user_id = query.from_user.id
+        
+        if not self.db.is_admin(user_id):
+            query.answer(t(user_id, 'admin_panel_access_denied'))
+            return
+        
+        query.answer()
+        
+        stats = self.db.get_user_statistics()
+        
+        # Calculate ratios
+        total = stats.get('total_users', 0)
+        active_rate = (stats.get('week_active', 0) / total * 100) if total > 0 else 0
+        member_rate = (stats.get('active_members', 0) / total * 100) if total > 0 else 0
+        
+        text = f"""
+<b>{t(user_id, 'user_stats_title')}</b>
+
+<b>{t(user_id, 'user_stats_basic_data')}</b>
+• {t(user_id, 'user_stats_total_users')}: {stats.get('total_users', 0)}
+• {t(user_id, 'user_stats_today_active')}: {stats.get('today_active', 0)}
+• {t(user_id, 'user_stats_week_active')}: {stats.get('week_active', 0)} ({active_rate:.1f}%)
+• {t(user_id, 'user_stats_recent_new')}: {stats.get('recent_users', 0)} {t(user_id, 'user_stats_recent_days')}
+
+<b>{t(user_id, 'user_stats_member_data')}</b>
+• {t(user_id, 'user_stats_active_members')}: {stats.get('active_members', 0)} ({member_rate:.1f}%)
+• {t(user_id, 'user_stats_trial_members')}: {stats.get('trial_members', 0)}
+• {t(user_id, 'user_stats_conversion_rate')}: {member_rate:.1f}%
+
+<b>{t(user_id, 'user_stats_activity_analysis')}</b>
+• {t(user_id, 'user_stats_week_rate')}: {active_rate:.1f}%
+• {t(user_id, 'user_stats_day_rate')}: {(stats.get('today_active', 0) / total * 100) if total > 0 else 0:.1f}%
+
+<b>{t(user_id, 'user_stats_time')}</b>
+{datetime.now(BEIJING_TZ).strftime('%Y-%m-%d %H:%M:%S CST')}
+        """
+        
+        buttons = [
+            [
+                InlineKeyboardButton(t(user_id, 'admin_btn_user_management'), callback_data="admin_users"),
+                InlineKeyboardButton(t(user_id, 'user_stats_btn_refresh'), callback_data="admin_stats")
+            ],
+            [InlineKeyboardButton(t(user_id, 'admin_btn_back_panel'), callback_data="admin_panel")]
+        ]
+        
+        keyboard = InlineKeyboardMarkup(buttons)
+        self.safe_edit_message(query, text, 'HTML', keyboard)
+
+    def handle_admin_manage(self, query):
+        """Admin Management Interface"""
+        user_id = query.from_user.id
+        
+        if not self.db.is_admin(user_id):
+            query.answer(t(user_id, 'admin_panel_access_denied'))
+            return
+        
+        query.answer()
+        
+        # Get admin list
+        admins = self.db.get_all_admins()
+        
+        text = f"<b>{t(user_id, 'admin_manage_title')}</b>\n\n<b>{t(user_id, 'admin_manage_list')}</b>\n\n"
+        
+        if admins:
+            for i, (admin_id, username, first_name, added_time) in enumerate(admins, 1):
+                is_super = admin_id in config.ADMIN_IDS
+                admin_type = t(user_id, 'admin_manage_super') if is_super else t(user_id, 'admin_manage_normal')
+                
+                display_name = first_name or username or f"{t(user_id, 'admin_manage_admin_prefix')}{admin_id}"
+                if len(display_name) > 15:
+                    display_name = display_name[:15] + "..."
+                
+                text += f"{i}. {admin_type}\n"
+                text += f"   ID: <code>{admin_id}</code>\n"
+                text += f"   {t(user_id, 'admin_manage_nickname')}: {display_name}\n"
+                if username and username != t(user_id, 'admin_manage_config_admin'):
+                    text += f"   {t(user_id, 'admin_manage_username')}: @{username}\n"
+                display_time = added_time if added_time != "系统内置" else t(user_id, 'admin_manage_system_builtin')
+                text += f"   {t(user_id, 'admin_manage_added_time')}: {display_time}\n\n"
+        else:
+            text += t(user_id, 'admin_manage_no_admins') + "\n"
+        
+        text += f"\n<b>{t(user_id, 'admin_manage_description')}</b>\n• {t(user_id, 'admin_manage_desc_super')}\n• {t(user_id, 'admin_manage_desc_normal')}"
+        
+        buttons = [
+            [InlineKeyboardButton(t(user_id, 'admin_btn_back_panel'), callback_data="admin_panel")]
+        ]
+        
+        keyboard = InlineKeyboardMarkup(buttons)
+        self.safe_edit_message(query, text, 'HTML', keyboard)
+
+    def handle_admin_search(self, query):
+        """Search User Interface"""
+        user_id = query.from_user.id
+        
+        if not self.db.is_admin(user_id):
+            query.answer(t(user_id, 'admin_panel_access_denied'))
+            return
+        
+        query.answer()
+        
+        text = f"""
+<b>{t(user_id, 'search_user_title')}</b>
+
+<b>{t(user_id, 'search_user_prompt')}</b>
+{t(user_id, 'search_user_methods')}
+• {t(user_id, 'search_user_by_id')}
+• {t(user_id, 'search_user_by_username')}
+• {t(user_id, 'search_user_by_nickname')}
+
+<b>{t(user_id, 'search_user_example')}</b>
+• {t(user_id, 'search_user_example_id')}
+• {t(user_id, 'search_user_example_username')}
+• {t(user_id, 'search_user_example_nickname')}
+
+{t(user_id, 'search_user_timeout')}
+{t(user_id, 'search_user_send_prompt')}
+        """
+        
+        # Set user status to waiting for search input
+        self.db.save_user(
+            user_id,
+            query.from_user.username or "",
+            query.from_user.first_name or "",
+            "waiting_admin_search"
+        )
+        
+        buttons = [
+            [InlineKeyboardButton(t(user_id, 'search_user_btn_cancel'), callback_data="admin_users")]
+        ]
+        
+        keyboard = InlineKeyboardMarkup(buttons)
+        self.safe_edit_message(query, text, 'HTML', keyboard)
+
+    def handle_admin_recent(self, query):
+        """Recently Registered Users"""
+        user_id = query.from_user.id
+        
+        if not self.db.is_admin(user_id):
+            query.answer(t(user_id, 'admin_panel_access_denied'))
+            return
+        
+        query.answer()
+        
+        recent_users = self.db.get_recent_users(limit=15)
+        
+        text = f"<b>{t(user_id, 'recent_users_title')}</b>\n\n"
+        
+        if recent_users:
+            for i, (uid, username, first_name, register_time, last_active, status) in enumerate(recent_users, 1):
+                # Check membership status
+                is_member, level, _ = self.db.check_membership(uid)
+                member_icon = "💎" if is_member else "❌"
+                admin_icon = "👑" if self.db.is_admin(uid) else ""
+                
+                display_name = first_name or username or f"{t(user_id, 'user_management_user_prefix')}{uid}"
+                if len(display_name) > 15:
+                    display_name = display_name[:15] + "..."
+                
+                text += f"{i}. {admin_icon}{member_icon} <code>{uid}</code> - {display_name}\n"
+                
+                if register_time:
+                    try:
+                        # Database stores naive datetime strings, compare with naive Beijing time
+                        reg_time = datetime.strptime(register_time, '%Y-%m-%d %H:%M:%S')
+                        time_diff = datetime.now(BEIJING_TZ).replace(tzinfo=None) - reg_time
+                        if time_diff.days == 0:
+                            time_str = t(user_id, 'user_management_time_hours_ago').format(hours=time_diff.seconds//3600)
+                        else:
+                            time_str = t(user_id, 'user_management_time_days_ago').format(days=time_diff.days)
+                        text += f"   📅 {t(user_id, 'recent_users_registered').format(time=time_str)}\n"
+                    except:
+                        text += f"   📅 {register_time}\n"
+                text += "\n"
+        else:
+            text += t(user_id, 'recent_users_no_data') + "\n"
+        
+        text += f"\n{t(user_id, 'user_management_legend')}\n{t(user_id, 'user_management_legend_admin')} | {t(user_id, 'user_management_legend_vip')} | {t(user_id, 'user_management_legend_normal')}"
+        
+        buttons = [
+            [
+                InlineKeyboardButton(t(user_id, 'admin_btn_user_management'), callback_data="admin_users"),
+                InlineKeyboardButton(t(user_id, 'recent_users_btn_refresh'), callback_data="admin_recent")
+            ],
+            [InlineKeyboardButton(t(user_id, 'admin_btn_back_panel'), callback_data="admin_panel")]
+        ]
+        
+        keyboard = InlineKeyboardMarkup(buttons)
+        self.safe_edit_message(query, text, 'HTML', keyboard)
+    
+    def handle_admin_payment_stats(self, query):
+        """管理员收款统计页面"""
+        user_id = query.from_user.id
+        
+        if not self.db.is_admin(user_id):
+            query.answer(t(user_id, 'admin_panel_access_denied'))
+            return
+        
+        query.answer()
+        
+        try:
+            from tron import PaymentDatabase
+            payment_db = PaymentDatabase()
+            
+            # 获取统计数据
+            today_stats = payment_db.get_today_stats()
+            week_stats = payment_db.get_week_stats()
+            month_stats = payment_db.get_month_stats()
+            
+            # 格式化今日统计
+            today_date = datetime.now(BEIJING_TZ).strftime('%Y-%m-%d')
+            
+            text = f"""<b>{t(user_id, 'admin_payment_stats_title')}</b>
+
+━━━━━━━━━━━━━━━━━━━━
+<b>{t(user_id, 'admin_stats_today')} ({today_date})</b>
+• {t(user_id, 'admin_stats_order_count')}: {today_stats['total_count']} 笔
+• {t(user_id, 'admin_stats_total_amount')}: {today_stats['total_amount']:.4f} USDT
+• {t(user_id, 'admin_stats_completed')}: {today_stats['completed_count']} 笔 ({today_stats['completed_amount']:.4f} USDT)
+• {t(user_id, 'admin_stats_pending')}: {today_stats['pending_count']} 笔 ({today_stats['pending_amount']:.4f} USDT)
+• {t(user_id, 'admin_stats_cancelled')}: {today_stats['cancelled_count']} 笔 ({today_stats['cancelled_amount']:.4f} USDT)
+• {t(user_id, 'admin_stats_expired')}: {today_stats['expired_count']} 笔 ({today_stats['expired_amount']:.4f} USDT)
+
+━━━━━━━━━━━━━━━━━━━━
+<b>{t(user_id, 'admin_stats_week')}</b>
+• {t(user_id, 'admin_stats_order_count')}: {week_stats['total_count']} 笔
+• {t(user_id, 'admin_stats_total_amount')}: {week_stats['total_amount']:.4f} USDT
+
+━━━━━━━━━━━━━━━━━━━━
+<b>{t(user_id, 'admin_stats_month')}</b>
+• {t(user_id, 'admin_stats_order_count')}: {month_stats['total_count']} 笔
+• {t(user_id, 'admin_stats_total_amount')}: {month_stats['total_amount']:.4f} USDT
+"""
+            
+            buttons = [
+                [InlineKeyboardButton(t(user_id, 'btn_admin_view_orders'), callback_data="admin_payment_orders")],
+                [
+                    InlineKeyboardButton(t(user_id, 'btn_admin_query_by_date'), callback_data="admin_query_by_date"),
+                    InlineKeyboardButton(t(user_id, 'btn_admin_query_by_user'), callback_data="admin_query_by_user")
+                ],
+                [InlineKeyboardButton(t(user_id, 'admin_btn_back_panel'), callback_data="admin_panel")]
+            ]
+            
+            keyboard = InlineKeyboardMarkup(buttons)
+            self.safe_edit_message(query, text, 'HTML', keyboard)
+            
+        except Exception as e:
+            logger.error(f"显示收款统计失败: {e}")
+            query.answer("❌ 加载统计数据失败", show_alert=True)
+    
+    def handle_admin_payment_orders(self, query, page: int = 1):
+        """管理员订单列表页面"""
+        user_id = query.from_user.id
+        
+        if not self.db.is_admin(user_id):
+            query.answer(t(user_id, 'admin_panel_access_denied'))
+            return
+        
+        query.answer()
+        
+        try:
+            from tron import PaymentDatabase, PaymentConfig
+            payment_db = PaymentDatabase()
+            
+            # 分页获取订单
+            per_page = 5
+            orders, total_pages = payment_db.get_orders_paginated(page=page, per_page=per_page)
+            
+            if not orders:
+                text = f"<b>{t(user_id, 'admin_orders_title')}</b>\n\n{t(user_id, 'admin_no_orders')}"
+                buttons = [
+                    [InlineKeyboardButton(t(user_id, 'btn_admin_back_stats'), callback_data="admin_payment_stats")]
+                ]
+                keyboard = InlineKeyboardMarkup(buttons)
+                self.safe_edit_message(query, text, 'HTML', keyboard)
+                return
+            
+            text = f"""<b>{t(user_id, 'admin_orders_title')}</b>
+
+{t(user_id, 'admin_orders_recent')} ({t(user_id, 'admin_orders_page').format(current=page, total=total_pages)})
+"""
+            
+            # 订单状态映射
+            status_map = {
+                'pending': '⏳ 待支付',
+                'paid': '💳 已支付',
+                'completed': '✅ 已完成',
+                'expired': '⏱️ 已过期',
+                'cancelled': '❌ 已取消'
+            }
+            
+            for i, order in enumerate(orders, 1):
+                # 获取套餐名称
+                plan_info = PaymentConfig.PAYMENT_PLANS.get(order.plan_id, {})
+                plan_name = plan_info.get('name', order.plan_id)
+                
+                text += f"\n━━━━━━━━━━━━━━━━━━━━\n"
+                text += f"{i}️⃣ {order.order_id}\n"
+                text += f"• {t(user_id, 'admin_orders_user_id')}: <code>{order.user_id}</code>\n"
+                text += f"• {t(user_id, 'admin_orders_amount')}: {order.amount:.4f} USDT\n"
+                text += f"• {t(user_id, 'admin_orders_plan')}: {plan_name}\n"
+                text += f"• {t(user_id, 'admin_orders_status')}: {status_map.get(order.status.value, order.status.value)}\n"
+                text += f"• {t(user_id, 'admin_orders_created')}: {order.created_at.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                if order.tx_hash:
+                    tx_short = order.tx_hash[:12] + "..."
+                    text += f"• {t(user_id, 'admin_orders_tx_hash')}: {tx_short}\n"
+            
+            # 分页按钮
+            nav_buttons = []
+            if page > 1:
+                nav_buttons.append(InlineKeyboardButton(t(user_id, 'btn_admin_prev_page'), callback_data=f"admin_orders_page_{page-1}"))
+            
+            nav_buttons.append(InlineKeyboardButton(f"{page}/{total_pages}", callback_data="noop"))
+            
+            if page < total_pages:
+                nav_buttons.append(InlineKeyboardButton(t(user_id, 'btn_admin_next_page'), callback_data=f"admin_orders_page_{page+1}"))
+            
+            buttons = [
+                nav_buttons,
+                [
+                    InlineKeyboardButton(t(user_id, 'btn_admin_query_by_date'), callback_data="admin_query_by_date"),
+                    InlineKeyboardButton(t(user_id, 'btn_admin_query_by_user'), callback_data="admin_query_by_user")
+                ],
+                [InlineKeyboardButton(t(user_id, 'btn_admin_back_stats'), callback_data="admin_payment_stats")]
+            ]
+            
+            keyboard = InlineKeyboardMarkup(buttons)
+            self.safe_edit_message(query, text, 'HTML', keyboard)
+            
+        except Exception as e:
+            logger.error(f"显示订单列表失败: {e}")
+            query.answer("❌ 加载订单列表失败", show_alert=True)
+    
+    def handle_admin_payment_export(self, query):
+        """管理员导出报表页面"""
+        user_id = query.from_user.id
+        
+        if not self.db.is_admin(user_id):
+            query.answer(t(user_id, 'admin_panel_access_denied'))
+            return
+        
+        query.answer()
+        
+        text = f"""<b>{t(user_id, 'admin_export_title')}</b>
+
+{t(user_id, 'admin_export_select')}
+"""
+        
+        buttons = [
+            [InlineKeyboardButton(t(user_id, 'btn_admin_export_today'), callback_data="admin_export_today")],
+            [InlineKeyboardButton(t(user_id, 'btn_admin_export_week'), callback_data="admin_export_week")],
+            [InlineKeyboardButton(t(user_id, 'btn_admin_export_month'), callback_data="admin_export_month")],
+            [InlineKeyboardButton(t(user_id, 'btn_admin_export_all'), callback_data="admin_export_all")],
+            [InlineKeyboardButton(t(user_id, 'admin_btn_back_panel'), callback_data="admin_panel")]
+        ]
+        
+        keyboard = InlineKeyboardMarkup(buttons)
+        self.safe_edit_message(query, text, 'HTML', keyboard)
+    
+    def handle_admin_export_generate(self, query, export_type: str):
+        """生成并导出报表"""
+        user_id = query.from_user.id
+        
+        if not self.db.is_admin(user_id):
+            query.answer(t(user_id, 'admin_panel_access_denied'))
+            return
+        
+        query.answer(t(user_id, 'admin_export_generating'))
+        
+        try:
+            from tron import PaymentDatabase
+            payment_db = PaymentDatabase()
+            
+            # 根据类型确定日期范围
+            start_date = None
+            end_date = None
+            filename_suffix = export_type
+            
+            if export_type == "today":
+                now = datetime.now(BEIJING_TZ)
+                start_date = now.replace(hour=0, minute=0, second=0, microsecond=0)
+                end_date = now.replace(hour=23, minute=59, second=59, microsecond=999999)
+                filename_suffix = now.strftime('%Y-%m-%d')
+            elif export_type == "week":
+                now = datetime.now(BEIJING_TZ)
+                start_date = now - timedelta(days=now.weekday())
+                start_date = start_date.replace(hour=0, minute=0, second=0, microsecond=0)
+                end_date = start_date + timedelta(days=6, hours=23, minutes=59, seconds=59)
+                filename_suffix = f"week_{start_date.strftime('%Y-%m-%d')}"
+            elif export_type == "month":
+                now = datetime.now(BEIJING_TZ)
+                start_date = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+                if now.month == 12:
+                    end_date = now.replace(year=now.year + 1, month=1, day=1) - timedelta(seconds=1)
+                else:
+                    end_date = now.replace(month=now.month + 1, day=1) - timedelta(seconds=1)
+                filename_suffix = now.strftime('%Y-%m')
+            
+            # 生成CSV
+            csv_content = payment_db.export_orders_csv(start_date, end_date)
+            
+            if not csv_content:
+                query.answer(t(user_id, 'admin_export_empty'), show_alert=True)
+                return
+            
+            # 发送文件
+            filename = t(user_id, 'admin_export_file_name').format(date=filename_suffix)
+            csv_bytes = BytesIO(csv_content.encode('utf-8'))
+            csv_bytes.seek(0)
+            
+            query.message.reply_document(
+                document=csv_bytes,
+                filename=filename,
+                caption=t(user_id, 'admin_export_success')
+            )
+            
+            # 返回到导出菜单
+            self.handle_admin_payment_export(query)
+            
+        except Exception as e:
+            logger.error(f"导出报表失败: {e}")
+            query.answer("❌ 导出失败", show_alert=True)
+    
+    def handle_admin_query_by_date(self, query):
+        """按日期查询提示"""
+        user_id = query.from_user.id
+        
+        if not self.db.is_admin(user_id):
+            query.answer(t(user_id, 'admin_panel_access_denied'))
+            return
+        
+        query.answer()
+        
+        # Set user status in database
+        self.db.save_user(
+            user_id,
+            query.from_user.username or "",
+            query.from_user.first_name or "",
+            "waiting_admin_query_date"
+        )
+        
+        text = t(user_id, 'admin_query_date_prompt')
+        
+        buttons = [
+            [InlineKeyboardButton(t(user_id, 'btn_cancel'), callback_data="admin_payment_orders")]
+        ]
+        
+        keyboard = InlineKeyboardMarkup(buttons)
+        self.safe_edit_message(query, text, 'HTML', keyboard)
+    
+    def handle_admin_query_by_user(self, query):
+        """按用户查询提示"""
+        user_id = query.from_user.id
+        
+        if not self.db.is_admin(user_id):
+            query.answer(t(user_id, 'admin_panel_access_denied'))
+            return
+        
+        query.answer()
+        
+        # Set user status in database
+        self.db.save_user(
+            user_id,
+            query.from_user.username or "",
+            query.from_user.first_name or "",
+            "waiting_admin_query_user"
+        )
+        
+        text = t(user_id, 'admin_query_user_prompt')
+        
+        buttons = [
+            [InlineKeyboardButton(t(user_id, 'btn_cancel'), callback_data="admin_payment_orders")]
+        ]
+        
+        keyboard = InlineKeyboardMarkup(buttons)
+        self.safe_edit_message(query, text, 'HTML', keyboard)
+    
+    def handle_admin_query_input(self, update: Update, user_id: int, text: str):
+        """处理管理员查询输入"""
+        user_state = self.get_user_state(user_id)
+        action = user_state.get('action')
+        
+        if action == 'admin_query_date':
+            # 处理日期查询
+            self.handle_admin_date_query_result(update, user_id, text)
+        elif action == 'admin_query_user':
+            # 处理用户查询
+            self.handle_admin_user_query_result(update, user_id, text)
+    
+    def handle_admin_date_query_result(self, update: Update, user_id: int, text: str):
+        """处理日期查询结果"""
+        try:
+            from tron import PaymentDatabase, PaymentConfig
+            payment_db = PaymentDatabase()
+            
+            # 解析日期
+            parts = text.strip().split()
+            
+            if len(parts) == 1:
+                # 单日查询
+                date_str = parts[0]
+                start_date = datetime.strptime(date_str, '%Y-%m-%d')
+                start_date = start_date.replace(tzinfo=BEIJING_TZ, hour=0, minute=0, second=0)
+                end_date = start_date.replace(hour=23, minute=59, second=59)
+            elif len(parts) == 2:
+                # 日期范围查询
+                start_str, end_str = parts
+                start_date = datetime.strptime(start_str, '%Y-%m-%d')
+                start_date = start_date.replace(tzinfo=BEIJING_TZ, hour=0, minute=0, second=0)
+                end_date = datetime.strptime(end_str, '%Y-%m-%d')
+                end_date = end_date.replace(tzinfo=BEIJING_TZ, hour=23, minute=59, second=59)
+            else:
+                update.message.reply_text(t(user_id, 'admin_invalid_date'))
+                return
+            
+            # 查询订单
+            orders = payment_db.get_orders_by_date_range(start_date, end_date)
+            
+            if not orders:
+                update.message.reply_text(t(user_id, 'admin_query_no_results'))
+                return
+            
+            # 显示结果
+            text = f"<b>{t(user_id, 'admin_orders_title')}</b>\n\n"
+            text += f"📅 {start_date.strftime('%Y-%m-%d')} ~ {end_date.strftime('%Y-%m-%d')}\n"
+            text += f"共找到 {len(orders)} 笔订单\n"
+            
+            # 状态映射
+            status_map = {
+                'pending': '⏳ 待支付',
+                'paid': '💳 已支付',
+                'completed': '✅ 已完成',
+                'expired': '⏱️ 已过期',
+                'cancelled': '❌ 已取消'
+            }
+            
+            for i, order in enumerate(orders[:10], 1):  # 最多显示10个
+                plan_info = PaymentConfig.PAYMENT_PLANS.get(order.plan_id, {})
+                plan_name = plan_info.get('name', order.plan_id)
+                
+                text += f"\n━━━━━━━━━━━━━━━━━━━━\n"
+                text += f"{i}️⃣ {order.order_id}\n"
+                text += f"• {t(user_id, 'admin_orders_user_id')}: <code>{order.user_id}</code>\n"
+                text += f"• {t(user_id, 'admin_orders_amount')}: {order.amount:.4f} USDT\n"
+                text += f"• {t(user_id, 'admin_orders_plan')}: {plan_name}\n"
+                text += f"• {t(user_id, 'admin_orders_status')}: {status_map.get(order.status.value, order.status.value)}\n"
+                text += f"• {t(user_id, 'admin_orders_created')}: {order.created_at.strftime('%Y-%m-%d %H:%M:%S')}\n"
+            
+            if len(orders) > 10:
+                text += f"\n... 还有 {len(orders) - 10} 笔订单"
+            
+            update.message.reply_text(text, parse_mode='HTML')
+            
+            # 清除状态 - reset user status
+            self.db.save_user(
+                user_id,
+                update.message.from_user.username or "",
+                update.message.from_user.first_name or "",
+                "active"
+            )
+            
+        except ValueError:
+            update.message.reply_text(t(user_id, 'admin_invalid_date'))
+        except Exception as e:
+            logger.error(f"日期查询失败: {e}")
+            update.message.reply_text("❌ 查询失败")
+    
+    def handle_admin_user_query_result(self, update: Update, user_id: int, text: str):
+        """处理用户查询结果"""
+        try:
+            from tron import PaymentDatabase, PaymentConfig
+            payment_db = PaymentDatabase()
+            
+            # 解析用户ID
+            target_user_id = int(text.strip())
+            
+            # 查询订单
+            orders = payment_db.get_orders_by_user(target_user_id)
+            
+            if not orders:
+                update.message.reply_text(t(user_id, 'admin_query_no_results'))
+                return
+            
+            # 显示结果
+            text = f"<b>{t(user_id, 'admin_orders_title')}</b>\n\n"
+            text += f"👤 用户ID: <code>{target_user_id}</code>\n"
+            text += f"共找到 {len(orders)} 笔订单\n"
+            
+            # 状态映射
+            status_map = {
+                'pending': '⏳ 待支付',
+                'paid': '💳 已支付',
+                'completed': '✅ 已完成',
+                'expired': '⏱️ 已过期',
+                'cancelled': '❌ 已取消'
+            }
+            
+            for i, order in enumerate(orders[:10], 1):  # 最多显示10个
+                plan_info = PaymentConfig.PAYMENT_PLANS.get(order.plan_id, {})
+                plan_name = plan_info.get('name', order.plan_id)
+                
+                text += f"\n━━━━━━━━━━━━━━━━━━━━\n"
+                text += f"{i}️⃣ {order.order_id}\n"
+                text += f"• {t(user_id, 'admin_orders_amount')}: {order.amount:.4f} USDT\n"
+                text += f"• {t(user_id, 'admin_orders_plan')}: {plan_name}\n"
+                text += f"• {t(user_id, 'admin_orders_status')}: {status_map.get(order.status.value, order.status.value)}\n"
+                text += f"• {t(user_id, 'admin_orders_created')}: {order.created_at.strftime('%Y-%m-%d %H:%M:%S')}\n"
+            
+            if len(orders) > 10:
+                text += f"\n... 还有 {len(orders) - 10} 笔订单"
+            
+            update.message.reply_text(text, parse_mode='HTML')
+            
+            # 清除状态 - reset user status
+            self.db.save_user(
+                user_id,
+                update.message.from_user.username or "",
+                update.message.from_user.first_name or "",
+                "active"
+            )
+            
+        except ValueError:
+            update.message.reply_text(t(user_id, 'admin_invalid_user_id'))
+        except Exception as e:
+            logger.error(f"用户查询失败: {e}")
+            update.message.reply_text("❌ 查询失败")
+
+    def handle_user_detail(self, query, target_user_id: int):
+        """显示用户详细信息"""
+        user_id = query.from_user.id
+        
+        if not self.db.is_admin(user_id):
+            query.answer("❌ 仅管理员可访问")
+            return
+        
+        query.answer()
+        
+        user_info = self.db.get_user_membership_info(target_user_id)
+        
+        if not user_info:
+            self.safe_edit_message(query, f"❌ 找不到用户 {target_user_id}")
+            return
+        
+        # 格式化显示
+        username = user_info.get('username', '')
+        first_name = user_info.get('first_name', '')
+        register_time = user_info.get('register_time', '')
+        last_active = user_info.get('last_active', '')
+        membership_level = user_info.get('membership_level', '')
+        expiry_time = user_info.get('expiry_time', '')
+        is_admin = user_info.get('is_admin', False)
+        
+        # 计算活跃度
+        activity_status = "🔴 从未活跃"
+        if last_active:
+            try:
+                # Database stores naive datetime strings, compare with naive Beijing time
+                last_time = datetime.strptime(last_active, '%Y-%m-%d %H:%M:%S')
+                time_diff = datetime.now(BEIJING_TZ).replace(tzinfo=None) - last_time
+                if time_diff.days == 0:
+                    activity_status = f"🟢 {time_diff.seconds//3600}小时前活跃"
+                elif time_diff.days <= 7:
+                    activity_status = f"🟡 {time_diff.days}天前活跃"
+                else:
+                    activity_status = f"🔴 {time_diff.days}天前活跃"
+            except:
+                activity_status = f"🔴 {last_active}"
+        
+        # 会员状态
+        member_status = "❌ 无会员"
+        if membership_level and membership_level != "无会员":
+            if expiry_time:
+                try:
+                    # Database stores naive datetime strings, compare with naive Beijing time
+                    expiry_dt = datetime.strptime(expiry_time, '%Y-%m-%d %H:%M:%S')
+                    if expiry_dt > datetime.now(BEIJING_TZ).replace(tzinfo=None):
+                        member_status = f"🎁 {membership_level}（有效至 {expiry_time}）"
+                    else:
+                        member_status = f"⏰ {membership_level}（已过期）"
+                except:
+                    member_status = f"🎁 {membership_level}"
+        
+        text = f"""
+<b>👤 用户详细信息</b>
+
+<b>📋 基本信息</b>
+• 用户ID: <code>{target_user_id}</code>
+• 昵称: {first_name or '未设置'}
+• 用户名: @{username} 
+• 权限: {'👑 管理员' if is_admin else '👤 普通用户'}
+
+<b>📅 时间信息</b>
+• 注册时间: {register_time or '未知'}
+• 最后活跃: {last_active or '从未活跃'}
+• 活跃状态: {activity_status}
+
+<b>💎 会员信息</b>
+• 会员状态: {member_status}
+
+<b>🔧 管理操作</b>
+点击下方按钮进行管理操作
+        """
+        
+        buttons = [
+            [InlineKeyboardButton("🎁 授予体验会员", callback_data=f"grant_membership_{target_user_id}")]
+        ]
+        
+        # 如果不是管理员，显示设为管理员按钮
+        if not is_admin:
+            buttons.append([InlineKeyboardButton("👑 设为管理员", callback_data=f"make_admin_{target_user_id}")])
+        
+        buttons.append([InlineKeyboardButton("🔙 返回", callback_data="admin_users")])
+        
+        keyboard = InlineKeyboardMarkup(buttons)
+        self.safe_edit_message(query, text, 'HTML', keyboard)
+
+    def handle_grant_membership(self, query, target_user_id: int):
+        """授予用户体验会员"""
+        user_id = query.from_user.id
+        
+        if not self.db.is_admin(user_id):
+            query.answer("❌ 仅管理员可访问")
+            return
+        
+        # 检查用户是否存在
+        user_info = self.db.get_user_membership_info(target_user_id)
+        if not user_info:
+            query.answer("❌ 用户不存在")
+            return
+        
+        # 授予体验会员
+        success = self.db.save_membership(target_user_id, "体验会员")
+        
+        if success:
+            query.answer("✅ 体验会员授予成功")
+            # 刷新用户详情页面
+            self.handle_user_detail(query, target_user_id)
+        else:
+            query.answer("❌ 授予失败")
+
+    def handle_make_admin(self, query, target_user_id: int):
+        """设置用户为管理员"""
+        user_id = query.from_user.id
+        
+        if not self.db.is_admin(user_id):
+            query.answer("❌ 仅管理员可访问")
+            return
+        
+        # 检查用户是否存在
+        user_info = self.db.get_user_membership_info(target_user_id)
+        if not user_info:
+            query.answer("❌ 用户不存在")
+            return
+        
+        username = user_info.get('username', '')
+        first_name = user_info.get('first_name', '')
+        
+        # 添加为管理员
+        success = self.db.add_admin(target_user_id, username, first_name, user_id)
+        
+        if success:
+            query.answer("✅ 管理员设置成功")
+            # 刷新用户详情页面
+            self.handle_user_detail(query, target_user_id)
+        else:
+            query.answer("❌ 设置失败")
+    def handle_proxy_panel(self, query):
+        """代理面板"""
+        user_id = query.from_user.id
+        
+        if not self.db.is_admin(user_id):
+            query.answer("❌ 仅管理员可访问")
+            return
+        
+        # 直接调用刷新代理面板
+        self.refresh_proxy_panel(query)
+
+    def handle_file(self, update: Update, context: CallbackContext):
+        """处理文件上传"""
+        user_id = update.effective_user.id
+        document = update.message.document
+
+        if not document:
+            self.safe_send_message(update, "❌ 请上传文件")
+            return
+
+        try:
+            conn = sqlite3.connect(config.DB_NAME)
+            c = conn.cursor()
+            c.execute("SELECT status FROM users WHERE user_id = ?", (user_id,))
+            row = c.fetchone()
+            conn.close()
+
+            # 放行的状态，新增 waiting_api_file, waiting_rename_file, waiting_merge_files, waiting_cleanup_file, batch_create_upload, reauthorize_upload, registration_check_upload, profile_update_upload, waiting_contact_check_file
+            allowed_states = [
+                "waiting_file",
+                "waiting_convert_tdata",
+                "waiting_convert_session",
+                "waiting_2fa_file",
+                "waiting_api_file",
+                "waiting_classify_file",
+                "waiting_rename_file",
+                "waiting_merge_files",
+                "waiting_forget_2fa_file",
+                "waiting_add_2fa_file",
+                "waiting_remove_2fa_file",
+                "waiting_cleanup_file",
+                "batch_create_upload",
+                "batch_create_names",
+                "batch_create_usernames",
+                "reauthorize_upload",
+                "registration_check_upload",
+                "profile_update_upload",
+                "waiting_contact_check_file",
+            ]
+            
+            # 添加自定义资料上传状态
+            if row and row[0].startswith("profile_custom_upload_"):
+                allowed_states.append(row[0])
+            
+            if not row or row[0] not in allowed_states:
+                self.safe_send_message(update, f"❌ {t(user_id, 'error_click_function_button')}")
+                return
+
+            user_status = row[0]
+        except Exception:
+            self.safe_send_message(update, "❌ 系统错误，请重试")
+            return
+        
+        # 文件重命名和账户合并不需要会员权限检查，也不需要ZIP格式检查
+        if user_status == "waiting_rename_file":
+            self.handle_rename_file_upload(update, context, document)
+            return
+        elif user_status == "waiting_merge_files":
+            self.handle_merge_file_upload(update, context, document)
+            return
+        
+        # 自定义资料上传不需要ZIP格式检查（支持txt和图片文件）
+        if user_status.startswith("profile_custom_upload_"):
+            field_name = user_status.replace("profile_custom_upload_", "")
+            self.handle_profile_custom_file_upload(update, context, user_id, field_name, document)
+            return
+        
+        # 其他功能需要ZIP格式
+        if not document.file_name.lower().endswith('.zip'):
+            self.safe_send_message(update, t(user_id, 'error_upload_zip_only'))
+            return
+
+        is_member, _, _ = self.db.check_membership(user_id)
+        if not is_member and not self.db.is_admin(user_id):
+            self.safe_send_message(update, "❌ 需要会员权限")
+            return
+
+        if document.file_size > 100 * 1024 * 1024:
+            self.safe_send_message(update, "❌ 文件过大 (限制100MB)")
+            return
+
+        # 根据用户状态选择处理方式
+        if user_status == "waiting_file":
+            # 异步处理账号检测
+            def process_file():
+                try:
+                    asyncio.run(self.process_enhanced_check(update, context, document))
+                except asyncio.CancelledError:
+                    print(f"[process_file] 任务被取消")
+                except Exception as e:
+                    print(f"[process_file] 处理异常: {e}")
+                    import traceback
+                    traceback.print_exc()
+            thread = threading.Thread(target=process_file)
+            thread.start()
+
+        elif user_status in ["waiting_convert_tdata", "waiting_convert_session"]:
+            # 异步处理格式转换
+            def process_conversion():
+                try:
+                    asyncio.run(self.process_format_conversion(update, context, document, user_status))
+                except asyncio.CancelledError:
+                    print(f"[process_conversion] 任务被取消")
+                except Exception as e:
+                    print(f"[process_conversion] 处理异常: {e}")
+                    import traceback
+                    traceback.print_exc()
+            thread = threading.Thread(target=process_conversion)
+            thread.start()
+
+        elif user_status == "waiting_2fa_file":
+            # 异步处理2FA密码修改
+            def process_2fa():
+                try:
+                    asyncio.run(self.process_2fa_change(update, context, document))
+                except asyncio.CancelledError:
+                    print(f"[process_2fa] 任务被取消")
+                except Exception as e:
+                    print(f"[process_2fa] 处理异常: {e}")
+                    import traceback
+                    traceback.print_exc()
+            thread = threading.Thread(target=process_2fa)
+            thread.start()
+
+        elif user_status == "waiting_api_file":
+            # 新增：API转换处理
+            def process_api_conversion():
+                try:
+                    asyncio.run(self.process_api_conversion(update, context, document))
+                except asyncio.CancelledError:
+                    print(f"[process_api_conversion] 任务被取消")
+                except Exception as e:
+                    print(f"[process_api_conversion] 处理异常: {e}")
+                    import traceback
+                    traceback.print_exc()
+            thread = threading.Thread(target=process_api_conversion)
+            thread.start()
+        elif user_status == "waiting_classify_file":
+            # 账号分类处理
+            def process_classify():
+                try:
+                    asyncio.run(self.process_classify_stage1(update, context, document))
+                except asyncio.CancelledError:
+                    print(f"[process_classify] 任务被取消")
+                except Exception as e:
+                    print(f"[process_classify] 处理异常: {e}")
+                    import traceback
+                    traceback.print_exc()
+            thread = threading.Thread(target=process_classify, daemon=True)
+            thread.start()
+        elif user_status == "waiting_forget_2fa_file":
+            # 忘记2FA处理
+            def process_forget_2fa():
+                try:
+                    asyncio.run(self.process_forget_2fa(update, context, document))
+                except asyncio.CancelledError:
+                    print(f"[process_forget_2fa] 任务被取消")
+                except Exception as e:
+                    print(f"[process_forget_2fa] 处理异常: {e}")
+                    import traceback
+                    traceback.print_exc()
+            thread = threading.Thread(target=process_forget_2fa, daemon=True)
+            thread.start()
+        elif user_status == "waiting_add_2fa_file":
+            # 添加2FA处理
+            def process_add_2fa():
+                try:
+                    asyncio.run(self.process_add_2fa(update, context, document))
+                except asyncio.CancelledError:
+                    print(f"[process_add_2fa] 任务被取消")
+                except Exception as e:
+                    print(f"[process_add_2fa] 处理异常: {e}")
+                    import traceback
+                    traceback.print_exc()
+            thread = threading.Thread(target=process_add_2fa, daemon=True)
+            thread.start()
+        elif user_status == "waiting_remove_2fa_file":
+            # 删除2FA处理
+            def process_remove_2fa():
+                try:
+                    asyncio.run(self.process_remove_2fa(update, context, document))
+                except asyncio.CancelledError:
+                    print(f"[process_remove_2fa] 任务被取消")
+                except Exception as e:
+                    print(f"[process_remove_2fa] 处理异常: {e}")
+                    import traceback
+                    traceback.print_exc()
+            thread = threading.Thread(target=process_remove_2fa, daemon=True)
+            thread.start()
+        elif user_status == "waiting_cleanup_file":
+            # 一键清理处理
+            def process_cleanup():
+                try:
+                    asyncio.run(self.process_cleanup(update, context, document))
+                except asyncio.CancelledError:
+                    print(f"[process_cleanup] 任务被取消")
+                except Exception as e:
+                    print(f"[process_cleanup] 处理异常: {e}")
+                    import traceback
+                    traceback.print_exc()
+            thread = threading.Thread(target=process_cleanup, daemon=True)
+            thread.start()
+        elif user_status == "batch_create_upload":
+            # 批量创建文件处理
+            def process_batch_create():
+                try:
+                    asyncio.run(self.process_batch_create_upload(update, context, document))
+                except asyncio.CancelledError:
+                    print(f"[process_batch_create] 任务被取消")
+                except Exception as e:
+                    print(f"[process_batch_create] 处理异常: {e}")
+                    import traceback
+                    traceback.print_exc()
+            thread = threading.Thread(target=process_batch_create, daemon=True)
+            thread.start()
+        elif user_status == "batch_create_names":
+            # 处理群组名称文件上传
+            self.process_batch_create_names_file(update, context, document, user_id)
+        elif user_status == "batch_create_usernames":
+            # 处理用户名文件上传
+            self.process_batch_create_usernames_file(update, context, document, user_id)
+        elif user_status == "reauthorize_upload":
+            # 重新授权文件处理
+            def process_reauthorize():
+                try:
+                    asyncio.run(self.process_reauthorize_upload(update, context, document))
+                except asyncio.CancelledError:
+                    print(f"[process_reauthorize] 任务被取消")
+                except Exception as e:
+                    print(f"[process_reauthorize] 处理异常: {e}")
+                    import traceback
+                    traceback.print_exc()
+            thread = threading.Thread(target=process_reauthorize, daemon=True)
+            thread.start()
+        elif user_status == "registration_check_upload":
+            # 查询注册时间文件处理
+            def process_registration_check():
+                try:
+                    asyncio.run(self.process_registration_check_upload(update, context, document))
+                except asyncio.CancelledError:
+                    print(f"[process_registration_check] 任务被取消")
+                except Exception as e:
+                    print(f"[process_registration_check] 处理异常: {e}")
+                    import traceback
+                    traceback.print_exc()
+            thread = threading.Thread(target=process_registration_check, daemon=True)
+            thread.start()
+        elif user_status == "profile_update_upload":
+            # 资料修改文件处理
+            def process_profile_update():
+                try:
+                    asyncio.run(self.process_profile_update(update, context, document))
+                except asyncio.CancelledError:
+                    print(f"[process_profile_update] 任务被取消")
+                except Exception as e:
+                    print(f"[process_profile_update] 处理异常: {e}")
+                    import traceback
+                    traceback.print_exc()
+            thread = threading.Thread(target=process_profile_update, daemon=True)
+            thread.start()
+        elif user_status == "waiting_contact_check_file":
+            # 通讯录限制检测处理
+            def process_contact_limit_check():
+                try:
+                    asyncio.run(self.process_contact_limit_check(update, context, document))
+                except asyncio.CancelledError:
+                    print(f"[process_contact_limit_check] 任务被取消")
+                except Exception as e:
+                    print(f"[process_contact_limit_check] 处理异常: {e}")
+                    import traceback
+                    traceback.print_exc()
+            thread = threading.Thread(target=process_contact_limit_check, daemon=True)
+            thread.start()
+        elif user_status.startswith("profile_custom_upload_"):
+            # 自定义资料文件上传
+            field_name = user_status.replace("profile_custom_upload_", "")
+            self.handle_profile_custom_file_upload(update, context, user_id, field_name, document)
+        # 清空用户状态
+        self.db.save_user(
+            user_id,
+            update.effective_user.username or "",
+            update.effective_user.first_name or "",
+            ""
+        )
+
+
+    async def process_api_conversion(self, update, context, document):
+        """API格式转换 - 阶段1：解析文件并询问网页展示的2FA"""
+        user_id = update.effective_user.id
+        start_time = time.time()
+        task_id = f"{user_id}_{int(start_time)}"
+
+        progress_msg = self.safe_send_message(update, f"📥 <b>{t(user_id, 'api_processing_file')}...</b>", 'HTML')
+        if not progress_msg:
+            return
+
+        temp_zip = None
+        try:
+            temp_dir = tempfile.mkdtemp(prefix="temp_api_")
+            temp_zip = os.path.join(temp_dir, document.file_name)
+            document.get_file().download(temp_zip)
+
+            files, extract_dir, file_type = self.processor.scan_zip_file(temp_zip, user_id, task_id)
+            if not files:
+                try:
+                    progress_msg.edit_text("❌ <b>未找到有效文件</b>\n\n请确保ZIP包含Session或TData格式的文件", parse_mode='HTML')
+                except:
+                    pass
+                return
+
+            total_files = len(files)
+            file_type_upper = file_type.upper()
+            file_type_key = 'api_type_session' if file_type.lower() == 'session' else 'api_type_tdata'
+            
+            try:
+                progress_msg.edit_text(
+                    f"{t(user_id, 'api_found_accounts').format(count=total_files)}\n"
+                    f"{t(user_id, file_type_key)}\n\n"
+                    f"{t(user_id, 'api_enter_2fa')}\n"
+                    f"{t(user_id, 'api_2fa_example')}\n"
+                    f"{t(user_id, 'api_2fa_skip')}\n\n"
+                    f"{t(user_id, 'api_2fa_timeout')}",
+                    parse_mode='HTML'
+                )
+            except:
+                pass
+
+            # 记录待处理任务，等待用户输入2FA
+            self.pending_api_tasks[user_id] = {
+                "files": files,
+                "file_type": file_type,
+                "extract_dir": extract_dir,
+                "task_id": task_id,
+                "progress_msg": progress_msg,
+                "start_time": start_time,
+                "temp_zip": temp_zip
+            }
+        except Exception as e:
+            print(f"❌ API阶段1失败: {e}")
+            try:
+                progress_msg.edit_text(f"❌ 失败: {str(e)}", parse_mode='HTML')
+            except:
+                pass
+            if temp_zip and os.path.exists(temp_zip):
+                try:
+                    shutil.rmtree(os.path.dirname(temp_zip), ignore_errors=True)
+                except:
+                    pass
+    async def continue_api_conversion(self, update, context, user_id: int, two_fa_input: Optional[str]):
+        """API格式转换 - 阶段2：执行转换并生成仅含链接的TXT"""
+        result_files = []
+        task = self.pending_api_tasks.get(user_id)
+        if not task:
+            self.safe_send_message(update, "❌ 没有待处理的API转换任务")
+            return
+
+        files = task["files"]
+        file_type = task["file_type"]
+        extract_dir = task["extract_dir"]
+        task_id = task["task_id"]
+        progress_msg = task["progress_msg"]
+        temp_zip = task["temp_zip"]
+        start_time = task["start_time"]
+
+        # Check if user wants to skip (supports both Chinese and English)
+        override_two_fa = None if (not two_fa_input or two_fa_input.strip().lower() in [t(user_id, 'api_skip').lower(), "跳过", "skip"]) else two_fa_input.strip()
+
+        # 更新提示
+        try:
+            tip = f"🔄 <b>{t(user_id, 'api_converting')}</b>\n\n"
+            if override_two_fa:
+                tip += f"🔐 {t(user_id, 'api_2fa_mode_manual')}: <code>{override_two_fa}</code>\n"
+            else:
+                tip += f"🔐 {t(user_id, 'api_2fa_mode_auto')}\n"
+            progress_msg.edit_text(tip, parse_mode='HTML')
+        except:
+            pass
+
+        try:
+            # =================== 变量初始化 ===================
+            total_files = len(files)
+            api_accounts = []
+            failed_accounts = []
+            failure_reasons = {}
+            
+            # =================== 性能参数计算 ===================  
+            max_concurrent = 15 if total_files > 100 else 10 if total_files > 50 else 5
+            batch_size = min(20, max(5, total_files // 5))  # 统一的批次计算
+            semaphore = asyncio.Semaphore(max_concurrent)
+            
+            print(f"🚀 并发转换参数: 文件={total_files}, 批次={batch_size}, 并发={max_concurrent}")
+            
+            file_type_key = 'api_file_type_session' if file_type.lower() == 'session' else 'api_file_type_tdata'
+            mode_2fa_key = 'api_2fa_mode_manual' if override_two_fa else 'api_2fa_mode_auto'
+            
+            # =================== 进度提示 ===================
+            try:
+                progress_msg.edit_text(
+                    f"🔄 <b>{t(user_id, 'api_converting')}</b>\n\n"
+                    f"📊 {t(user_id, 'api_stat_total').format(count=total_files)}\n"
+                    f"{t(user_id, file_type_key)}\n"
+                    f"{t(user_id, mode_2fa_key)}\n"
+                    f"🚀 并发数: {max_concurrent} | 批次: {batch_size}\n\n"
+                    f"正在处理...",
+                    parse_mode='HTML'
+                )
+            except:
+                pass
+
+            # =================== 并发批处理循环 ===================
+            for i in range(0, total_files, batch_size):
+                batch_files = files[i:i + batch_size]
+                
+                # 更新进度
+                try:
+                    processed = i
+                    progress = int(processed / total_files * 100)
+                    elapsed = time.time() - start_time
+                    speed = processed / elapsed if elapsed > 0 and processed > 0 else 0
+                    remaining = (total_files - processed) / speed if speed > 0 else 0
+                    
+                    file_type_key = 'api_file_type_session' if file_type.lower() == 'session' else 'api_file_type_tdata'
+                    mode_2fa_key = 'api_2fa_mode_manual' if override_two_fa else 'api_2fa_mode_auto'
+                    
+                    # 生成失败原因统计
+                    failure_stats = ""
+                    if failure_reasons:
+                        failure_stats = f"\n\n<b>{t(user_id, 'api_failure_stats')}</b>\n"
+                        for reason, count in failure_reasons.items():
+                            # 翻译失败原因
+                            reason_key_map = {
+                                "转换失败": "api_failure_reason_conversion_failed",
+                                "未授权": "api_failure_reason_unauthorized",
+                                "连接超时": "api_failure_reason_timeout",
+                                "转换异常": "api_failure_reason_conversion_error",
+                                "并发异常": "api_failure_reason_concurrent_error",
+                                "文件不存在": "api_failure_reason_file_not_exist",
+                                "文件损坏": "api_failure_reason_file_corrupted",
+                                "目录不存在": "api_failure_reason_dir_not_exist",
+                                "未知错误": "api_failure_reason_unknown",
+                            }
+                            reason_key = reason_key_map.get(reason, None)
+                            translated_reason = t(user_id, reason_key) if reason_key else reason
+                            failure_stats += f"• {translated_reason}: {count}\n"
+                    
+                    progress_text = f"""
+<b>{t(user_id, 'api_converting')}</b>
+
+<b>{t(user_id, 'api_progress')}</b>
+{t(user_id, 'api_progress_percent').format(percent=progress, done=processed, total=total_files)}
+{t(user_id, 'api_progress_success').format(count=len(api_accounts))}
+{t(user_id, 'api_progress_failed').format(count=len(failed_accounts))}
+{t(user_id, 'api_progress_speed').format(speed=f'{speed:.1f}')}
+{t(user_id, 'api_progress_remaining').format(time=f'{remaining/60:.1f}')}
+
+<b>{t(user_id, 'api_processing_status')}</b>
+{t(user_id, file_type_key)}
+{t(user_id, mode_2fa_key)}
+{t(user_id, 'api_elapsed_time').format(time=f'{elapsed:.1f}')}{failure_stats}
+                    """
+                    
+                    progress_msg.edit_text(progress_text, parse_mode='HTML')
+                except:
+                    pass
+                
+                # 并发处理当前批次 - 高速版
+                # 并发处理当前批次
+                async def process_single_file(file_path, file_name):
+                    try:
+                        single_result = await self.api_converter.convert_to_api_format(
+                            [(file_path, file_name)], file_type, override_two_fa
+                        )
+                        
+                        if single_result and len(single_result) > 0:
+                            return ("success", single_result[0], file_name)
+                        else:
+                            reason = await self.get_conversion_failure_reason(file_path, file_type)
+                            return ("failed", reason, file_name)
+                            
+                    except Exception as e:
+                        error_msg = str(e).lower()
+                        if "auth" in error_msg:
+                            reason = "未授权"
+                        elif "timeout" in error_msg:
+                            reason = "连接超时"
+                        else:
+                            reason = "转换异常"
+                        
+                        return ("failed", reason, file_name)
+                
+                # 创建并发任务
+                tasks = [process_single_file(file_path, file_name) for file_path, file_name in batch_files]
+                
+                # 并发执行所有任务
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+                
+                # 处理结果
+                for result in results:
+                    if isinstance(result, BaseException):
+                        failed_accounts.append(("未知文件", "并发异常"))
+                        failure_reasons["并发异常"] = failure_reasons.get("并发异常", 0) + 1
+                        continue
+                    
+                    status, data, file_name = result
+                    if status == "success":
+                        api_accounts.append(data)
+                    else:  # failed
+                        failed_accounts.append((file_name, data))
+                        failure_reasons[data] = failure_reasons.get(data, 0) + 1
+                
+                # 短暂延迟
+                await asyncio.sleep(0.1)  # 减少延迟提升速度
+
+            # 仅生成TXT
+            result_files = self.api_converter.create_api_result_files(api_accounts, task_id, user_id)
+            elapsed_time = time.time() - start_time
+
+            # 生成详细的失败原因统计
+            failure_detail = ""
+            if failure_reasons:
+                failure_detail = f"\n\n<b>{t(user_id, 'api_failure_details')}</b>\n"
+                for reason, count in failure_reasons.items():
+                    percentage = (count / total_files * 100) if total_files > 0 else 0
+                    # 翻译失败原因
+                    reason_key_map = {
+                        "转换失败": "api_failure_reason_conversion_failed",
+                        "未授权": "api_failure_reason_unauthorized",
+                        "连接超时": "api_failure_reason_timeout",
+                        "转换异常": "api_failure_reason_conversion_error",
+                        "并发异常": "api_failure_reason_concurrent_error",
+                        "文件不存在": "api_failure_reason_file_not_exist",
+                        "文件损坏": "api_failure_reason_file_corrupted",
+                        "目录不存在": "api_failure_reason_dir_not_exist",
+                        "未知错误": "api_failure_reason_unknown",
+                    }
+                    reason_key = reason_key_map.get(reason, None)
+                    translated_reason = t(user_id, reason_key) if reason_key else reason
+                    failure_detail += f"• {translated_reason}: {count} ({percentage:.1f}%)\n"
+            
+            success_rate = (len(api_accounts) / total_files * 100) if total_files > 0 else 0
+            fail_rate = 100 - success_rate
+            
+            # 发送结果（TXT）
+            summary_text = f"""
+<b>{t(user_id, 'api_complete')}</b>
+
+<b>{t(user_id, 'api_statistics')}</b>
+{t(user_id, 'api_stat_total').format(count=total_files)}
+{t(user_id, 'api_stat_success').format(count=len(api_accounts), percent=f'{success_rate:.1f}')}
+{t(user_id, 'api_stat_failed').format(count=len(failed_accounts), percent=f'{fail_rate:.1f}')}
+{t(user_id, 'api_stat_duration').format(time=int(elapsed_time))}
+{t(user_id, 'api_stat_speed').format(speed=f'{total_files/elapsed_time:.1f}')}{failure_detail}
+
+{t(user_id, 'api_sending_txt')}
+            """
+            try:
+                progress_msg.edit_text(summary_text, parse_mode='HTML')
+            except:
+                pass
+
+            for file_path in result_files:
+                if os.path.exists(file_path):
+                    try:
+                        with open(file_path, 'rb') as f:
+                            caption = t(user_id, 'api_result_desc')
+                            context.bot.send_document(
+                                chat_id=update.effective_chat.id,
+                                document=f,
+                                filename=os.path.basename(file_path),
+                                caption=caption,
+                                parse_mode='HTML'
+                            )
+                        print(f"📤 已发送TXT: {os.path.basename(file_path)}")
+                        await asyncio.sleep(0.5)
+                    except Exception as e:
+                        print(f"❌ 发送TXT失败: {e}")
+
+            # 完成提示
+            self.safe_send_message(
+                update,
+                t(user_id, 'api_use_again')
+            )
+
+        except Exception as e:
+            print(f"❌ API阶段2失败: {e}")
+            try:
+                progress_msg.edit_text(f"❌ 失败: {str(e)}", parse_mode='HTML')
+            except:
+                pass
+        finally:
+            # 清理
+            if temp_zip and os.path.exists(temp_zip):
+                try:
+                    shutil.rmtree(os.path.dirname(temp_zip), ignore_errors=True)
+                except:
+                    pass
+            if user_id in self.pending_api_tasks:
+                del self.pending_api_tasks[user_id]
+            # 可选：清理生成的TXT（如果你不想保留）
+            try:
+                for file_path in result_files:
+                    if os.path.exists(file_path):
+                        os.remove(file_path)
+                        print(f"🗑️ 已删除TXT: {os.path.basename(file_path)}")
+            except Exception as _:
+                pass
+    async def get_conversion_failure_reason(self, file_path: str, file_type: str) -> str:
+        """获取转换失败的具体原因"""
+        try:
+            if file_type == "session":
+                if not os.path.exists(file_path):
+                    return "文件不存在"
+                
+                if os.path.getsize(file_path) < 100:
+                    return "文件损坏"
+                
+                return "转换失败"
+            
+            elif file_type == "tdata":
+                if not os.path.exists(file_path):
+                    return "目录不存在"
+                
+                return "转换失败"
+            
+            return "未知错误"
+            
+        except Exception:
+            return "检测失败"
+            
+    async def process_enhanced_check(self, update, context, document):
+        """增强版检测处理"""
+        user_id = update.effective_user.id
+        start_time = time.time()
+        task_id = f"{user_id}_{int(start_time)}"
+        
+        print(f"🚀 开始增强版检测任务: {task_id}")
+        print(f"📡 代理模式: {'启用' if config.USE_PROXY else '禁用'}")
+        print(f"🔢 可用代理: {len(self.proxy_manager.proxies)}个")
+        
+        # 安全发送进度消息
+        progress_msg = self.safe_send_message(
+            update,
+            f"<b>{t(user_id, 'processing_file')}</b>",
+            'HTML'
+        )
+        
+        if not progress_msg:
+            print("❌ 无法发送进度消息")
+            return
+        
+        # 创建临时文件用于下载
+        temp_zip = None
+        try:
+            # 下载上传的文件到临时位置
+            temp_dir = tempfile.mkdtemp(prefix="temp_download_")
+            temp_zip = os.path.join(temp_dir, document.file_name)
+            
+            document.get_file().download(temp_zip)
+            print(f"📥 临时下载文件: {temp_zip}")
+            
+            # 扫描并正确保存文件
+            files, extract_dir, file_type = self.processor.scan_zip_file(temp_zip, user_id, task_id)
+            
+            if not files:
+                try:
+                    progress_msg.edit_text(
+                        "❌ <b>未找到有效的账号文件</b>\n\n"
+                        "请确保ZIP文件包含:\n"
+                        "• Session 文件 (.session)\n"
+                        "• Session+JSON 文件 (.session + .json)\n"
+                        "• TData 文件夹",
+                        parse_mode='HTML'
+                    )
+                except:
+                    pass
+                return
+            
+            total_accounts = len(files)
+            proxy_mode_text = t(user_id, 'account_check_proxy_mode') if config.USE_PROXY else t(user_id, 'account_check_local_mode')
+            print(f"📊 找到 {total_accounts} 个账号文件，类型: {file_type}")
+            
+            # 开始检测提示
+            try:
+                progress_msg.edit_text(
+                    f"{t(user_id, 'account_check_starting').format(count=total_accounts)}\n\n"
+                    f"{t(user_id, 'account_check_file_type').format(type=file_type.upper())}\n"
+                    f"{proxy_mode_text}\n"
+                    f"{t(user_id, 'account_check_threads').format(count=config.MAX_CONCURRENT_CHECKS)}\n\n"
+                    f"{t(user_id, 'account_check_please_wait')}",
+                    parse_mode='HTML'
+                )
+            except:
+                pass
+            
+            # 实时更新回调函数
+            async def enhanced_callback(processed, total, results, speed, elapsed):
+                try:
+                    progress = int(processed / total * 100)
+                    remaining_time = (total - processed) / speed if speed > 0 else 0
+                    
+                    # 获取代理使用统计
+                    proxy_stats_text = ""
+                    if config.USE_PROXY and self.checker.proxy_manager.is_proxy_mode_active(self.db):
+                        stats = self.checker.get_proxy_usage_stats()
+                        proxy_stats_text = f"""
+{t(user_id, 'account_check_proxy_stats')}
+{t(user_id, 'account_check_proxies_used').format(count=stats['proxy_success'])}
+{t(user_id, 'account_check_fallback_local').format(count=stats['local_fallback'])}
+{t(user_id, 'account_check_failed_proxies').format(count=stats['proxy_failed'])}
+"""
+                    
+                    mode_text = t(user_id, 'account_check_proxy_mode') if config.USE_PROXY else t(user_id, 'account_check_local_mode')
+                    fast_mode_status = t(user_id, 'account_check_fast_mode_on') if config.PROXY_FAST_MODE else t(user_id, 'account_check_fast_mode_off')
+                    
+                    text = f"""
+{t(user_id, 'account_check_in_progress')}
+
+{t(user_id, 'account_check_progress_title')}
+{t(user_id, 'account_check_progress_percent').format(percent=progress, done=processed, total=total)}
+{t(user_id, 'account_check_format').format(format=file_type.upper())}
+{t(user_id, 'account_check_mode').format(mode=mode_text)}
+{t(user_id, 'account_check_speed').format(speed=f'{speed:.1f}')}
+{t(user_id, 'account_check_remaining').format(time=f'{remaining_time/60:.1f}')}
+{proxy_stats_text}
+{t(user_id, 'account_check_optimization')}
+{t(user_id, 'account_check_fast_mode').format(status=fast_mode_status)}
+{t(user_id, 'account_check_concurrency').format(count=config.PROXY_CHECK_CONCURRENT if config.PROXY_FAST_MODE else config.MAX_CONCURRENT_CHECKS)}
+{t(user_id, 'account_check_timeout').format(seconds=config.PROXY_CHECK_TIMEOUT if config.PROXY_FAST_MODE else config.CHECK_TIMEOUT)}
+                    """
+                    
+                    # 创建状态|数量分离按钮
+                    keyboard = self.create_status_count_separate_buttons(results, processed, total, user_id)
+                    
+                    # 安全编辑消息
+                    try:
+                        progress_msg.edit_text(text, parse_mode='HTML', reply_markup=keyboard)
+                    except RetryAfter as e:
+                        print(f"⚠️ 编辑消息频率限制，等待 {e.retry_after} 秒")
+                        await asyncio.sleep(e.retry_after + 1)
+                        try:
+                            progress_msg.edit_text(text, parse_mode='HTML', reply_markup=keyboard)
+                        except:
+                            pass
+                    except BadRequest as e:
+                        if "message is not modified" not in str(e).lower():
+                            print(f"❌ 编辑消息失败: {e}")
+                    except Exception as e:
+                        print(f"❌ 增强版按钮更新失败: {e}")
+                    
+                except Exception as e:
+                    print(f"❌ 增强版回调失败: {e}")
+            
+            # 开始检测
+            results = await self.processor.check_accounts_with_realtime_updates(
+                files, file_type, enhanced_callback
+            )
+            
+            print("📦 开始生成结果文件...")
+            
+            # 生成结果文件
+            result_files = self.processor.create_result_zips(results, task_id, file_type)
+            
+            print(f"✅ 生成了 {len(result_files)} 个结果文件")
+            
+            # 最终结果显示
+            total_time = time.time() - start_time
+            final_speed = total_accounts / total_time if total_time > 0 else 0
+            
+            # 统计代理使用情况（增强版）
+            proxy_stats = ""
+            if config.USE_PROXY:
+                stats = self.checker.get_proxy_usage_stats()
+                if stats['total'] > 0:
+                    unit = t(user_id, 'accounts_unit')
+                    proxy_stats = f"\n\n<b>{t(user_id, 'proxy_usage_stats')}</b>\n• {t(user_id, 'proxies_used_stat')}: {stats['proxy_success']}{unit}\n• {t(user_id, 'fallback_local_stat')}: {stats['local_fallback']}{unit}\n• {t(user_id, 'failed_proxies_stat')}: {stats['proxy_failed']}{unit}\n• {t(user_id, 'local_only_stat')}: {stats['local_only']}{unit}"
+                else:
+                    # 回退到简单统计
+                    proxy_used_count = sum(1 for _, _, info in sum(results.values(), []) if "代理" in info)
+                    local_used_count = total_accounts - proxy_used_count
+                    unit = t(user_id, 'accounts_unit')
+                    proxy_stats = f"\n\n{t(user_id, 'proxy_connection')}: {proxy_used_count}{unit}\n{t(user_id, 'local_connection')}: {local_used_count}{unit}"
+            
+            # 格式化检测时间
+            seconds_unit = t(user_id, 'seconds_unit')
+            minutes_unit = t(user_id, 'minutes_unit')
+            check_time_text = t(user_id, 'check_time').format(time=f'{int(total_time)}{seconds_unit} ({total_time/60:.1f}{minutes_unit})')
+            
+            accounts_unit = t(user_id, 'accounts_unit')
+            accounts_per_sec = t(user_id, 'accounts_per_second')
+            
+            final_text = f"""
+✅ <b>{t(user_id, 'all_files_sent')}</b>
+
+<b>{t(user_id, 'send_summary')}</b>
+• {t(user_id, 'total_accounts')}: {total_accounts}{accounts_unit}
+• 🟢 {t(user_id, 'status_no_restriction')}: {len(results['无限制'])}{accounts_unit}
+• 🟡 {t(user_id, 'status_spambot')}: {len(results['垃圾邮件'])}{accounts_unit}
+• 🔴 {t(user_id, 'status_frozen')}: {len(results['冻结'])}{accounts_unit}
+• 🟠 {t(user_id, 'status_banned')}: {len(results['封禁'])}{accounts_unit}
+• ⚫ {t(user_id, 'status_connection_error')}: {len(results['连接错误'])}{accounts_unit}{proxy_stats}
+
+<b>{t(user_id, 'performance_stats')}</b>
+• {check_time_text}
+• {t(user_id, 'average_speed')}: {final_speed:.1f} {accounts_per_sec}
+
+{t(user_id, 'sending_files')}
+            """
+            
+            # 最终状态按钮
+            final_keyboard = self.create_status_count_separate_buttons(results, total_accounts, total_accounts, user_id)
+            
+            try:
+                progress_msg.edit_text(final_text, parse_mode='HTML', reply_markup=final_keyboard)
+            except:
+                pass
+            
+            # 自动发送所有分类文件
+            sent_count = 0
+            for file_path, status, count in result_files:
+                if os.path.exists(file_path):
+                    try:
+                        print(f"📤 正在发送: {status}_{count}个.zip")
+                        
+                        # 获取翻译后的文件信息
+                        zip_filename, file_caption_text, check_time_display, check_mode = self.get_translated_file_info(user_id, status, count)
+                        
+                        with open(file_path, 'rb') as f:
+                            context.bot.send_document(
+                                chat_id=update.effective_chat.id,
+                                document=f,
+                                filename=zip_filename,
+                                caption=f"{file_caption_text}\n\n"
+                                       f"{t(user_id, 'check_time').format(time=check_time_display)}\n"
+                                       f"{t(user_id, 'check_mode_label').format(mode=check_mode)}",
+                                parse_mode='HTML'
+                            )
+                        
+                        sent_count += 1
+                        print(f"✅ 发送成功: {zip_filename}")
+                        
+                        # 延迟避免发送过快
+                        await asyncio.sleep(1.0)
+                        
+                    except RetryAfter as e:
+                        print(f"⚠️ 发送文件频率限制，等待 {e.retry_after} 秒")
+                        await asyncio.sleep(e.retry_after + 1)
+                        # 重试发送
+                        try:
+                            zip_filename, file_caption_text, _, _ = self.get_translated_file_info(user_id, status, count)
+                            
+                            with open(file_path, 'rb') as f:
+                                context.bot.send_document(
+                                    chat_id=update.effective_chat.id,
+                                    document=f,
+                                    filename=zip_filename,
+                                    caption=file_caption_text,
+                                    parse_mode='HTML'
+                                )
+                            sent_count += 1
+                        except Exception as e2:
+                            print(f"❌ 重试发送失败: {e2}")
+                    except Exception as e:
+                        print(f"❌ 发送文件失败: {status} - {e}")
+            
+            # 发送完成总结
+            if sent_count > 0:
+                # 检查实际的代理模式状态
+                actual_proxy_mode = self.proxy_manager.is_proxy_mode_active(self.db)
+                check_mode = t(user_id, 'check_mode_proxy') if actual_proxy_mode else t(user_id, 'check_mode_local')
+                
+                summary_text = f"""
+🎉 <b>{t(user_id, 'all_files_sent')}</b>
+
+{t(user_id, 'send_summary')}
+{t(user_id, 'files_sent_count').format(count=sent_count)}
+{t(user_id, 'check_mode_summary').format(mode=check_mode)}
+{t(user_id, 'check_duration').format(seconds=int(total_time))}
+
+{t(user_id, 'thanks_message')}
+                """
+                
+                try:
+                    context.bot.send_message(
+                        chat_id=update.effective_chat.id,
+                        text=summary_text,
+                        parse_mode='HTML'
+                    )
+                except:
+                    pass
+            else:
+                try:
+                    context.bot.send_message(
+                        chat_id=update.effective_chat.id,
+                        text="❌ 没有文件可以发送"
+                    )
+                except:
+                    pass
+            
+            print("✅ 增强版检测任务完成")
+            
+        except Exception as e:
+            print(f"❌ 处理失败: {e}")
+            try:
+                progress_msg.edit_text(f"❌ 处理失败: {str(e)}")
+            except:
+                pass
+        finally:
+            # 清理临时下载文件
+            if temp_zip and os.path.exists(temp_zip):
+                try:
+                    shutil.rmtree(os.path.dirname(temp_zip), ignore_errors=True)
+                    print(f"🗑️ 清理临时文件: {temp_zip}")
+                except:
+                    pass
+    
+    async def process_format_conversion(self, update, context, document, user_status):
+        """处理格式转换"""
+        user_id = update.effective_user.id
+        start_time = time.time()
+        task_id = f"{user_id}_{int(start_time)}"
+        
+        conversion_type = "tdata_to_session" if user_status == "waiting_convert_tdata" else "session_to_tdata"
+        print(f"🔄 开始格式转换任务: {task_id} | 类型: {conversion_type}")
+        
+        # 发送进度消息
+        progress_msg = self.safe_send_message(
+            update,
+            f"<b>{t(user_id, 'processing_your_file')}</b>",
+            'HTML'
+        )
+        
+        if not progress_msg:
+            print("❌ 无法发送进度消息")
+            return
+        
+        temp_zip = None
+        try:
+            # 下载文件
+            temp_dir = tempfile.mkdtemp(prefix="temp_conversion_")
+            temp_zip = os.path.join(temp_dir, document.file_name)
+            
+            document.get_file().download(temp_zip)
+            print(f"📥 下载文件: {temp_zip}")
+            
+            # 扫描文件
+            files, extract_dir, file_type = self.processor.scan_zip_file(temp_zip, user_id, task_id)
+            
+            if not files:
+                try:
+                    progress_msg.edit_text(
+                        f"❌ <b>{t(user_id, 'error_no_valid_files')}</b>\n\n{t(user_id, 'error_ensure_correct_format')}",
+                        parse_mode='HTML'
+                    )
+                except:
+                    pass
+                return
+            
+            # 验证文件类型
+            if conversion_type == "tdata_to_session" and file_type != "tdata":
+                try:
+                    progress_msg.edit_text(
+                        f"❌ <b>{t(user_id, 'error_file_type')}</b>\n\n{t(user_id, 'error_need_tdata').format(type=file_type)}",
+                        parse_mode='HTML'
+                    )
+                except:
+                    pass
+                return
+            
+            if conversion_type == "session_to_tdata" and file_type != "session":
+                try:
+                    progress_msg.edit_text(
+                        f"❌ <b>{t(user_id, 'error_file_type')}</b>\n\n{t(user_id, 'error_need_session').format(type=file_type)}",
+                        parse_mode='HTML'
+                    )
+                except:
+                    pass
+                return
+            
+            total_files = len(files)
+            
+            try:
+                progress_msg.edit_text(
+                    f"<b>{t(user_id, 'start_conversion')}</b>\n\n{t(user_id, 'found_files').format(count=total_files)}\n{t(user_id, 'initializing')}",
+                    parse_mode='HTML'
+                )
+            except:
+                pass
+            
+            # 定义进度回调
+            async def conversion_callback(processed, total, results, speed, elapsed):
+                try:
+                    success_count = len(results.get("转换成功", []))
+                    error_count = len(results.get("转换错误", []))
+                    
+                    progress_text = f"""
+<b>{t(user_id, 'conversion_in_progress')}</b>
+
+<b>{t(user_id, 'conversion_current_progress')}</b>
+{t(user_id, 'conversion_processed').format(done=processed, total=total)}
+{t(user_id, 'conversion_speed').format(speed=f"{speed:.1f}")}
+{t(user_id, 'conversion_elapsed').format(time=int(elapsed))}
+
+{t(user_id, 'conversion_success_count').format(count=success_count)}
+{t(user_id, 'conversion_error_count').format(count=error_count)}
+
+{t(user_id, 'conversion_remaining').format(time=int((total - processed) / speed) if speed > 0 else 0)}
+                    """
+                    
+                    progress_msg.edit_text(progress_text, parse_mode='HTML')
+                except Exception as e:
+                    print(f"⚠️ 更新进度失败: {e}")
+            
+            # 执行批量转换
+            results = await self.converter.batch_convert_with_progress(
+                files, 
+                conversion_type,
+                int(config.API_ID),
+                str(config.API_HASH),
+                conversion_callback
+            )
+            
+            # 创建结果文件
+            result_files = self.converter.create_conversion_result_zips(results, task_id, conversion_type, user_id)
+            
+            elapsed_time = time.time() - start_time
+            
+            # 发送结果统计
+            success_count = len(results["转换成功"])
+            error_count = len(results["转换错误"])
+            
+            summary_text = f"""
+<b>{t(user_id, 'conversion_complete')}</b>
+
+<b>{t(user_id, 'conversion_stats')}</b>
+{t(user_id, 'conversion_total').format(count=total_files)}
+{t(user_id, 'conversion_success').format(count=success_count)}
+{t(user_id, 'conversion_failed').format(count=error_count)}
+{t(user_id, 'conversion_duration').format(time=int(elapsed_time))}
+{t(user_id, 'conversion_speed_stat').format(speed=f"{total_files/elapsed_time:.1f}")}
+
+{t(user_id, 'packing_results')}
+            """
+            
+            try:
+                progress_msg.edit_text(summary_text, parse_mode='HTML')
+            except:
+                pass
+            
+            # 发送结果文件
+            # 发送结果文件（分离发送 ZIP 和 TXT）
+            for zip_path, txt_path, status, count in result_files:
+                try:
+                    # 1. 发送 ZIP 文件
+                    if os.path.exists(zip_path):
+                        with open(zip_path, 'rb') as f:
+                            # Determine if success or failed based on status
+                            if status == "转换成功":
+                                desc_key = 'file_desc_conversion_success'
+                            else:
+                                desc_key = 'file_desc_conversion_failed'
+                            caption = f"{t(user_id, desc_key).format(count=count)}"
+                            update.message.reply_document(
+                                document=f,
+                                filename=os.path.basename(zip_path),
+                                caption=caption,
+                                parse_mode='HTML'
+                            )
+                        print(f"📤 发送ZIP文件: {os.path.basename(zip_path)}")
+                        await asyncio.sleep(1.0)
+                    
+                    # 2. 发送 TXT 报告
+                    if os.path.exists(txt_path):
+                        with open(txt_path, 'rb') as f:
+                            if status == "转换成功":
+                                desc_key = 'report_desc_success'
+                            else:
+                                desc_key = 'report_desc_failed'
+                            caption = f"{t(user_id, desc_key)}\n\n{t(user_id, 'report_contains_accounts').format(count=count)}"
+                            update.message.reply_document(
+                                document=f,
+                                filename=os.path.basename(txt_path),
+                                caption=caption,
+                                parse_mode='HTML'
+                            )
+                        print(f"📤 发送TXT报告: {os.path.basename(txt_path)}")
+                        await asyncio.sleep(1.0)
+                        
+                except Exception as e:
+                    print(f"❌ 发送文件失败: {e}")
+            
+            # 最终消息
+            success_rate = (success_count / total_files * 100) if total_files > 0 else 0
+            
+            final_text = f"""
+<b>{t(user_id, 'conversion_task_complete')}</b>
+
+<b>{t(user_id, 'conversion_stats')}</b>
+{t(user_id, 'conversion_total_count').format(count=total_files)}
+{t(user_id, 'conversion_success_percent').format(count=success_count, percent=f"{success_rate:.1f}")}
+{t(user_id, 'conversion_failed_percent').format(count=error_count, percent=f"{100-success_rate:.1f}")}
+{t(user_id, 'conversion_total_time').format(seconds=int(elapsed_time), minutes=f"{elapsed_time/60:.1f}")}
+{t(user_id, 'conversion_avg_speed').format(speed=f"{total_files/elapsed_time:.2f}")}
+
+
+{t(user_id, 'all_results_sent')}
+            """
+            
+            self.safe_send_message(update, final_text, 'HTML')
+            
+            # 清理临时文件
+            if extract_dir and os.path.exists(extract_dir):
+                shutil.rmtree(extract_dir, ignore_errors=True)
+                print(f"🗑️ 清理解压目录: {extract_dir}")
+            
+            # 清理结果文件（修复：正确解包4个值）
+            for zip_path, txt_path, status, count in result_files:
+                try:
+                    if os.path.exists(zip_path):
+                        os.remove(zip_path)
+                        print(f"🗑️ 清理结果ZIP: {os.path.basename(zip_path)}")
+                except Exception as e:
+                    print(f"⚠️ 清理ZIP失败: {e}")
+                
+                try:
+                    if os.path.exists(txt_path):
+                        os.remove(txt_path)
+                        print(f"🗑️ 清理结果TXT: {os.path.basename(txt_path)}")
+                except Exception as e:
+                    print(f"⚠️ 清理TXT失败: {e}")
+        
+        except Exception as e:
+            print(f"❌ 转换失败: {e}")
+            import traceback
+            traceback.print_exc()
+            
+            try:
+                progress_msg.edit_text(
+                    f"❌ <b>转换失败</b>\n\n错误: {str(e)}",
+                    parse_mode='HTML'
+                )
+            except:
+                pass
+        
+        finally:
+            # 清理临时下载文件
+            if temp_zip and os.path.exists(temp_zip):
+                try:
+                    shutil.rmtree(os.path.dirname(temp_zip), ignore_errors=True)
+                    print(f"🗑️ 清理临时文件: {temp_zip}")
+                except:
+                    pass
+    
+    async def process_2fa_change(self, update, context, document):
+        """处理2FA密码修改 - 交互式版本"""
+        user_id = update.effective_user.id
+        start_time = time.time()
+        task_id = f"{user_id}_{int(start_time)}"
+        
+        print(f"🔐 开始2FA密码修改任务: {task_id}")
+        
+        # 发送进度消息
+        progress_msg = self.safe_send_message(
+            update,
+            t(user_id, 'processing_your_file'),
+            'HTML'
+        )
+        
+        if not progress_msg:
+            print("❌ 无法发送进度消息")
+            return
+        
+        temp_zip = None
+        try:
+            # 下载文件
+            temp_dir = tempfile.mkdtemp(prefix="temp_2fa_")
+            temp_zip = os.path.join(temp_dir, document.file_name)
+            
+            document.get_file().download(temp_zip)
+            print(f"📥 下载文件: {temp_zip}")
+            
+            # 扫描文件
+            files, extract_dir, file_type = self.processor.scan_zip_file(temp_zip, user_id, task_id)
+            
+            if not files:
+                try:
+                    progress_msg.edit_text(
+                        "❌ <b>未找到有效文件</b>\n\n请确保ZIP包含Session或TData格式的账号文件",
+                        parse_mode='HTML'
+                    )
+                except:
+                    pass
+                return
+            
+            total_files = len(files)
+            
+            # 保存任务信息，等待用户输入密码
+            self.two_factor_manager.pending_2fa_tasks[user_id] = {
+                'files': files,
+                'file_type': file_type,
+                'extract_dir': extract_dir,
+                'task_id': task_id,
+                'progress_msg': progress_msg,
+                'start_time': start_time,
+                'temp_zip': temp_zip
+            }
+            
+            # 请求用户输入密码
+            try:
+                progress_msg.edit_text(
+                    f"<b>{t(user_id, 'change_2fa_found_files').format(count=total_files)}</b>\n\n"
+                    f"{t(user_id, 'change_2fa_file_type').format(type=file_type.upper())}\n\n"
+                    f"<b>{t(user_id, 'change_2fa_enter_password')}</b>\n\n"
+                    f"<b>{t(user_id, 'change_2fa_format1')}</b>\n"
+                    f"<code>{t(user_id, 'change_2fa_format1_example')}</code>\n"
+                    f"<i>{t(user_id, 'change_2fa_format1_desc')}</i>\n\n"
+                    f"<b>{t(user_id, 'change_2fa_format2')}</b>\n"
+                    f"<code>{t(user_id, 'change_2fa_format2_example')}</code>\n"
+                    f"<i>{t(user_id, 'change_2fa_format2_desc')}</i>\n\n"
+                    f"<b>{t(user_id, 'change_2fa_tips')}</b>\n"
+                    f"• {t(user_id, 'change_2fa_tip1')}\n"
+                    f"• {t(user_id, 'change_2fa_tip2')}\n"
+                    f"• {t(user_id, 'change_2fa_tip3')}\n\n"
+                    f"{t(user_id, 'change_2fa_wait_password')}",
+                    parse_mode='HTML'
+                )
+            except:
+                pass
+            
+            print(f"⏳ 等待用户 {user_id} 输入密码...")
+            
+        except Exception as e:
+            print(f"❌ 处理文件失败: {e}")
+            import traceback
+            traceback.print_exc()
+            
+            try:
+                progress_msg.edit_text(
+                    f"❌ <b>处理文件失败</b>\n\n错误: {str(e)}",
+                    parse_mode='HTML'
+                )
+            except:
+                pass
+            
+            # 清理临时下载文件
+            if temp_zip and os.path.exists(temp_zip):
+                try:
+                    shutil.rmtree(os.path.dirname(temp_zip), ignore_errors=True)
+                except:
+                    pass
+    
+    async def complete_2fa_change_with_passwords(self, update, context, old_password: Optional[str], new_password: str):
+        """完成2FA密码修改任务（使用用户提供的密码）"""
+        user_id = update.effective_user.id
+        
+        # 检查是否有待处理的任务
+        if user_id not in self.two_factor_manager.pending_2fa_tasks:
+            self.safe_send_message(update, "❌ 没有待处理的2FA修改任务")
+            return
+        
+        task_info = self.two_factor_manager.pending_2fa_tasks[user_id]
+        files = task_info['files']
+        file_type = task_info['file_type']
+        extract_dir = task_info['extract_dir']
+        task_id = task_info['task_id']
+        progress_msg = task_info['progress_msg']
+        start_time = task_info['start_time']
+        temp_zip = task_info['temp_zip']
+        
+        total_files = len(files)
+        
+        try:
+            # 更新消息，开始处理
+            try:
+                progress_msg.edit_text(
+                    f"<b>{t(user_id, 'change_2fa_starting')}</b>\n\n"
+                    f"{t(user_id, 'change_2fa_found_count').format(count=total_files)}\n"
+                    f"{t(user_id, 'change_2fa_new_password').format(password=new_password[:3] + '***' + (new_password[-3:] if len(new_password) > 6 else ''))}\n"
+                    f"{t(user_id, 'change_2fa_please_wait')}",
+                    parse_mode='HTML'
+                )
+            except:
+                pass
+            
+            # 定义进度回调
+            async def change_callback(processed, total, results, speed, elapsed):
+                try:
+                    success_count = len(results.get("成功", []))
+                    fail_count = len(results.get("失败", []))
+                    
+                    progress_text = f"""
+<b>{t(user_id, 'change_2fa_in_progress')}</b>
+
+<b>{t(user_id, 'change_2fa_current_progress')}</b>
+• {t(user_id, 'change_2fa_processed').format(processed=processed, total=total)}
+• {t(user_id, 'change_2fa_speed').format(speed=f'{speed:.1f}')}
+• {t(user_id, 'change_2fa_elapsed').format(elapsed=int(elapsed))}
+
+<b>{t(user_id, 'change_2fa_success_count').format(count=success_count)}</b>
+<b>{t(user_id, 'change_2fa_failed_count').format(count=fail_count)}</b>
+
+{t(user_id, 'change_2fa_remaining').format(time=int((total - processed) / speed) if speed > 0 else 0)}
+                    """
+                    
+                    try:
+                        progress_msg.edit_text(progress_text, parse_mode='HTML')
+                    except:
+                        pass
+                except Exception as e:
+                    print(f"⚠️ 更新进度失败: {e}")
+            
+            # 执行批量修改
+            results = await self.two_factor_manager.batch_change_passwords(
+                files,
+                file_type,
+                old_password,
+                new_password,
+                change_callback,
+                user_id
+            )
+            
+                       # 创建结果文件（传入 file_type 参数）
+                    
+            result_files = self.two_factor_manager.create_result_files(results, task_id, file_type, user_id)
+            
+            elapsed_time = time.time() - start_time
+            
+            # 发送结果统计
+            success_count = len(results["成功"])
+            fail_count = len(results["失败"])
+            
+            summary_text = f"""
+<b>{t(user_id, 'change_2fa_complete')}</b>
+
+<b>{t(user_id, 'change_2fa_stats')}</b>
+{t(user_id, 'change_2fa_total').format(count=total_files)}
+{t(user_id, 'change_2fa_success').format(count=success_count)}
+{t(user_id, 'change_2fa_failed').format(count=fail_count)}
+{t(user_id, 'change_2fa_duration').format(time=int(elapsed_time))}
+{t(user_id, 'change_2fa_speed_stat').format(speed=f'{total_files/elapsed_time:.1f}')}
+
+{t(user_id, 'change_2fa_sending_results')}
+            """
+            
+            try:
+                progress_msg.edit_text(summary_text, parse_mode='HTML')
+            except:
+                pass
+            
+            # 发送结果文件（分离发送 ZIP 和 TXT）
+            sent_count = 0
+            for zip_path, txt_path, status, count in result_files:
+                try:
+                    # 1. 发送 ZIP 文件
+                    if os.path.exists(zip_path):
+                        try:
+                            with open(zip_path, 'rb') as f:
+                                # Use translation for caption
+                                if status == "成功":
+                                    file_desc = t(user_id, 'file_desc_change_2fa_success').format(count=count)
+                                else:  # 失败
+                                    file_desc = t(user_id, 'file_desc_change_2fa_failed').format(count=count)
+                                caption = f"{file_desc}\n\n{t(user_id, 'change_2fa_process_time').format(time=datetime.now(BEIJING_TZ).strftime('%Y-%m-%d %H:%M:%S CST'))}"
+                                context.bot.send_document(
+                                    chat_id=update.effective_chat.id,
+                                    document=f,
+                                    filename=os.path.basename(zip_path),
+                                    caption=caption,
+                                    parse_mode='HTML'
+                                )
+                            print(f"📤 发送ZIP文件: {os.path.basename(zip_path)}")
+                            sent_count += 1
+                            await asyncio.sleep(1.0)
+                        except Exception as e:
+                            print(f"❌ 发送ZIP文件失败: {e}")
+                    
+                    # 2. 发送 TXT 报告
+                    if os.path.exists(txt_path):
+                        try:
+                            with open(txt_path, 'rb') as f:
+                                # Use translation for caption
+                                if status == "成功":
+                                    report_desc = t(user_id, 'report_desc_change_2fa_success')
+                                else:  # 失败
+                                    report_desc = t(user_id, 'report_desc_change_2fa_failed')
+                                caption = f"{report_desc}\n\n{t(user_id, 'report_contains_details').format(count=count)}"
+                                context.bot.send_document(
+                                    chat_id=update.effective_chat.id,
+                                    document=f,
+                                    filename=os.path.basename(txt_path),
+                                    caption=caption,
+                                    parse_mode='HTML'
+                                )
+                            print(f"📤 发送TXT报告: {os.path.basename(txt_path)}")
+                            sent_count += 1
+                            await asyncio.sleep(1.0)
+                        except Exception as e:
+                            print(f"❌ 发送TXT文件失败: {e}")
+                    
+                    # 3. 清理文件
+                    try:
+                        if os.path.exists(zip_path):
+                            os.remove(zip_path)
+                            print(f"🗑️ 清理结果文件: {os.path.basename(zip_path)}")
+                        if os.path.exists(txt_path):
+                            os.remove(txt_path)
+                            print(f"🗑️ 清理报告文件: {os.path.basename(txt_path)}")
+                    except Exception as e:
+                        print(f"⚠️ 清理文件失败: {e}")
+                        
+                except Exception as e:
+                    print(f"❌ 处理结果文件失败 {status}: {e}")
+            
+            # 发送完成总结
+            if sent_count > 0:
+                final_summary_text = f"""
+<b>{t(user_id, 'change_2fa_all_sent')}</b>
+
+<b>{t(user_id, 'change_2fa_send_summary')}</b>
+{t(user_id, 'change_2fa_files_sent').format(count=sent_count)}
+{t(user_id, 'change_2fa_total_accounts').format(count=len(files))}
+{t(user_id, 'change_2fa_success_count').format(count=success_count)}
+{t(user_id, 'change_2fa_failed_count').format(count=fail_count)}
+{t(user_id, 'change_2fa_time_spent').format(time=int(elapsed_time))}
+
+{t(user_id, 'change_2fa_use_again')}
+                """
+                
+                try:
+                    context.bot.send_message(
+                        chat_id=update.effective_chat.id,
+                        text=final_summary_text,
+                        parse_mode='HTML'
+                    )
+                except Exception as e:
+                    print(f"❌ 发送总结失败: {e}")
+            else:
+                try:
+                    context.bot.send_message(
+                        chat_id=update.effective_chat.id,
+                        text="❌ 没有文件可以发送"
+                    )
+                except Exception as e:
+                    print(f"❌ 发送消息失败: {type(e).__name__}: {e}")
+                    import traceback
+                    traceback.print_exc()
+            
+            # 清理临时文件
+            if extract_dir and os.path.exists(extract_dir):
+                shutil.rmtree(extract_dir, ignore_errors=True)
+                print(f"🗑️ 清理解压目录: {extract_dir}")
+            
+        except Exception as e:
+            print(f"❌ 2FA修改失败: {e}")
+            import traceback
+            traceback.print_exc()
+            
+            if progress_msg:
+                try:
+                    progress_msg.edit_text(
+                        f"❌ <b>2FA修改失败</b>\n\n错误: {str(e)}",
+                        parse_mode='HTML'
+                    )
+                except:
+                    pass
+            
+            # 清理临时文件
+            if extract_dir and os.path.exists(extract_dir):
+                shutil.rmtree(extract_dir, ignore_errors=True)
+            if temp_zip and os.path.exists(temp_zip):
+                try:
+                    shutil.rmtree(os.path.dirname(temp_zip), ignore_errors=True)
+                except:
+                    pass
+        
+        finally:
+            # 清理任务信息
+            if user_id in self.two_factor_manager.pending_2fa_tasks:
+                del self.two_factor_manager.pending_2fa_tasks[user_id]
+                print(f"🗑️ 清理任务信息: user_id={user_id}")
+    
+    def handle_photo(self, update: Update, context: CallbackContext):
+        """处理图片上传（用于广播媒体和资料头像）"""
+        user_id = update.effective_user.id
+        
+        # 检查用户状态
+        try:
+            conn = sqlite3.connect(config.DB_NAME)
+            c = conn.cursor()
+            c.execute("SELECT status FROM users WHERE user_id = ?", (user_id,))
+            row = c.fetchone()
+            conn.close()
+            
+            if not row:
+                return
+            
+            user_status = row[0]
+            
+            # 处理资料头像上传
+            if user_status == "profile_custom_upload_photo":
+                self.handle_profile_photo_upload(update, context, user_id)
+                return
+            
+            # 处理广播媒体上传
+            if user_status != "waiting_broadcast_media":
+                # 不是在等待上传，忽略
+                return
+        except:
+            return
+        
+        # 检查是否有待处理的广播任务
+        if user_id not in self.pending_broadcasts:
+            self.safe_send_message(update, "❌ 没有待处理的广播任务")
+            return
+        
+        task = self.pending_broadcasts[user_id]
+        
+        # 获取最大尺寸的图片
+        photo = update.message.photo[-1]
+        
+        # 保存图片 file_id
+        task['media_file_id'] = photo.file_id
+        task['media_type'] = 'photo'
+        
+        # 清空用户状态
+        self.db.save_user(user_id, "", "", "")
+        
+        # 发送成功消息并返回编辑器
+        self.safe_send_message(
+            update,
+            "✅ <b>图片已保存</b>\n\n返回编辑器继续设置",
+            'HTML'
+        )
+        
+        # 模拟 query 对象返回编辑器
+        class FakeQuery:
+            def __init__(self, user, chat):
+                self.from_user = user
+                self.message = type('obj', (object,), {'chat_id': chat.id, 'message_id': None})()
+            def answer(self):
+                pass
+        
+        fake_query = FakeQuery(update.effective_user, update.effective_chat)
+        
+        # 发送新消息显示编辑器
+        self.show_broadcast_wizard_editor_as_new_message(update, context)
+    
+    def show_broadcast_wizard_editor_as_new_message(self, update, context):
+        """以新消息的形式显示广播编辑器"""
+        user_id = update.effective_user.id
+        
+        if user_id not in self.pending_broadcasts:
+            return
+        
+        task = self.pending_broadcasts[user_id]
+        
+        # 状态指示器
+        media_status = "✅" if task.get('media_file_id') else "⚪"
+        text_status = "✅" if task.get('content') else "⚪"
+        buttons_status = "✅" if task.get('buttons') else "⚪"
+        
+        text = f"""
+<b>📝 创建群发通知</b>
+
+<b>📊 当前状态</b>
+{media_status} 媒体: {'已设置' if task.get('media_file_id') else '未设置'}
+{text_status} 文本: {'已设置' if task.get('content') else '未设置'}
+{buttons_status} 按钮: {len(task.get('buttons', []))} 个
+
+<b>💡 操作提示</b>
+• 文本为必填项
+• 媒体和按钮为可选项
+• 设置完成后点击"下一步"
+        """
+        
+        # 两栏布局按钮
+        keyboard = InlineKeyboardMarkup([
+            # 第一行：媒体操作
+            [
+                InlineKeyboardButton("📸 媒体", callback_data="broadcast_media"),
+                InlineKeyboardButton("👁️ 查看", callback_data="broadcast_media_view"),
+                InlineKeyboardButton("🗑️ 清除", callback_data="broadcast_media_clear")
+            ],
+            # 第二行：文本操作
+            [
+                InlineKeyboardButton("📝 文本", callback_data="broadcast_text"),
+                InlineKeyboardButton("👁️ 查看", callback_data="broadcast_text_view")
+            ],
+            # 第三行：按钮操作
+            [
+                InlineKeyboardButton("🔘 按钮", callback_data="broadcast_buttons"),
+                InlineKeyboardButton("👁️ 查看", callback_data="broadcast_buttons_view"),
+                InlineKeyboardButton("🗑️ 清除", callback_data="broadcast_buttons_clear")
+            ],
+            # 第四行：预览和导航
+            [
+                InlineKeyboardButton("🔍 完整预览", callback_data="broadcast_preview")
+            ],
+            [
+                InlineKeyboardButton("🔙 返回", callback_data="broadcast_cancel"),
+                InlineKeyboardButton("➡️ 下一步", callback_data="broadcast_next")
+            ]
+        ])
+        
+        self.safe_send_message(update, text, 'HTML', keyboard)
+    
+    def handle_text(self, update: Update, context: CallbackContext):
+        user_id = update.effective_user.id
+        text = update.message.text
+        
+        # 检查广播消息输入
+        try:
+            conn = sqlite3.connect(config.DB_NAME)
+            c = conn.cursor()
+            c.execute("SELECT status FROM users WHERE user_id = ?", (user_id,))
+            row = c.fetchone()
+            conn.close()
+            
+            if row:
+                user_status = row[0]
+                
+                if user_status == "waiting_broadcast_title":
+                    self.handle_broadcast_title_input(update, context, user_id, text)
+                    return
+                elif user_status == "waiting_broadcast_content":
+                    self.handle_broadcast_content_input(update, context, user_id, text)
+                    return
+                elif user_status == "waiting_broadcast_buttons":
+                    self.handle_broadcast_buttons_input(update, context, user_id, text)
+                    return
+                # VIP会员相关状态
+                elif user_status == "waiting_redeem_code":
+                    self.handle_redeem_code_input(update, user_id, text)
+                    return
+                elif user_status == "waiting_manual_user":
+                    self.handle_manual_user_input(update, user_id, text)
+                    return
+                elif user_status == "waiting_revoke_user":
+                    self.handle_revoke_user_input(update, user_id, text)
+                    return
+                elif user_status == "waiting_admin_query_date":
+                    self.handle_admin_date_query_result(update, user_id, text)
+                    return
+                elif user_status == "waiting_admin_query_user":
+                    self.handle_admin_user_query_result(update, user_id, text)
+                    return
+                elif user_status == "waiting_rename_newname":
+                    self.handle_rename_newname_input(update, context, user_id, text)
+                    return
+                elif user_status == "waiting_add_2fa_input":
+                    self.handle_add_2fa_input(update, context, user_id, text)
+                    return
+                elif user_status == "waiting_remove_2fa_input":
+                    # 处理删除2FA的手动密码输入
+                    if user_id in self.two_factor_manager.pending_2fa_tasks:
+                        task_info = self.two_factor_manager.pending_2fa_tasks[user_id]
+                        if task_info.get('operation') == 'remove':
+                            old_password = text.strip()
+                            print(f"🗑️ 用户 {user_id} 输入删除2FA密码")
+                            # 异步处理密码删除
+                            def process_remove():
+                                asyncio.run(self.complete_remove_2fa(update, context, user_id, old_password))
+                            threading.Thread(target=process_remove, daemon=True).start()
+                        else:
+                            self.safe_send_message(update, "❌ 操作类型不匹配")
+                    else:
+                        self.safe_send_message(update, "❌ 没有待处理的删除2FA任务")
+                    return
+                elif user_status == "batch_create_count":
+                    self.handle_batch_create_count_input(update, context, user_id, text)
+                    return
+                elif user_status == "batch_create_admin":
+                    self.handle_batch_create_admin_input(update, context, user_id, text)
+                    return
+                elif user_status == "batch_create_names":
+                    self.handle_batch_create_names_input(update, context, user_id, text)
+                    return
+                elif user_status == "batch_create_usernames":
+                    self.handle_batch_create_usernames_input(update, context, user_id, text)
+                    return
+                elif user_status == "reauthorize_old_password":
+                    self.handle_reauthorize_old_password_input(update, context, user_id, text)
+                    return
+                elif user_status == "reauthorize_new_password":
+                    self.handle_reauthorize_new_password_input(update, context, user_id, text)
+                    return
+                # 自定义资料输入状态
+                elif user_status.startswith("profile_custom_input_"):
+                    field_name = user_status.replace("profile_custom_input_", "")
+                    self.handle_profile_custom_text_input(update, context, user_id, field_name, text)
+                    return
+        except Exception as e:
+            print(f"❌ 检查广播状态失败: {e}")
+        
+        # 处理添加2FA等待的密码输入（使用任务字典检查，不依赖数据库状态）
+        if user_id in getattr(self, "pending_add_2fa_tasks", {}):
+            self.handle_add_2fa_input(update, context, user_id, text)
+            return
+        
+        # 新增：处理 API 转换等待的 2FA 输入
+        if user_id in getattr(self, "pending_api_tasks", {}):
+            two_fa_input = (text or "").strip()
+            def go_next():
+                asyncio.run(self.continue_api_conversion(update, context, user_id, two_fa_input))
+            threading.Thread(target=go_next, daemon=True).start()
+            return        
+        # 检查是否是2FA密码输入
+        if user_id in self.two_factor_manager.pending_2fa_tasks:
+            # 用户正在等待输入密码
+            parts = text.strip().split()
+            
+            if len(parts) == 1:
+                # 格式1：仅新密码，让系统自动检测旧密码
+                new_password = parts[0]
+                old_password = None
+                
+                print(f"🔐 用户 {user_id} 输入新密码（自动检测旧密码）")
+                
+                # 异步处理密码修改
+                def process_password_change():
+                    asyncio.run(self.complete_2fa_change_with_passwords(update, context, old_password, new_password))
+                
+                thread = threading.Thread(target=process_password_change)
+                thread.start()
+                
+            elif len(parts) == 2:
+                # 格式2：旧密码 新密码
+                old_password = parts[0]
+                new_password = parts[1]
+                
+                print(f"🔐 用户 {user_id} 输入旧密码和新密码")
+                
+                # 异步处理密码修改
+                def process_password_change():
+                    asyncio.run(self.complete_2fa_change_with_passwords(update, context, old_password, new_password))
+                
+                thread = threading.Thread(target=process_password_change)
+                thread.start()
+                
+            else:
+                # 格式错误
+                self.safe_send_message(
+                    update,
+                    "❌ <b>格式错误</b>\n\n"
+                    "请使用以下格式之一：\n\n"
+                    "1️⃣ 仅新密码（推荐）\n"
+                    "<code>NewPassword123</code>\n\n"
+                    "2️⃣ 旧密码 新密码\n"
+                    "<code>OldPass456 NewPassword123</code>\n\n"
+                    "两个密码之间用空格分隔",
+                    'HTML'
+                )
+            
+            return
+        
+        # 检查是否是账号分类数量输入
+        try:
+            conn = sqlite3.connect(config.DB_NAME)
+            c = conn.cursor()
+            c.execute("SELECT status FROM users WHERE user_id = ?", (user_id,))
+            row = c.fetchone()
+            conn.close()
+            
+            if row:
+                user_status = row[0]
+                
+                # 单个数量拆分
+                if user_status == "waiting_classify_qty_single":
+                    try:
+                        qty = int(text.strip())
+                        if qty <= 0:
+                            self.safe_send_message(update, "❌ 请输入大于0的正整数")
+                            return
+                        
+                        # 处理单个数量拆分
+                        def process_single_qty():
+                            asyncio.run(self._classify_split_single_qty(update, context, user_id, qty))
+                        threading.Thread(target=process_single_qty, daemon=True).start()
+                        return
+                    except ValueError:
+                        self.safe_send_message(update, "❌ 请输入有效的正整数")
+                        return
+                
+                # 多个数量拆分
+                elif user_status == "waiting_classify_qty_multi":
+                    try:
+                        parts = text.strip().split()
+                        quantities = [int(p) for p in parts]
+                        if any(q <= 0 for q in quantities):
+                            self.safe_send_message(update, "❌ 所有数量必须大于0")
+                            return
+                        
+                        # 处理多个数量拆分
+                        def process_multi_qty():
+                            asyncio.run(self._classify_split_multi_qty(update, context, user_id, quantities))
+                        threading.Thread(target=process_multi_qty, daemon=True).start()
+                        return
+                    except ValueError:
+                        self.safe_send_message(update, "❌ 请输入有效的正整数，用空格分隔\n例如: 10 20 30")
+                        return
+        except Exception as e:
+            print(f"❌ 检查分类状态失败: {e}")
+        # 管理员搜索用户
+        if user_status == "waiting_admin_search":
+            if not self.db.is_admin(user_id):
+                self.safe_send_message(update, "❌ 权限不足")
+                return
+            
+            search_query = text.strip()
+            if len(search_query) < 2:
+                self.safe_send_message(update, "❌ 搜索关键词太短，请至少输入2个字符")
+                return
+            
+            # 执行搜索
+            search_results = self.db.search_user(search_query)
+            
+            if not search_results:
+                self.safe_send_message(update, f"🔍 未找到匹配 '{search_query}' 的用户")
+                # 清空状态
+                self.db.save_user(user_id, update.effective_user.username or "", update.effective_user.first_name or "", "")
+                return
+            
+            # 显示搜索结果
+            result_text = f"🔍 <b>搜索结果：'{search_query}'</b>\n\n"
+            
+            for i, (uid, username, first_name, register_time, last_active, status) in enumerate(search_results[:10], 1):
+                is_member, level, _ = self.db.check_membership(uid)
+                member_icon = "🎁" if is_member else "❌"
+                admin_icon = "👑" if self.db.is_admin(uid) else ""
+                
+                display_name = first_name or username or f"用户{uid}"
+                if len(display_name) > 20:
+                    display_name = display_name[:20] + "..."
+                
+                result_text += f"{i}. {admin_icon}{member_icon} <code>{uid}</code>\n"
+                result_text += f"   👤 {display_name}\n"
+                if username:
+                    result_text += f"   📱 @{username}\n"
+                
+                # 活跃状态
+                if last_active:
+                    try:
+                        # Database stores naive datetime strings, compare with naive Beijing time
+                        last_time = datetime.strptime(last_active, '%Y-%m-%d %H:%M:%S')
+                        time_diff = datetime.now(BEIJING_TZ).replace(tzinfo=None) - last_time
+                        if time_diff.days == 0:
+                            result_text += f"   🕒 {time_diff.seconds//3600}小时前活跃\n"
+                        else:
+                            result_text += f"   🕒 {time_diff.days}天前活跃\n"
+                    except:
+                        result_text += f"   🕒 {last_active}\n"
+                else:
+                    result_text += f"   🕒 从未活跃\n"
+                
+                result_text += "\n"
+            
+            if len(search_results) > 10:
+                result_text += f"\n... 还有 {len(search_results) - 10} 个结果未显示"
+            
+            # 创建详情按钮（只显示前5个用户的详情按钮）
+            buttons = []
+            for i, (uid, username, first_name, _, _, _) in enumerate(search_results[:5]):
+                display_name = first_name or username or f"用户{uid}"
+                if len(display_name) > 15:
+                    display_name = display_name[:15] + "..."
+                buttons.append([InlineKeyboardButton(f"📋 {display_name} 详情", callback_data=f"user_detail_{uid}")])
+            
+            buttons.append([InlineKeyboardButton("🔙 返回用户管理", callback_data="admin_users")])
+            
+            keyboard = InlineKeyboardMarkup(buttons)
+            self.safe_send_message(update, result_text, 'HTML', keyboard)
+            
+            # 清空状态
+            self.db.save_user(user_id, update.effective_user.username or "", update.effective_user.first_name or "", "")
+            return        
+        # 其他文本消息的处理
+        text_lower = text.lower()
+        if any(word in text_lower for word in ["你好", "hello", "hi"]):
+            self.safe_send_message(update, "👋 你好！发送 /start 开始检测")
+        elif "帮助" in text_lower or "help" in text_lower:
+            self.safe_send_message(update, "📖 发送 /help 查看帮助")
+    
+    # ================================
+    # 账号分类功能
+    # ================================
+    
+    def classify_command(self, update: Update, context: CallbackContext):
+        """账号分类命令入口"""
+        user_id = update.effective_user.id
+        
+        # 权限检查
+        is_member, _, _ = self.db.check_membership(user_id)
+        if not is_member and not self.db.is_admin(user_id):
+            self.safe_send_message(update, "❌ 需要会员权限才能使用账号分类功能")
+            return
+        
+        if not CLASSIFY_AVAILABLE or not self.classifier:
+            self.safe_send_message(update, "❌ 账号分类功能不可用\n\n请检查 account_classifier.py 模块和 phonenumbers 库是否正确安装")
+            return
+        
+        self.handle_classify_menu(update.callback_query if hasattr(update, 'callback_query') else None, update)
+    
+    def handle_classify_menu(self, query, update=None):
+        """显示账号分类菜单"""
+        if update is None:
+            update = query.message if query else None
+        
+        user_id = query.from_user.id if query else update.effective_user.id
+        
+        # 权限检查
+        is_member, _, _ = self.db.check_membership(user_id)
+        if not is_member and not self.db.is_admin(user_id):
+            if query:
+                self.safe_edit_message(query, "❌ 需要会员权限")
+            else:
+                self.safe_send_message(update, "❌ 需要会员权限")
+            return
+        
+        if not CLASSIFY_AVAILABLE or not self.classifier:
+            msg = "❌ 账号分类功能不可用\n\n请检查依赖库是否正确安装"
+            if query:
+                self.safe_edit_message(query, msg)
+            else:
+                self.safe_send_message(update, msg)
+            return
+        
+        text = f"""
+{t(user_id, 'split_title')}
+
+<b>{t(user_id, 'split_features')}</b>
+{t(user_id, 'split_features_desc')}
+
+<b>{t(user_id, 'split_methods')}</b>
+<b>{t(user_id, 'split_method_country')}</b>
+   {t(user_id, 'split_method_country_desc1')}
+   {t(user_id, 'split_method_country_desc2')}
+   {t(user_id, 'split_method_country_desc3')}
+
+<b>{t(user_id, 'split_method_quantity')}</b>
+   {t(user_id, 'split_method_quantity_desc1')}
+   {t(user_id, 'split_method_quantity_desc2')}
+   {t(user_id, 'split_method_quantity_desc3')}
+
+<b>{t(user_id, 'split_steps')}</b>
+{t(user_id, 'split_step1')}
+{t(user_id, 'split_step2')}
+{t(user_id, 'split_step3')}
+{t(user_id, 'split_step4')}
+
+<b>{t(user_id, 'split_notes')}</b>
+{t(user_id, 'split_note1')}
+{t(user_id, 'split_note2')}
+{t(user_id, 'split_note3')}
+        """
+        
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton(t(user_id, 'split_start_upload'), callback_data="classify_start")],
+            [InlineKeyboardButton(t(user_id, 'split_back_menu'), callback_data="back_to_main")]
+        ])
+        
+        if query:
+            query.answer()
+            try:
+                query.edit_message_text(text, parse_mode='HTML', reply_markup=keyboard)
+            except:
+                pass
+        else:
+            self.safe_send_message(update, text, 'HTML', keyboard)
+    def on_back_to_main(self, update: Update, context: CallbackContext):
+        """处理"返回主菜单"按钮"""
+        query = update.callback_query
+        if query:
+            user_id = query.from_user.id
+            
+            try:
+                query.answer()
+            except:
+                pass
+            
+            # 清除用户状态 - 重置为空状态
+            try:
+                self.db.save_user(user_id, query.from_user.username or "", 
+                                query.from_user.first_name or "", "")
+            except Exception as e:
+                logger.warning(f"清除用户状态失败: {e}")
+            
+            # 使用统一方法渲染主菜单（包含"📦 账号分类"按钮）
+            self.show_main_menu(update, user_id)
+    def _classify_buttons_split_type(self, user_id: int) -> InlineKeyboardMarkup:
+        """生成拆分方式选择按钮"""
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton(t(user_id, 'split_btn_country'), callback_data="classify_split_country")],
+            [InlineKeyboardButton(t(user_id, 'split_btn_quantity'), callback_data="classify_split_quantity")],
+            [InlineKeyboardButton(t(user_id, 'split_btn_cancel'), callback_data="back_to_main")]
+        ])
+    
+    def _classify_buttons_qty_mode(self, user_id: int) -> InlineKeyboardMarkup:
+        """生成数量模式选择按钮"""
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton(t(user_id, 'split_btn_single'), callback_data="classify_qty_single")],
+            [InlineKeyboardButton(t(user_id, 'split_btn_multiple'), callback_data="classify_qty_multi")],
+            [InlineKeyboardButton(t(user_id, 'split_btn_back'), callback_data="classify_menu")]
+        ])
+    
+    def handle_add_2fa_input(self, update: Update, context: CallbackContext, user_id: int, text: str):
+        """处理添加2FA密码输入"""
+        if user_id not in self.pending_add_2fa_tasks:
+            self.safe_send_message(update, t(user_id, 'add_2fa_no_pending_task'))
+            return
+        
+        task = self.pending_add_2fa_tasks[user_id]
+        
+        # 检查超时（5分钟）
+        if time.time() - task['start_time'] > 300:
+            del self.pending_add_2fa_tasks[user_id]
+            self.db.save_user(user_id, "", "", "")
+            self.safe_send_message(update, t(user_id, 'add_2fa_operation_timeout'))
+            return
+        
+        # 验证密码
+        two_fa_password = text.strip()
+        
+        if not two_fa_password:
+            self.safe_send_message(update, t(user_id, 'add_2fa_password_empty'))
+            return
+        
+        # 确认接收密码
+        self.safe_send_message(
+            update,
+            f"<b>{t(user_id, 'add_2fa_password_received')}</b>\n\n"
+            f"{t(user_id, 'add_2fa_password_display').format(password=two_fa_password)}\n\n"
+            f"{t(user_id, 'add_2fa_processing_now')}",
+            'HTML'
+        )
+        
+        # 异步处理添加2FA
+        def process_add_2fa():
+            asyncio.run(self.complete_add_2fa(update, context, user_id, two_fa_password))
+        
+        thread = threading.Thread(target=process_add_2fa, daemon=True)
+        thread.start()
+    
+    
+    async def process_forget_2fa(self, update, context, document):
+        """忘记2FA处理 - 批量请求密码重置"""
+        user_id = update.effective_user.id
+        start_time = time.time()
+        task_id = f"{user_id}_{int(start_time)}"
+        batch_id = f"forget2fa_{task_id}"
+        
+        progress_msg = self.safe_send_message(update, f"<b>{t(user_id, 'forget_2fa_processing_file')}</b>", 'HTML')
+        if not progress_msg:
+            return
+        
+        temp_zip = None
+        try:
+            temp_dir = tempfile.mkdtemp(prefix="temp_forget2fa_")
+            temp_zip = os.path.join(temp_dir, document.file_name)
+            document.get_file().download(temp_zip)
+            
+            # 使用FileProcessor扫描
+            files, extract_dir, file_type = self.processor.scan_zip_file(temp_zip, user_id, task_id)
+            
+            if not files:
+                try:
+                    progress_msg.edit_text(
+                        f"<b>{t(user_id, 'forget_2fa_no_valid_files')}</b>\n\n{t(user_id, 'forget_2fa_ensure_format')}",
+                        parse_mode='HTML'
+                    )
+                except:
+                    pass
+                return
+            
+            total_files = len(files)
+            proxy_count = len(self.proxy_manager.proxies)
+            
+            try:
+                progress_msg.edit_text(
+                    f"<b>{t(user_id, 'forget_2fa_processing')}</b>\n\n"
+                    f"{t(user_id, 'forget_2fa_found_accounts').format(count=total_files)}\n"
+                    f"{t(user_id, 'forget_2fa_format').format(format=file_type.upper())}\n"
+                    f"{t(user_id, 'forget_2fa_proxy_count').format(count=proxy_count)}\n\n"
+                    f"{t(user_id, 'forget_2fa_initializing')}",
+                    parse_mode='HTML'
+                )
+            except:
+                pass
+            
+            # 创建Forget2FAManager实例
+            forget_manager = Forget2FAManager(self.proxy_manager, self.db)
+            
+            # 进度回调函数
+            last_update_time = [time.time()]
+            
+            async def progress_callback(processed, total, results, speed, elapsed, current_result):
+                # 限制更新频率（每3秒最多更新一次）
+                current_time = time.time()
+                if current_time - last_update_time[0] < 3 and processed < total:
+                    return
+                last_update_time[0] = current_time
+                
+                # 格式化时间 - 使用翻译
+                minutes = int(elapsed) // 60
+                seconds = int(elapsed) % 60
+                if minutes > 0:
+                    time_str = f"{minutes}{t(user_id, 'minutes_unit')}{seconds}{t(user_id, 'seconds_unit')}"
+                else:
+                    time_str = f"{seconds}{t(user_id, 'seconds_unit')}"
+                
+                # 统计各状态数量
+                requested = len(results.get('requested', []))
+                no_2fa = len(results.get('no_2fa', []))
+                cooling = len(results.get('cooling', []))
+                failed = len(results.get('failed', []))
+                pending = total - processed
+                
+                # 当前处理状态
+                current_name = current_result.get('account_name', '')
+                current_status = current_result.get('status', '')
+                # 隐藏代理详细信息，保护用户隐私
+                current_proxy_raw = current_result.get('proxy_used', t(user_id, 'forget_2fa_status_local'))
+                current_proxy = Forget2FAManager.mask_proxy_for_display(current_proxy_raw, user_id)
+                
+                # 状态映射 - 使用翻译
+                status_map = {
+                    'requested': t(user_id, 'forget_2fa_status_reset'),
+                    'no_2fa': t(user_id, 'forget_2fa_status_no_reset'),
+                    'cooling': t(user_id, 'forget_2fa_status_cooling'),
+                    'failed': t(user_id, 'forget_2fa_status_failed')
+                }
+                status_emoji = status_map.get(current_status, t(user_id, 'status_processing'))
+                
+                # 计算百分比
+                percent = processed * 100 // total if total > 0 else 0
+                
+                progress_text = f"""
+<b>{t(user_id, 'forget_2fa_processing')}</b>
+
+<b>{t(user_id, 'forget_2fa_progress').format(done=processed, total=total, percent=percent)}</b>
+{t(user_id, 'forget_2fa_elapsed').format(time=time_str)}
+{t(user_id, 'forget_2fa_speed').format(speed=f"{speed:.2f}")}
+
+{t(user_id, 'forget_2fa_stat_reset').format(count=requested)}
+{t(user_id, 'forget_2fa_stat_no_reset').format(count=no_2fa)}
+{t(user_id, 'forget_2fa_stat_cooling').format(count=cooling)}
+{t(user_id, 'forget_2fa_stat_failed').format(count=failed)}
+{t(user_id, 'forget_2fa_stat_pending').format(count=pending)}
+
+<b>{t(user_id, 'forget_2fa_current').format(filename=current_name[:30])}</b>
+<b>{status_emoji}</b>
+<b>{current_proxy}</b>
+                """
+                
+                try:
+                    progress_msg.edit_text(progress_text, parse_mode='HTML')
+                except:
+                    pass
+            
+            # 批量处理
+            results = await forget_manager.batch_process_with_progress(
+                files, file_type, batch_id, progress_callback
+            )
+            
+            # 处理完成
+            total_time = time.time() - start_time
+            minutes = int(total_time) // 60
+            seconds = int(total_time) % 60
+            if minutes > 0:
+                time_str = f"{minutes}{t(user_id, 'minutes_unit')}{seconds}{t(user_id, 'seconds_unit')}"
+            else:
+                time_str = f"{seconds}{t(user_id, 'seconds_unit')}"
+            
+            # 统计各状态数量
+            requested = len(results.get('requested', []))
+            no_2fa = len(results.get('no_2fa', []))
+            cooling = len(results.get('cooling', []))
+            failed = len(results.get('failed', []))
+            
+            # 完成消息
+            completion_text = f"""
+<b>{t(user_id, 'forget_2fa_complete')}</b>
+
+<b>{t(user_id, 'forget_2fa_results')}</b>
+{t(user_id, 'forget_2fa_total_accounts').format(count=total_files)}
+{t(user_id, 'forget_2fa_result_reset').format(count=requested)}
+{t(user_id, 'forget_2fa_result_no_reset').format(count=no_2fa)}
+{t(user_id, 'forget_2fa_result_cooling').format(count=cooling)}
+{t(user_id, 'forget_2fa_result_failed').format(count=failed)}
+
+<b>{t(user_id, 'forget_2fa_total_time').format(time=time_str)}</b>
+<b>{t(user_id, 'forget_2fa_batch_id').format(batch_id=batch_id)}</b>
+
+<b>{t(user_id, 'forget_2fa_notes')}</b>
+{t(user_id, 'forget_2fa_notes_wait')}
+{t(user_id, 'forget_2fa_notes_remove')}
+            """
+            
+            try:
+                progress_msg.edit_text(completion_text, parse_mode='HTML')
+            except:
+                pass
+            
+            # 生成结果文件
+            result_files = forget_manager.create_result_files(results, task_id, files, file_type, user_id)
+            
+            # 发送结果文件
+            for zip_path, txt_path, status_name, count in result_files:
+                try:
+                    # 发送ZIP文件
+                    if os.path.exists(zip_path):
+                        # 根据状态名获取对应的翻译键
+                        status_key_map = {
+                            '已请求重置': 'file_desc_forget_2fa_reset',
+                            '无需重置': 'file_desc_forget_2fa_no_reset',
+                            '冷却期中': 'file_desc_forget_2fa_cooling',
+                            '失败': 'file_desc_forget_2fa_failed'
+                        }
+                        caption_key = status_key_map.get(status_name, 'file_desc_forget_2fa_reset')
+                        caption = t(user_id, caption_key).format(count=count)
+                        with open(zip_path, 'rb') as f:
+                            context.bot.send_document(
+                                chat_id=user_id,
+                                document=f,
+                                caption=caption,
+                                filename=os.path.basename(zip_path)
+                            )
+                        os.remove(zip_path)
+                    
+                    # 发送TXT报告
+                    if os.path.exists(txt_path):
+                        # 根据状态名获取对应的翻译键
+                        report_key_map = {
+                            '已请求重置': 'report_desc_forget_2fa_reset',
+                            '无需重置': 'report_desc_forget_2fa_no_reset',
+                            '冷却期中': 'report_desc_forget_2fa_cooling',
+                            '失败': 'report_desc_forget_2fa_failed'
+                        }
+                        report_caption_key = report_key_map.get(status_name, 'report_desc_forget_2fa_reset')
+                        report_caption = t(user_id, report_caption_key)
+                        with open(txt_path, 'rb') as f:
+                            context.bot.send_document(
+                                chat_id=user_id,
+                                document=f,
+                                caption=report_caption,
+                                filename=os.path.basename(txt_path)
+                            )
+                        os.remove(txt_path)
+                except Exception as e:
+                    print(f"❌ 发送结果文件失败: {e}")
+            
+        except Exception as e:
+            print(f"❌ 忘记2FA处理失败: {e}")
+            import traceback
+            traceback.print_exc()
+            try:
+                progress_msg.edit_text(
+                    f"❌ <b>处理失败</b>\n\n错误: {str(e)[:100]}",
+                    parse_mode='HTML'
+                )
+            except:
+                pass
+        finally:
+            # 清理临时文件
+            if temp_zip and os.path.exists(os.path.dirname(temp_zip)):
+                try:
+                    shutil.rmtree(os.path.dirname(temp_zip), ignore_errors=True)
+                except:
+                    pass
+    
+    async def process_add_2fa(self, update, context, document):
+        """添加2FA处理 - 为Session创建JSON文件，为TData创建2fa.txt文件"""
+        user_id = update.effective_user.id
+        start_time = time.time()
+        task_id = f"{user_id}_{int(start_time)}"
+        
+        progress_msg = self.safe_send_message(update, f"<b>{t(user_id, 'add_2fa_processing_file')}</b>", 'HTML')
+        if not progress_msg:
+            return
+        
+        temp_zip = None
+        try:
+            temp_dir = tempfile.mkdtemp(prefix="temp_add_2fa_")
+            temp_zip = os.path.join(temp_dir, document.file_name)
+            document.get_file().download(temp_zip)
+            
+            # 使用FileProcessor扫描
+            files, extract_dir, file_type = self.processor.scan_zip_file(temp_zip, user_id, task_id)
+            
+            if not files:
+                try:
+                    progress_msg.edit_text(
+                        f"<b>{t(user_id, 'add_2fa_no_valid_files')}</b>\n\n{t(user_id, 'add_2fa_ensure_format')}",
+                        parse_mode='HTML'
+                    )
+                except:
+                    pass
+                return
+            
+            total_files = len(files)
+            
+            # 保存任务信息，等待用户输入2FA密码
+            self.pending_add_2fa_tasks[user_id] = {
+                'files': files,
+                'file_type': file_type,
+                'extract_dir': extract_dir,
+                'task_id': task_id,
+                'progress_msg': progress_msg,
+                'start_time': start_time,
+                'temp_zip': temp_zip,
+                'temp_dir': temp_dir
+            }
+            
+            # 提示用户输入2FA密码
+            text = f"""
+<b>{t(user_id, 'add_2fa_scan_complete')}</b>
+
+<b>{t(user_id, 'add_2fa_statistics')}</b>
+{t(user_id, 'add_2fa_total_accounts').format(count=total_files)}
+{t(user_id, 'add_2fa_file_type').format(type=file_type.upper())}
+
+<b>{t(user_id, 'add_2fa_enter_password')}</b>
+
+{t(user_id, 'add_2fa_enter_desc1')}
+{t(user_id, 'add_2fa_enter_desc2')}
+{t(user_id, 'add_2fa_enter_desc3')}
+
+<i>{t(user_id, 'add_2fa_timeout')}</i>
+            """
+            
+            try:
+                progress_msg.edit_text(text, parse_mode='HTML')
+            except:
+                pass
+            
+            # 设置用户状态 - 等待输入2FA密码
+            self.db.save_user(user_id, update.effective_user.username or "", 
+                             update.effective_user.first_name or "", "waiting_add_2fa_input")
+            
+        except Exception as e:
+            print(f"❌ 添加2FA处理失败: {e}")
+            import traceback
+            traceback.print_exc()
+            try:
+                progress_msg.edit_text(
+                    f"<b>{t(user_id, 'add_2fa_processing_failed')}</b>\n\n{t(user_id, 'add_2fa_error').format(error=str(e)[:100])}",
+                    parse_mode='HTML'
+                )
+            except:
+                pass
+    
+    async def complete_add_2fa(self, update, context, user_id: int, two_fa_password: str):
+        """完成添加2FA - 为文件添加2FA配置"""
+        if user_id not in self.pending_add_2fa_tasks:
+            self.safe_send_message(update, t(user_id, 'add_2fa_no_pending_task'))
+            return
+        
+        task_info = self.pending_add_2fa_tasks[user_id]
+        files = task_info['files']
+        file_type = task_info['file_type']
+        extract_dir = task_info['extract_dir']
+        temp_dir = task_info.get('temp_dir')
+        
+        progress_msg = self.safe_send_message(update, f"<b>{t(user_id, 'add_2fa_processing_config')}</b>", 'HTML')
+        
+        try:
+            success_count = 0
+            failed_count = 0
+            results = []
+            
+            for file_path, file_name in files:
+                try:
+                    if file_type == "session":
+                        # 处理Session文件 - 创建对应的JSON文件
+                        result = await self._add_2fa_to_session(file_path, file_name, two_fa_password)
+                    else:
+                        # 处理TData目录 - 创建2fa.txt文件
+                        result = await self._add_2fa_to_tdata(file_path, file_name, two_fa_password)
+                    
+                    if result['success']:
+                        success_count += 1
+                        results.append((file_name, t(user_id, 'add_2fa_result_success_desc'), result.get('message', '')))
+                    else:
+                        failed_count += 1
+                        results.append((file_name, t(user_id, 'add_2fa_result_failed_desc'), result.get('error', '')))
+                        
+                except Exception as e:
+                    failed_count += 1
+                    results.append((file_name, t(user_id, 'add_2fa_result_error_desc'), str(e)[:50]))
+            
+            # 创建结果ZIP文件 - 保持原始目录结构，只添加2fa.txt
+            timestamp = int(time.time())
+            result_dir = os.path.join(config.RESULTS_DIR, f"add_2fa_{user_id}_{timestamp}")
+            os.makedirs(result_dir, exist_ok=True)
+            
+            result_zip_path = os.path.join(result_dir, t(user_id, 'zip_add_2fa_result').format(timestamp=timestamp) + ".zip")
+            
+            # 直接打包整个extract_dir，保持原始结构（2fa.txt已经被添加到正确位置）
+            with zipfile.ZipFile(result_zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+                for root, dirs, filenames in os.walk(extract_dir):
+                    for fn in filenames:
+                        full_path = os.path.join(root, fn)
+                        # 计算相对于extract_dir的路径，保持原始结构
+                        rel_path = os.path.relpath(full_path, extract_dir)
+                        zf.write(full_path, rel_path)
+            
+            # 发送结果
+            elapsed = time.time() - task_info['start_time']
+            
+            summary_text = f"""
+<b>{t(user_id, 'add_2fa_complete')}</b>
+
+<b>{t(user_id, 'add_2fa_results')}</b>
+{t(user_id, 'add_2fa_success').format(count=success_count)}
+{t(user_id, 'add_2fa_failed').format(count=failed_count)}
+{t(user_id, 'add_2fa_total').format(count=len(files))}
+{t(user_id, 'add_2fa_duration').format(time=f'{elapsed:.1f}')}
+
+<b>{t(user_id, 'add_2fa_password_set').format(password=two_fa_password)}</b>
+            """
+            
+            try:
+                progress_msg.edit_text(summary_text, parse_mode='HTML')
+            except:
+                self.safe_send_message(update, summary_text, 'HTML')
+            
+            # 发送结果文件
+            if os.path.exists(result_zip_path):
+                with open(result_zip_path, 'rb') as f:
+                    context.bot.send_document(
+                        chat_id=user_id,
+                        document=f,
+                        caption=t(user_id, 'file_desc_add_2fa_success').format(count=success_count),
+                        filename=os.path.basename(result_zip_path)
+                    )
+            
+        except Exception as e:
+            print(f"❌ 完成添加2FA失败: {e}")
+            import traceback
+            traceback.print_exc()
+            self.safe_send_message(update, t(user_id, 'add_2fa_error').format(error=str(e)[:100]))
+        
+        finally:
+            # 清理任务
+            if user_id in self.pending_add_2fa_tasks:
+                del self.pending_add_2fa_tasks[user_id]
+            
+            # 清除用户状态
+            self.db.save_user(user_id, "", "", "")
+            
+            # 清理临时文件
+            if temp_dir and os.path.exists(temp_dir):
+                try:
+                    shutil.rmtree(temp_dir, ignore_errors=True)
+                except:
+                    pass
+    
+    async def _add_2fa_to_session(self, session_path: str, session_name: str, two_fa_password: str) -> dict:
+        """为Session文件添加2FA配置 - 创建对应的JSON文件"""
+        try:
+            # 生成JSON文件路径
+            json_path = session_path.replace('.session', '.json')
+            
+            # 检查JSON文件是否已存在
+            if os.path.exists(json_path):
+                # 读取现有JSON并更新，删除旧密码字段，只保留twofa
+                with open(json_path, 'r', encoding='utf-8') as f:
+                    json_data = json.load(f)
+                
+                # 删除所有旧的密码字段
+                old_fields_to_remove = ['twoFA', '2fa', 'password', 'two_fa']
+                for field in old_fields_to_remove:
+                    if field in json_data:
+                        del json_data[field]
+                
+                # 设置标准的 twofa 字段
+                json_data['twofa'] = two_fa_password
+                json_data['has_password'] = True
+                
+                with open(json_path, 'w', encoding='utf-8') as f:
+                    json.dump(json_data, f, indent=2, ensure_ascii=False)
+                
+                return {'success': True, 'message': 'JSON文件已更新twofa字段'}
+            
+            # 创建新的JSON文件
+            # 从session文件名提取手机号（如果可能）
+            base_name = session_name.replace('.session', '')
+            # 清理手机号格式：移除常见的非数字字符
+            cleaned_phone = ''.join(c for c in base_name if c.isdigit())
+            phone = cleaned_phone if cleaned_phone and len(cleaned_phone) >= 10 else ""
+            
+            current_time = datetime.now(BEIJING_TZ)
+            
+            # 使用默认设备配置
+            device_config = {
+                'api_id': config.API_ID,
+                'api_hash': config.API_HASH,
+                'sdk': 'Windows 10 x64',
+                'device': 'PC 64bit',
+                'app_version': '6.3.4 x64',
+                'lang_code': 'en',
+                'system_lang_code': 'en-US',
+                'device_model': 'PC 64bit',
+            }
+            
+            # 使用用户提供的模板格式生成JSON
+            json_data = {
+                "app_id": device_config.get('api_id', config.API_ID),
+                "app_hash": device_config.get('api_hash', config.API_HASH),
+                "sdk": device_config.get('sdk', 'Windows 10 x64'),
+                "device": device_config.get('device', 'PC 64bit'),
+                "app_version": device_config.get('app_version', '6.3.4 x64'),
+                "lang_pack": device_config.get('lang_code', 'en'),
+                "system_lang_pack": device_config.get('system_lang_code', 'en-US'),
+                "twoFA": two_fa_password,
+                "role": None,
+                "id": 0,
+                "phone": phone,
+                "username": None,
+                "date_of_birth": None,
+                "date_of_birth_integrity": None,
+                "is_premium": False,
+                "premium_expiry": None,
+                "first_name": "",
+                "last_name": None,
+                "has_profile_pic": False,
+                "spamblock": "",
+                "spamblock_end_date": None,
+                "session_file": base_name,
+                "stats_spam_count": 0,
+                "stats_invites_count": 0,
+                "last_connect_date": current_time.strftime('%Y-%m-%dT%H:%M:%S+0000'),
+                "session_created_date": current_time.strftime('%Y-%m-%dT%H:%M:%S+0000'),
+                "app_config_hash": None,
+                "extra_params": "",
+                "device_model": device_config.get('device_model', 'PC 64bit'),
+                "user_id": 0,
+                "ipv6": False,
+                "register_time": None,
+                "sex": None,
+                "last_check_time": int(current_time.timestamp()),
+                "device_token": "",
+                "tz_offset": 0,
+                "perf_cat": 2,
+                "avatar": "img/default.png",
+                "proxy": None,
+                "block": False,
+                "package_id": "",
+                "installer": "",
+                "email": "",
+                "email_id": "",
+                "secret": "",
+                "category": "",
+                "scam": False,
+                "is_blocked": False,
+                "voip_token": "",
+                "last_reg_time": 0,
+                "has_password": True,
+                "block_since_time": 0,
+                "block_until_time": 0
+            }
+            
+            with open(json_path, 'w', encoding='utf-8') as f:
+                json.dump(json_data, f, indent=2, ensure_ascii=False)
+            
+            return {'success': True, 'message': 'JSON文件已创建'}
+            
+        except Exception as e:
+            return {'success': False, 'error': str(e)}
+    
+    async def _add_2fa_to_tdata(self, tdata_path: str, display_name: str, two_fa_password: str) -> dict:
+        """为TData目录添加2FA配置 - 创建2fa.txt文件"""
+        try:
+            # TData目录的父目录（与tdata同级）
+            parent_dir = os.path.dirname(tdata_path)
+            
+            # 2fa.txt文件路径
+            twofa_txt_path = os.path.join(parent_dir, "2fa.txt")
+            
+            # 检查是否已存在密码文件
+            existing_password_files = ['2fa.txt', 'twofa.txt', 'password.txt', '2FA.txt', 'TwoFA.txt']
+            existing_file = None
+            
+            for pwd_file in existing_password_files:
+                pwd_path = os.path.join(parent_dir, pwd_file)
+                if os.path.exists(pwd_path):
+                    existing_file = pwd_path
+                    break
+            
+            if existing_file:
+                # 更新现有密码文件
+                with open(existing_file, 'w', encoding='utf-8') as f:
+                    f.write(two_fa_password)
+                return {'success': True, 'message': f'密码文件已更新: {os.path.basename(existing_file)}'}
+            
+            # 创建新的2fa.txt文件
+            with open(twofa_txt_path, 'w', encoding='utf-8') as f:
+                f.write(two_fa_password)
+            
+            return {'success': True, 'message': '2fa.txt文件已创建'}
+            
+        except Exception as e:
+            return {'success': False, 'error': str(e)}
+    
+    async def process_remove_2fa(self, update, context, document):
+        """处理删除2FA - 从文件中删除2FA密码"""
+        user_id = update.effective_user.id
+        start_time = time.time()
+        task_id = f"{user_id}_{int(start_time)}"
+        
+        print(f"🗑️ 开始删除2FA任务: {task_id}")
+        
+        # 发送进度消息
+        progress_msg = self.safe_send_message(
+            update,
+            f"<b>{t(user_id, 'delete_2fa_processing_file')}</b>",
+            'HTML'
+        )
+        
+        if not progress_msg:
+            print("❌ 无法发送进度消息")
+            return
+        
+        temp_zip = None
+        try:
+            # 下载文件
+            temp_dir = tempfile.mkdtemp(prefix="temp_remove_2fa_")
+            temp_zip = os.path.join(temp_dir, document.file_name)
+            
+            document.get_file().download(temp_zip)
+            print(f"📥 下载文件: {temp_zip}")
+            
+            # 扫描文件
+            files, extract_dir, file_type = self.processor.scan_zip_file(temp_zip, user_id, task_id)
+            
+            if not files:
+                try:
+                    progress_msg.edit_text(
+                        f"<b>{t(user_id, 'delete_2fa_no_valid_files')}</b>\n\n{t(user_id, 'delete_2fa_ensure_format')}",
+                        parse_mode='HTML'
+                    )
+                except:
+                    pass
+                return
+            
+            total_files = len(files)
+            
+            # 保存任务信息，等待用户选择密码输入方式
+            self.two_factor_manager.pending_2fa_tasks[user_id] = {
+                'files': files,
+                'file_type': file_type,
+                'extract_dir': extract_dir,
+                'task_id': task_id,
+                'progress_msg': progress_msg,
+                'start_time': start_time,
+                'temp_zip': temp_zip,
+                'operation': 'remove'  # 标记为删除操作
+            }
+            
+            # 请求用户选择密码输入方式
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton(f"🔍 {t(user_id, 'delete_2fa_btn_auto')}", callback_data="remove_2fa_auto")],
+                [InlineKeyboardButton(f"✏️ {t(user_id, 'delete_2fa_btn_manual')}", callback_data="remove_2fa_manual")],
+                [InlineKeyboardButton(f"❌ {t(user_id, 'delete_2fa_btn_cancel')}", callback_data="back_to_main")]
+            ])
+            
+            try:
+                progress_msg.edit_text(
+                    f"{t(user_id, 'delete_2fa_found_files').format(count=total_files)}\n\n"
+                    f"{t(user_id, 'delete_2fa_file_type').format(type=file_type.upper())}\n\n"
+                    f"{t(user_id, 'delete_2fa_select_method')}\n\n"
+                    f"<b>{t(user_id, 'delete_2fa_auto_detect_title')}</b>\n"
+                    f"{t(user_id, 'delete_2fa_auto_detect_desc1')}\n"
+                    f"{t(user_id, 'delete_2fa_auto_detect_desc2')}\n"
+                    f"{t(user_id, 'delete_2fa_auto_detect_desc3')}\n\n"
+                    f"<b>{t(user_id, 'delete_2fa_manual_title')}</b>\n"
+                    f"{t(user_id, 'delete_2fa_manual_desc1')}\n"
+                    f"{t(user_id, 'delete_2fa_manual_desc2')}\n\n"
+                    f"{t(user_id, 'delete_2fa_select_timeout')}",
+                    parse_mode='HTML',
+                    reply_markup=keyboard
+                )
+            except:
+                pass
+            
+            print(f"⏳ 等待用户 {user_id} 选择密码输入方式...")
+            
+        except Exception as e:
+            print(f"❌ 处理文件失败: {e}")
+            import traceback
+            traceback.print_exc()
+            
+            try:
+                progress_msg.edit_text(
+                    f"❌ <b>处理文件失败</b>\n\n错误: {str(e)}",
+                    parse_mode='HTML'
+                )
+            except:
+                pass
+            
+            # 清理临时下载文件
+            if temp_zip and os.path.exists(temp_zip):
+                try:
+                    shutil.rmtree(os.path.dirname(temp_zip), ignore_errors=True)
+                except:
+                    pass
+    
+    async def complete_remove_2fa(self, update, context, user_id: int, old_password: Optional[str]):
+        """执行删除2FA操作"""
+        # 检查是否有待处理的任务
+        if user_id not in self.two_factor_manager.pending_2fa_tasks:
+            self.safe_send_message(update, "❌ 没有待处理的删除2FA任务")
+            return
+        
+        task_info = self.two_factor_manager.pending_2fa_tasks[user_id]
+        files = task_info['files']
+        file_type = task_info['file_type']
+        extract_dir = task_info['extract_dir']
+        task_id = task_info['task_id']
+        progress_msg = task_info['progress_msg']
+        start_time = task_info['start_time']
+        temp_zip = task_info['temp_zip']
+        
+        total_files = len(files)
+        
+        logger.info(f"开始删除2FA任务: user_id={user_id}, 文件数={total_files}")
+        
+        try:
+            # 更新消息，开始处理
+            try:
+                progress_msg.edit_text(
+                    f"{t(user_id, 'delete_2fa_starting')}\n\n"
+                    f"{t(user_id, 'delete_2fa_found_count').format(count=total_files)}\n"
+                    f"{t(user_id, 'delete_2fa_please_wait')}",
+                    parse_mode='HTML'
+                )
+            except:
+                pass
+            
+            # 定义进度回调
+            async def remove_callback(processed, total, results, speed, elapsed):
+                try:
+                    success_count = len(results.get("成功", []))
+                    fail_count = len(results.get("失败", []))
+                    
+                    # 添加日志跟踪进度
+                    if processed >= total:
+                        logger.info(f"进度回调: 处理完成 {processed}/{total}, 成功={success_count}, 失败={fail_count}")
+                    elif processed % 50 == 0:  # 每50个记录一次
+                        logger.info(f"进度回调: {processed}/{total}, 成功={success_count}, 失败={fail_count}")
+                    
+                    progress_text = f"""
+{t(user_id, 'delete_2fa_in_progress')}
+
+<b>{t(user_id, 'delete_2fa_current_progress')}</b>
+{t(user_id, 'delete_2fa_processed').format(done=processed, total=total)}
+{t(user_id, 'delete_2fa_speed').format(speed=f"{speed:.1f}")}
+{t(user_id, 'delete_2fa_elapsed').format(time=int(elapsed))}
+
+{t(user_id, 'delete_2fa_success_count').format(count=success_count)}
+{t(user_id, 'delete_2fa_failed_count').format(count=fail_count)}
+
+{t(user_id, 'delete_2fa_remaining').format(time=int((total - processed) / speed) if speed > 0 else 0)}
+                    """
+                    
+                    try:
+                        progress_msg.edit_text(progress_text, parse_mode='HTML')
+                    except FloodWaitError as e:
+                        # 被限流时记录警告但不阻塞处理
+                        if processed >= total:
+                            logger.warning(f"更新最终进度消息被限流: {e.seconds}秒")
+                        # 非最终消息被限流时静默跳过
+                    except Exception as e:
+                        if processed >= total:
+                            logger.warning(f"更新最终进度消息失败: {e}")
+                        pass
+                except Exception as e:
+                    logger.error(f"⚠️ 进度回调错误: {e}")
+            
+            # 执行批量删除
+            logger.info("开始执行批量删除...")
+            results = await self.two_factor_manager.batch_remove_passwords(
+                files,
+                file_type,
+                old_password,
+                remove_callback,
+                user_id
+            )
+            logger.info(f"批量删除完成: 成功={len(results.get('成功', []))}, 失败={len(results.get('失败', []))}")
+            
+            # 创建结果文件
+            logger.info("开始生成结果文件...")
+            result_files = self.two_factor_manager.create_result_files(results, task_id, file_type, user_id, operation='remove')
+            logger.info(f"结果文件生成完成，共 {len(result_files)} 个文件")
+            
+            elapsed_time = time.time() - start_time
+            
+            # 发送结果统计
+            success_count = len(results["成功"])
+            fail_count = len(results["失败"])
+            
+            summary_text = f"""
+{t(user_id, 'delete_2fa_complete')}
+
+<b>{t(user_id, 'delete_2fa_stats')}</b>
+{t(user_id, 'delete_2fa_total').format(count=total_files)}
+{t(user_id, 'delete_2fa_success').format(count=success_count)}
+{t(user_id, 'delete_2fa_failed').format(count=fail_count)}
+{t(user_id, 'delete_2fa_duration').format(time=int(elapsed_time))}
+{t(user_id, 'delete_2fa_speed_stat').format(speed=f"{total_files/elapsed_time:.1f}")}
+
+{t(user_id, 'delete_2fa_sending_results')}
+            """
+            
+            try:
+                progress_msg.edit_text(summary_text, parse_mode='HTML')
+            except:
+                pass
+            
+            # 发送结果文件（分离发送 ZIP 和 TXT）
+            logger.info(f"开始发送 {len(result_files)} 个结果文件...")
+            sent_count = 0
+            for idx, (zip_path, txt_path, status, count) in enumerate(result_files, 1):
+                logger.info(f"发送第 {idx}/{len(result_files)} 个文件组: {status}")
+                try:
+                    # 1. 发送 ZIP 文件
+                    if os.path.exists(zip_path):
+                        logger.info(f"发送ZIP文件: {os.path.basename(zip_path)}")
+                        max_retries = 3
+                        for attempt in range(max_retries):
+                            try:
+                                with open(zip_path, 'rb') as f:
+                                    # Determine caption based on status
+                                    if status == "成功":
+                                        caption = f"{t(user_id, 'file_desc_delete_2fa_success').format(count=count)}\n\n{t(user_id, 'delete_2fa_process_time').format(time=datetime.now(BEIJING_TZ).strftime('%Y-%m-%d %H:%M:%S CST'))}"
+                                    else:
+                                        caption = f"{t(user_id, 'file_desc_delete_2fa_failed').format(count=count)}\n\n{t(user_id, 'delete_2fa_process_time').format(time=datetime.now(BEIJING_TZ).strftime('%Y-%m-%d %H:%M:%S CST'))}"
+                                    context.bot.send_document(
+                                        chat_id=update.effective_chat.id,
+                                        document=f,
+                                        filename=os.path.basename(zip_path),
+                                        caption=caption,
+                                        parse_mode='HTML',
+                                        timeout=300  # 5分钟超时
+                                    )
+                                logger.info(f"✅ ZIP文件发送成功: {os.path.basename(zip_path)}")
+                                sent_count += 1
+                                # 添加延迟避免连续发送触发限流
+                                if idx < len(result_files):
+                                    await asyncio.sleep(2.0)
+                                break
+                            except RetryAfter as e:
+                                wait_time = e.retry_after + 1
+                                logger.warning(f"被限流，等待 {wait_time} 秒后重试...")
+                                # 尝试通知用户等待
+                                try:
+                                    context.bot.send_message(
+                                        chat_id=update.effective_chat.id,
+                                        text=f"⏳ 发送文件触发频率限制\n等待 {int(wait_time)} 秒后自动继续...\n({idx}/{len(result_files)} 个文件组已发送)",
+                                        parse_mode='HTML'
+                                    )
+                                except:
+                                    pass
+                                await asyncio.sleep(wait_time)
+                            except Exception as e:
+                                if attempt < max_retries - 1:
+                                    logger.warning(f"发送ZIP失败 (尝试 {attempt+1}/{max_retries}): {e}")
+                                    await asyncio.sleep(2 ** attempt)
+                                else:
+                                    logger.error(f"❌ 发送ZIP文件失败（已重试{max_retries}次）: {e}")
+                    else:
+                        logger.warning(f"ZIP文件不存在: {zip_path}")
+                    
+                    # 2. 发送 TXT 报告
+                    if os.path.exists(txt_path):
+                        logger.info(f"发送TXT报告: {os.path.basename(txt_path)}")
+                        max_retries = 3
+                        for attempt in range(max_retries):
+                            try:
+                                with open(txt_path, 'rb') as f:
+                                    # Determine caption based on status
+                                    if status == "成功":
+                                        caption = f"{t(user_id, 'report_desc_delete_2fa_success')}\n\n{t(user_id, 'report_delete_2fa_contains').format(count=count)}"
+                                    else:
+                                        caption = f"{t(user_id, 'report_desc_delete_2fa_failed')}\n\n{t(user_id, 'report_delete_2fa_contains').format(count=count)}"
+                                    context.bot.send_document(
+                                        chat_id=update.effective_chat.id,
+                                        document=f,
+                                        filename=os.path.basename(txt_path),
+                                        caption=caption,
+                                        parse_mode='HTML',
+                                        timeout=300  # 5分钟超时
+                                    )
+                                logger.info(f"✅ TXT报告发送成功: {os.path.basename(txt_path)}")
+                                sent_count += 1
+                                # 添加延迟避免连续发送触发限流
+                                if idx < len(result_files):
+                                    await asyncio.sleep(2.0)
+                                break
+                            except RetryAfter as e:
+                                wait_time = e.retry_after + 1
+                                logger.warning(f"被限流，等待 {wait_time} 秒后重试...")
+                                # 尝试通知用户等待
+                                try:
+                                    context.bot.send_message(
+                                        chat_id=update.effective_chat.id,
+                                        text=f"⏳ 发送报告触发频率限制\n等待 {int(wait_time)} 秒后自动继续...\n({idx}/{len(result_files)} 个文件组已发送)",
+                                        parse_mode='HTML'
+                                    )
+                                except:
+                                    pass
+                                await asyncio.sleep(wait_time)
+                            except Exception as e:
+                                if attempt < max_retries - 1:
+                                    logger.warning(f"发送TXT失败 (尝试 {attempt+1}/{max_retries}): {e}")
+                                    await asyncio.sleep(2 ** attempt)
+                                else:
+                                    logger.error(f"❌ 发送TXT报告失败（已重试{max_retries}次）: {e}")
+                    else:
+                        logger.warning(f"TXT文件不存在: {txt_path}")
+                    
+                except Exception as e:
+                    logger.error(f"❌ 处理文件组失败: {e}")
+                    # 即使某个文件组失败也继续处理下一个
+            
+            logger.info(f"文件发送完成: 成功发送 {sent_count}/{len(result_files)*2} 个文件")
+            
+            # 最终汇总消息
+            final_text = f"""
+{t(user_id, 'delete_2fa_task_complete')}
+
+<b>{t(user_id, 'delete_2fa_final_stats')}</b>
+{t(user_id, 'delete_2fa_final_success').format(count=success_count)}
+{t(user_id, 'delete_2fa_final_failed').format(count=fail_count)}
+{t(user_id, 'delete_2fa_final_sent').format(count=sent_count)}
+
+<b>{t(user_id, 'delete_2fa_tips')}</b>
+{t(user_id, 'delete_2fa_tip1')}
+{t(user_id, 'delete_2fa_tip2')}
+{t(user_id, 'delete_2fa_tip3')}
+            """
+            
+            try:
+                progress_msg.edit_text(final_text, parse_mode='HTML')
+                logger.info("最终汇总消息已发送")
+            except Exception as e:
+                logger.error(f"更新最终汇总消息失败: {e}")
+            
+        except Exception as e:
+            logger.error(f"❌ 删除2FA任务失败: {e}")
+            import traceback
+            traceback.print_exc()
+            
+            try:
+                # 尝试发送错误信息给用户
+                progress_msg.edit_text(
+                    f"<b>{t(user_id, 'delete_2fa_failed_msg')}</b>\n\n{t(user_id, 'delete_2fa_error_msg').format(error=str(e))}",
+                    parse_mode='HTML'
+                )
+            except:
+                # 如果更新消息失败，尝试发送新消息
+                try:
+                    self.safe_send_message(update, f"{t(user_id, 'delete_2fa_failed_msg')}: {str(e)}")
+                except:
+                    pass
+        
+        finally:
+            # 确保清理任务和临时文件（在finally块中确保一定执行）
+            logger.info("开始清理任务和临时文件...")
+            
+            # 清理任务
+            if user_id in self.two_factor_manager.pending_2fa_tasks:
+                del self.two_factor_manager.pending_2fa_tasks[user_id]
+                logger.info("任务已从队列中移除")
+            
+            # 清理临时文件
+            try:
+                if temp_zip and os.path.exists(temp_zip):
+                    shutil.rmtree(os.path.dirname(temp_zip), ignore_errors=True)
+                    logger.info(f"已清理临时ZIP目录: {os.path.dirname(temp_zip)}")
+                if extract_dir and os.path.exists(extract_dir):
+                    shutil.rmtree(extract_dir, ignore_errors=True)
+                    logger.info(f"已清理解压目录: {extract_dir}")
+                
+                # 清理结果文件（如果已生成）
+                if 'result_files' in locals():
+                    for zip_path, txt_path, _, _ in result_files:
+                        try:
+                            if os.path.exists(zip_path):
+                                os.remove(zip_path)
+                                logger.info(f"已删除结果ZIP: {os.path.basename(zip_path)}")
+                            if os.path.exists(txt_path):
+                                os.remove(txt_path)
+                                logger.info(f"已删除结果TXT: {os.path.basename(txt_path)}")
+                        except Exception as e:
+                            logger.warning(f"删除结果文件失败: {e}")
+                
+                logger.info("临时文件清理完成")
+            except Exception as e:
+                logger.error(f"⚠️ 清理临时文件失败: {e}")
+    
+    async def process_classify_stage1(self, update, context, document):
+        """账号分类 - 阶段1：扫描文件并选择拆分方式"""
+        user_id = update.effective_user.id
+        start_time = time.time()
+        task_id = f"{user_id}_{int(start_time)}"
+        
+        progress_msg = self.safe_send_message(update, f"<b>{t(user_id, 'split_processing_file')}</b>", 'HTML')
+        if not progress_msg:
+            return
+        
+        temp_zip = None
+        try:
+            temp_dir = tempfile.mkdtemp(prefix="temp_classify_")
+            temp_zip = os.path.join(temp_dir, document.file_name)
+            document.get_file().download(temp_zip)
+            
+            # 使用FileProcessor扫描
+            files, extract_dir, file_type = self.processor.scan_zip_file(temp_zip, user_id, task_id)
+            
+            if not files:
+                try:
+                    progress_msg.edit_text(
+                        "❌ <b>未找到有效文件</b>\n\n请确保ZIP包含Session或TData格式的账号文件",
+                        parse_mode='HTML'
+                    )
+                except:
+                    pass
+                return
+            
+            # 构建元数据
+            metas = self.classifier.build_meta_from_pairs(files, file_type)
+            total_count = len(metas)
+            
+            # 统计识别情况
+            recognized = sum(1 for m in metas if m.phone)
+            unknown = total_count - recognized
+            
+            # 保存任务信息
+            self.pending_classify_tasks[user_id] = {
+                'metas': metas,
+                'file_type': file_type,
+                'extract_dir': extract_dir,
+                'task_id': task_id,
+                'progress_msg': progress_msg,
+                'start_time': start_time,
+                'temp_zip': temp_zip
+            }
+            
+            # 提示选择拆分方式
+            text = f"""
+<b>{t(user_id, 'split_scan_complete')}</b>
+
+<b>{t(user_id, 'split_statistics')}</b>
+{t(user_id, 'split_total_accounts').format(count=total_count)}
+{t(user_id, 'split_identified').format(count=recognized)}
+{t(user_id, 'split_unidentified').format(count=unknown)}
+{t(user_id, 'split_file_type').format(type=file_type.upper())}
+
+<b>{t(user_id, 'split_select_method')}</b>
+            """
+            
+            try:
+                progress_msg.edit_text(
+                    text,
+                    parse_mode='HTML',
+                    reply_markup=self._classify_buttons_split_type(user_id)
+                )
+            except:
+                pass
+        
+        except Exception as e:
+            print(f"❌ 分类阶段1失败: {e}")
+            import traceback
+            traceback.print_exc()
+            try:
+                progress_msg.edit_text(f"❌ 处理失败: {str(e)}", parse_mode='HTML')
+            except:
+                pass
+            if temp_zip and os.path.exists(temp_zip):
+                try:
+                    shutil.rmtree(os.path.dirname(temp_zip), ignore_errors=True)
+                except:
+                    pass
+    
+    def _classify_cleanup(self, user_id):
+        """清理分类任务"""
+        if user_id in self.pending_classify_tasks:
+            task = self.pending_classify_tasks[user_id]
+            # 清理临时文件
+            if 'temp_zip' in task and task['temp_zip'] and os.path.exists(task['temp_zip']):
+                try:
+                    shutil.rmtree(os.path.dirname(task['temp_zip']), ignore_errors=True)
+                except:
+                    pass
+            if 'extract_dir' in task and task['extract_dir'] and os.path.exists(task['extract_dir']):
+                try:
+                    shutil.rmtree(task['extract_dir'], ignore_errors=True)
+                except:
+                    pass
+            del self.pending_classify_tasks[user_id]
+        
+        # 清空数据库状态
+        self.db.save_user(user_id, "", "", "")
+    
+    async def _classify_send_bundles(self, update, context, bundles, user_id, prefix=""):
+        """统一发送ZIP包并节流"""
+        sent_count = 0
+        for zip_path, display_name, count in bundles:
+            if os.path.exists(zip_path):
+                try:
+                    with open(zip_path, 'rb') as f:
+                        caption = f"📦 <b>{prefix}{display_name}</b>\n{t(user_id, 'split_file_contains').format(count=count)}"
+                        context.bot.send_document(
+                            chat_id=update.effective_chat.id,
+                            document=f,
+                            filename=display_name,
+                            caption=caption,
+                            parse_mode='HTML'
+                        )
+                    sent_count += 1
+                    print(f"📤 已发送: {display_name}")
+                    await asyncio.sleep(1.0)  # 节流
+                    
+                    # 发送后删除
+                    try:
+                        os.remove(zip_path)
+                    except:
+                        pass
+                except Exception as e:
+                    print(f"❌ 发送文件失败: {display_name} - {e}")
+        
+        return sent_count
+    
+    async def _classify_split_single_qty(self, update, context, user_id, qty):
+        """按单个数量拆分"""
+        if user_id not in self.pending_classify_tasks:
+            self.safe_send_message(update, t(user_id, 'split_error_no_task'))
+            return
+        
+        task = self.pending_classify_tasks[user_id]
+        metas = task['metas']
+        task_id = task['task_id']
+        progress_msg = task['progress_msg']
+        
+        try:
+            total = len(metas)
+            if qty > total:
+                self.safe_send_message(update, t(user_id, 'split_error_qty_exceeds').format(qty=qty, total=total))
+                return
+            
+            # 更新提示
+            try:
+                progress_msg.edit_text(
+                    f"<b>{t(user_id, 'split_processing_quantity_single')}</b>\n\n{t(user_id, 'split_processing_quantity_single_desc').format(qty=qty)}\n{t(user_id, 'split_processing_quantity_multi_total').format(total=total)}",
+                    parse_mode='HTML'
+                )
+            except:
+                pass
+            
+            # 计算需要多少个包
+            num_bundles = (total + qty - 1) // qty
+            sizes = [qty] * (num_bundles - 1) + [total - (num_bundles - 1) * qty]
+            
+            out_dir = os.path.join(config.RESULTS_DIR, f"classify_{task_id}")
+            bundles = self.classifier.split_by_quantities(metas, sizes, out_dir, t_func=lambda key: t(user_id, key))
+            
+            # 发送结果
+            try:
+                progress_msg.edit_text(f"<b>{t(user_id, 'split_sending_results')}</b>", parse_mode='HTML')
+            except:
+                pass
+            
+            sent = await self._classify_send_bundles(update, context, bundles, user_id)
+            
+            # 完成提示
+            self.safe_send_message(
+                update,
+                f"<b>{t(user_id, 'split_complete')}</b>\n\n"
+                f"{t(user_id, 'split_result_total').format(count=total)}\n"
+                f"{t(user_id, 'split_result_sent').format(count=sent)}\n"
+                f"• {t(user_id, 'split_method_quantity')}: {qty} {t(user_id, 'accounts_unit')}\n\n"
+                f"{t(user_id, 'split_use_again')}",
+                'HTML'
+            )
+            
+            # 清理
+            try:
+                if os.path.exists(out_dir):
+                    shutil.rmtree(out_dir, ignore_errors=True)
+            except:
+                pass
+        
+        except Exception as e:
+            print(f"❌ 单数量拆分失败: {e}")
+            import traceback
+            traceback.print_exc()
+            self.safe_send_message(update, f"❌ 拆分失败: {str(e)}")
+        finally:
+            self._classify_cleanup(user_id)
+    
+    async def _classify_split_multi_qty(self, update, context, user_id, quantities):
+        """按多个数量拆分"""
+        if user_id not in self.pending_classify_tasks:
+            self.safe_send_message(update, t(user_id, 'split_error_no_task'))
+            return
+        
+        task = self.pending_classify_tasks[user_id]
+        metas = task['metas']
+        task_id = task['task_id']
+        progress_msg = task['progress_msg']
+        
+        try:
+            total = len(metas)
+            total_requested = sum(quantities)
+            
+            # 更新提示
+            try:
+                progress_msg.edit_text(
+                    f"<b>{t(user_id, 'split_processing_quantity_multi')}</b>\n\n"
+                    f"{t(user_id, 'split_processing_quantity_multi_sequence').format(sequence=' '.join(map(str, quantities)))}\n"
+                    f"{t(user_id, 'split_processing_quantity_multi_total').format(total=total)}\n"
+                    f"{t(user_id, 'split_processing_quantity_multi_requested').format(requested=total_requested)}",
+                    parse_mode='HTML'
+                )
+            except:
+                pass
+            
+            out_dir = os.path.join(config.RESULTS_DIR, f"classify_{task_id}")
+            bundles = self.classifier.split_by_quantities(metas, quantities, out_dir, t_func=lambda key: t(user_id, key))
+            
+            # 余数提示
+            remainder = total - total_requested
+            remainder_msg = ""
+            if remainder > 0:
+                remainder_msg = f"\n\n{t(user_id, 'split_remainder_unallocated').format(remainder=remainder)}"
+            elif remainder < 0:
+                remainder_msg = f"\n\n{t(user_id, 'split_remainder_exceeded')}"
+            
+            # 发送结果
+            try:
+                progress_msg.edit_text(f"<b>{t(user_id, 'split_sending_results')}</b>", parse_mode='HTML')
+            except:
+                pass
+            
+            sent = await self._classify_send_bundles(update, context, bundles, user_id)
+            
+            # 完成提示
+            self.safe_send_message(
+                update,
+                f"<b>{t(user_id, 'split_complete')}</b>\n\n"
+                f"{t(user_id, 'split_result_total').format(count=total)}\n"
+                f"{t(user_id, 'split_result_sent').format(count=sent)}\n"
+                f"{t(user_id, 'split_result_sequence').format(sequence=' '.join(map(str, quantities)))}{remainder_msg}\n\n"
+                f"{t(user_id, 'split_use_again')}",
+                'HTML'
+            )
+            
+            # 清理
+            try:
+                if os.path.exists(out_dir):
+                    shutil.rmtree(out_dir, ignore_errors=True)
+            except:
+                pass
+        
+        except Exception as e:
+            print(f"❌ 多数量拆分失败: {e}")
+            import traceback
+            traceback.print_exc()
+            self.safe_send_message(update, f"❌ 拆分失败: {str(e)}")
+        finally:
+            self._classify_cleanup(user_id)
+    
+    def handle_classify_callbacks(self, update, context, query, data):
+        """处理分类相关的回调"""
+        user_id = query.from_user.id
+        
+        if data == "classify_menu":
+            self.handle_classify_menu(query)
+        
+        elif data == "classify_start":
+            # 设置状态并提示上传
+            self.db.save_user(
+                user_id,
+                query.from_user.username or "",
+                query.from_user.first_name or "",
+                "waiting_classify_file"
+            )
+            query.answer()
+            try:
+                query.edit_message_text(
+                    f"<b>{t(user_id, 'split_upload_prompt')}</b>\n\n"
+                    f"{t(user_id, 'split_formats')}\n"
+                    f"{t(user_id, 'split_format1')}\n"
+                    f"{t(user_id, 'split_format2')}\n"
+                    f"{t(user_id, 'split_format3')}\n\n"
+                    f"{t(user_id, 'split_size_limit')}\n"
+                    f"{t(user_id, 'split_timeout')}",
+                    parse_mode='HTML',
+                    reply_markup=get_back_to_menu_keyboard(user_id)
+                )
+            except:
+                pass
+        
+        elif data == "classify_split_country":
+            # 按国家拆分
+            if user_id not in self.pending_classify_tasks:
+                query.answer("❌ 任务已过期")
+                return
+            
+            task = self.pending_classify_tasks[user_id]
+            metas = task['metas']
+            task_id = task['task_id']
+            progress_msg = task['progress_msg']
+            
+            query.answer()
+            
+            def process_country():
+                asyncio.run(self._classify_split_by_country(update, context, user_id))
+            threading.Thread(target=process_country, daemon=True).start()
+        
+        elif data == "classify_split_quantity":
+            # 按数量拆分 - 询问模式
+            query.answer()
+            try:
+                query.edit_message_text(
+                    f"<b>{t(user_id, 'split_quantity_mode')}</b>\n\n"
+                    f"<b>{t(user_id, 'split_single_quantity')}</b>\n"
+                    f"   {t(user_id, 'split_single_quantity_desc')}\n\n"
+                    f"<b>{t(user_id, 'split_multiple_quantity')}</b>\n"
+                    f"   {t(user_id, 'split_multiple_quantity_desc')}",
+                    parse_mode='HTML',
+                    reply_markup=self._classify_buttons_qty_mode(user_id)
+                )
+            except:
+                pass
+        
+        elif data == "classify_qty_single":
+            # 单个数量模式 - 等待输入
+            self.db.save_user(
+                user_id,
+                query.from_user.username or "",
+                query.from_user.first_name or "",
+                "waiting_classify_qty_single"
+            )
+            query.answer()
+            try:
+                query.edit_message_text(
+                    f"<b>{t(user_id, 'split_enter_single')}</b>\n\n"
+                    f"{t(user_id, 'split_enter_single_example')}: <code>10</code>\n\n"
+                    f"{t(user_id, 'split_enter_single_desc')}\n"
+                    f"{t(user_id, 'split_enter_timeout')}",
+                    parse_mode='HTML'
+                )
+            except:
+                pass
+        
+        elif data == "classify_qty_multi":
+            # 多个数量模式 - 等待输入
+            self.db.save_user(
+                user_id,
+                query.from_user.username or "",
+                query.from_user.first_name or "",
+                "waiting_classify_qty_multi"
+            )
+            query.answer()
+            try:
+                query.edit_message_text(
+                    f"<b>{t(user_id, 'split_enter_multiple')}</b>\n\n"
+                    f"{t(user_id, 'split_enter_multiple_example')}: <code>10 20 30</code>\n\n"
+                    f"{t(user_id, 'split_enter_multiple_desc')}\n"
+                    f"{t(user_id, 'split_enter_multiple_remainder')}\n"
+                    f"{t(user_id, 'split_enter_timeout')}",
+                    parse_mode='HTML'
+                )
+            except:
+                pass
+    
+    async def _classify_split_by_country(self, update, context, user_id):
+        """按国家拆分"""
+        if user_id not in self.pending_classify_tasks:
+            self.safe_send_message(update, t(user_id, 'split_error_no_task'))
+            return
+        
+        task = self.pending_classify_tasks[user_id]
+        metas = task['metas']
+        task_id = task['task_id']
+        progress_msg = task['progress_msg']
+        
+        try:
+            # 更新提示
+            try:
+                progress_msg.edit_text(
+                    f"<b>{t(user_id, 'split_processing_country')}</b>\n\n{t(user_id, 'split_processing_country_desc')}",
+                    parse_mode='HTML'
+                )
+            except:
+                pass
+            
+            out_dir = os.path.join(config.RESULTS_DIR, f"classify_{task_id}")
+            bundles = self.classifier.split_by_country(metas, out_dir, t_func=lambda key: t(user_id, key))
+            
+            # 发送结果
+            try:
+                progress_msg.edit_text(f"<b>{t(user_id, 'split_sending_results')}</b>", parse_mode='HTML')
+            except:
+                pass
+            
+            sent = await self._classify_send_bundles(update, context, bundles, user_id)
+            
+            # 完成提示
+            self.safe_send_message(
+                update,
+                f"<b>{t(user_id, 'split_complete')}</b>\n\n"
+                f"{t(user_id, 'split_result_total').format(count=len(metas))}\n"
+                f"{t(user_id, 'split_result_sent').format(count=sent)}\n"
+                f"{t(user_id, 'split_result_method_country')}\n\n"
+                f"{t(user_id, 'split_use_again')}",
+                'HTML'
+            )
+            
+            # 清理
+            try:
+                if os.path.exists(out_dir):
+                    shutil.rmtree(out_dir, ignore_errors=True)
+            except:
+                pass
+        
+        except Exception as e:
+            print(f"❌ 国家拆分失败: {e}")
+            import traceback
+            traceback.print_exc()
+            self.safe_send_message(update, f"❌ 拆分失败: {str(e)}")
+        finally:
+            self._classify_cleanup(user_id)
+    
+    # ================================
+    # VIP会员功能
+    # ================================
+    
+    def handle_vip_menu(self, query):
+        """显示VIP会员菜单"""
+        user_id = query.from_user.id
+        query.answer()
+        
+        # 获取会员状态
+        is_member, level, expiry = self.db.check_membership(user_id)
+        
+        if self.db.is_admin(user_id):
+            member_status = t(user_id, 'member_status_admin')
+        elif is_member:
+            # 翻译会员等级
+            if level == "会员":
+                translated_level = t(user_id, 'member_level_member')
+            elif level == "管理员":
+                translated_level = t(user_id, 'member_level_admin')
+            else:
+                translated_level = level  # 保留其他未知等级
+            
+            member_status = f"{t(user_id, 'member_status_member')} {translated_level}\n{t(user_id, 'member_status_expire').format(time=expiry)}"
+        else:
+            member_status = t(user_id, 'member_status_none')
+        
+        text = f"""
+<b>{t(user_id, 'member_center_title')}</b>
+
+<b>{t(user_id, 'member_current_status')}</b>
+{member_status}
+
+<b>{t(user_id, 'member_feature_title')}</b>
+{t(user_id, 'member_feature1')}
+{t(user_id, 'member_feature2')}
+{t(user_id, 'member_feature3')}
+
+<b>{t(user_id, 'member_operation_title')}</b>
+{t(user_id, 'member_operation_desc')}
+        """
+        
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton(t(user_id, 'member_btn_redeem'), callback_data="vip_redeem")],
+            [InlineKeyboardButton(t(user_id, 'btn_usdt_payment'), callback_data="usdt_payment")],
+            [InlineKeyboardButton(f"🔙 {t(user_id, 'btn_back_to_menu')}", callback_data="back_to_main")]
+        ])
+        
+        self.safe_edit_message(query, text, 'HTML', keyboard)
+    
+    def handle_usdt_payment(self, query):
+        """显示USDT支付菜单"""
+        user_id = query.from_user.id
+        query.answer()
+        
+        # 如果当前消息是图片消息（来自取消订单），先删除再发送新消息
+        message_was_photo = query.message and query.message.photo
+        if message_was_photo:
+            try:
+                query.message.delete()
+            except Exception as e:
+                logger.warning(f"删除图片消息失败: {e}")
+        
+        # 检查是否有待支付订单
+        try:
+            import sys
+            sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+            from tron import PaymentDatabase, OrderStatus
+            
+            payment_db = PaymentDatabase()
+            existing_order = payment_db.get_user_pending_order(user_id)
+            
+            if existing_order:
+                # 检查是否过期
+                from datetime import datetime, timezone, timedelta
+                BEIJING_TZ = timezone(timedelta(hours=8))
+                now = datetime.now(BEIJING_TZ)
+                expires_at = existing_order.expires_at.replace(tzinfo=BEIJING_TZ)
+                
+                if now < expires_at:
+                    # 有未过期订单，提示用户 - 使用 i18n
+                    remaining_minutes = int((expires_at - now).total_seconds() / 60)
+                    
+                    error_existing = t(user_id, 'payment_error_existing_order')
+                    order_id_label = t(user_id, 'payment_order_id')
+                    amount_label = t(user_id, 'payment_amount')
+                    minutes_label = t(user_id, 'payment_minutes')
+                    
+                    text = f"""
+<b>⚠️ {error_existing}</b>
+
+{order_id_label}: <code>{existing_order.order_id}</code>
+{amount_label}: <b>{existing_order.amount:.4f} USDT</b>
+剩余时间: <b>{remaining_minutes} {minutes_label}</b>
+
+请先完成或取消当前订单。
+                    """
+                    
+                    cancel_btn = t(user_id, 'btn_cancel_order')
+                    back_center_btn = t(user_id, 'member_btn_back_center')
+                    
+                    keyboard = InlineKeyboardMarkup([
+                        [InlineKeyboardButton(cancel_btn, callback_data=f"cancel_order_{existing_order.order_id}")],
+                        [InlineKeyboardButton(back_center_btn, callback_data="vip_menu")]
+                    ])
+                    
+                    # 如果删除了图片，发送新消息；否则编辑现有消息
+                    if message_was_photo:
+                        from telegram import Bot
+                        bot = query.bot if hasattr(query, 'bot') else Bot(token=os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN"))
+                        bot.send_message(
+                            chat_id=user_id,
+                            text=text,
+                            parse_mode='HTML',
+                            reply_markup=keyboard
+                        )
+                    else:
+                        self.safe_edit_message(query, text, 'HTML', keyboard)
+                    return
+        except Exception as e:
+            logger.error(f"检查待支付订单失败: {e}")
+        
+        # 显示支付菜单 - 使用 i18n
+        menu_title = t(user_id, 'payment_menu_title')
+        menu_desc = t(user_id, 'payment_menu_desc')
+        plan_7d = t(user_id, 'payment_plan_7d')
+        plan_30d = t(user_id, 'payment_plan_30d')
+        plan_120d = t(user_id, 'payment_plan_120d')
+        plan_365d = t(user_id, 'payment_plan_365d')
+        back_center = t(user_id, 'member_btn_back_center')
+        
+        # 套餐说明和安全保障
+        package_info = t(user_id, 'payment_menu_package_info')
+        info_1 = t(user_id, 'payment_menu_info_1')
+        info_2 = t(user_id, 'payment_menu_info_2')
+        info_3 = t(user_id, 'payment_menu_info_3')
+        info_4 = t(user_id, 'payment_menu_info_4')
+        security = t(user_id, 'payment_menu_security')
+        security_1 = t(user_id, 'payment_menu_security_1')
+        security_2 = t(user_id, 'payment_menu_security_2')
+        security_3 = t(user_id, 'payment_menu_security_3')
+        security_4 = t(user_id, 'payment_menu_security_4')
+        select_plan = t(user_id, 'payment_menu_select_plan')
+        
+        text = f"""
+<b>{menu_title}</b>
+
+{menu_desc}
+
+<b>{package_info}</b>
+{info_1}
+{info_2}
+{info_3}
+{info_4}
+
+<b>{security}</b>
+{security_1}
+{security_2}
+{security_3}
+{security_4}
+
+{select_plan}
+        """
+        
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton(plan_7d, callback_data="usdt_plan_7d")],
+            [InlineKeyboardButton(plan_30d, callback_data="usdt_plan_30d")],
+            [InlineKeyboardButton(plan_120d, callback_data="usdt_plan_120d")],
+            [InlineKeyboardButton(plan_365d, callback_data="usdt_plan_365d")],
+            [InlineKeyboardButton(f"🔙 {back_center}", callback_data="vip_menu")]
+        ])
+        
+        # 如果删除了图片，发送新消息；否则编辑现有消息
+        if message_was_photo:
+            from telegram import Bot
+            bot = query.bot if hasattr(query, 'bot') else Bot(token=os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN"))
+            bot.send_message(
+                chat_id=user_id,
+                text=text,
+                parse_mode='HTML',
+                reply_markup=keyboard
+            )
+        else:
+            self.safe_edit_message(query, text, 'HTML', keyboard)
+    
+    def handle_usdt_plan_select(self, query, plan_id: str):
+        """处理套餐选择"""
+        user_id = query.from_user.id
+        query.answer()
+        
+        try:
+            import sys
+            sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+            from tron import PaymentConfig, OrderManager, PaymentDatabase, QRCodeGenerator
+            from io import BytesIO
+            
+            # 创建订单
+            payment_db = PaymentDatabase()
+            order_manager = OrderManager(payment_db)
+            
+            order = order_manager.create_payment_order(user_id, plan_id)
+            
+            if not order:
+                error_create_failed = t(user_id, 'payment_error_create_failed')
+                self.safe_edit_message(query, error_create_failed, 'HTML')
+                return
+            
+            # 获取套餐信息
+            plan = PaymentConfig.PAYMENT_PLANS.get(plan_id, {})
+            days = plan.get("days", 0)
+            
+            # 获取套餐名称 - 使用 i18n
+            plan_name_key_map = {
+                'plan_7d': 'payment_plan_name_7d',
+                'plan_30d': 'payment_plan_name_30d',
+                'plan_120d': 'payment_plan_name_120d',
+                'plan_365d': 'payment_plan_name_365d',
+            }
+            plan_name_key = plan_name_key_map.get(plan_id, 'payment_plan_name_7d')
+            plan_name = t(user_id, plan_name_key)
+            
+            # 生成二维码
+            qr_bytes = QRCodeGenerator.generate_payment_qr(
+                PaymentConfig.WALLET_ADDRESS,
+                order.amount
+            )
+            
+            # 计算过期时间
+            from datetime import datetime, timezone, timedelta
+            BEIJING_TZ = timezone(timedelta(hours=8))
+            now = datetime.now(BEIJING_TZ)
+            expires_at = order.expires_at.replace(tzinfo=BEIJING_TZ)
+            
+            # 计算剩余时间（分钟和秒）
+            remaining_seconds = (expires_at - now).total_seconds()
+            remaining_minutes = max(0, int(remaining_seconds // 60))
+            remaining_secs = max(0, int(remaining_seconds % 60))
+            
+            # 使用 i18n 构建支付信息
+            order_info_title = t(user_id, 'payment_order_info_title')
+            order_id_label = t(user_id, 'payment_order_id')
+            plan_label = t(user_id, 'payment_plan')
+            days_label = t(user_id, 'payment_days')
+            amount_label = t(user_id, 'payment_amount')
+            valid_time_label = t(user_id, 'payment_valid_time')
+            minutes_label = t(user_id, 'payment_minutes')
+            seconds_label = t(user_id, 'payment_seconds')
+            wallet_addr_label = t(user_id, 'payment_wallet_address')
+            addr_click_copy = t(user_id, 'payment_address_click_copy')
+            important_notice = t(user_id, 'payment_important_notice')
+            notice_1 = t(user_id, 'payment_notice_1')
+            notice_2 = t(user_id, 'payment_notice_2')
+            notice_3 = t(user_id, 'payment_notice_3')
+            notice_4 = t(user_id, 'payment_notice_4')
+            scan_qr = t(user_id, 'payment_scan_qr')
+            scan_desc = t(user_id, 'payment_scan_desc')
+            
+            # 发送二维码和支付信息
+            caption = f"""
+<b>💳 {order_info_title}</b>
+
+<b>{order_info_title}</b>
+• {order_id_label}: <code>{order.order_id}</code>
+• {plan_label}: {plan_name}
+• {days_label}: {days} 天
+• {amount_label}: <code>{order.amount:.4f}</code>USDT
+• {valid_time_label}: <b>{remaining_minutes}{minutes_label}{remaining_secs}{seconds_label}</b>
+
+<b>{wallet_addr_label}</b>
+<code>{PaymentConfig.WALLET_ADDRESS}</code>
+{addr_click_copy}
+
+<b>{important_notice}</b>
+{notice_1}
+{notice_2}
+{notice_3}
+{notice_4}
+
+<b>{scan_qr}</b>
+{scan_desc}
+            """
+            
+            # 发送二维码图片
+            try:
+                from telegram import InputFile
+                photo = InputFile(BytesIO(qr_bytes), filename="payment_qr.png")
+                # 添加取消订单按钮 - 使用 i18n
+                cancel_btn = t(user_id, 'btn_cancel_order')
+                back_main_btn = t(user_id, 'btn_back_main_menu')
+                
+                keyboard = InlineKeyboardMarkup([
+                    [InlineKeyboardButton(cancel_btn, callback_data=f"cancel_order:{order.order_id}")],
+                    [InlineKeyboardButton(back_main_btn, callback_data="back_to_main")]
+                ])
+                # 使用bot实例发送图片
+                order_msg = query.message.bot.send_photo(
+                    chat_id=user_id,
+                    photo=photo,
+                    caption=caption,
+                    parse_mode='HTML',
+                    reply_markup=keyboard
+                )
+                # 保存 message_id 到数据库
+                payment_db.update_order_message_id(order.order_id, order_msg.message_id)
+                logger.info(f"✅ 订单消息ID已保存: {order.order_id} -> {order_msg.message_id}")
+            except Exception as e:
+                logger.error(f"发送二维码失败: {e}")
+                # 如果发送图片失败，至少发送文本信息
+                try:
+                    query.message.bot.send_message(
+                        chat_id=user_id,
+                        text=caption,
+                        parse_mode='HTML'
+                    )
+                except Exception as e2:
+                    logger.error(f"发送文本也失败: {e2}")
+            
+            # 更新原消息 - 使用 i18n
+            back_payment_btn = t(user_id, 'btn_back_payment_menu')
+            order_created = t(user_id, 'payment_order_created')
+            order_info = t(user_id, 'payment_order_info')
+            
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton(cancel_btn, callback_data=f"cancel_order_{order.order_id}")],
+                [InlineKeyboardButton(back_payment_btn, callback_data="usdt_payment")]
+            ])
+            
+            text = f"""
+<b>{order_created}</b>
+
+{order_id_label}: <code>{order.order_id}</code>
+{order_info}
+            """
+            
+            self.safe_edit_message(query, text, 'HTML', keyboard)
+            
+        except Exception as e:
+            logger.error(f"处理套餐选择失败: {e}")
+            error_msg = t(user_id, 'payment_error_create_failed')
+            self.safe_edit_message(query, f"{error_msg}: {e}", 'HTML')
+    
+    def handle_cancel_order(self, query, order_id: str):
+        """处理取消订单"""
+        user_id = query.from_user.id
+        query.answer()
+        
+        try:
+            import sys
+            sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+            from tron import PaymentDatabase, OrderManager, OrderStatus
+            
+            payment_db = PaymentDatabase()
+            order_manager = OrderManager(payment_db)
+            
+            # 获取订单信息以验证权限
+            order = payment_db.get_order(order_id)
+            
+            if not order:
+                error_not_found = t(user_id, 'payment_error_not_found')
+                query.answer(error_not_found, show_alert=True)
+                return
+            
+            if order.user_id != user_id:
+                query.answer("❌ 无权操作此订单", show_alert=True)
+                return
+            
+            if order.status.value != 'pending':
+                query.answer(f"❌ 订单状态为 {order.status.value}，无法取消", show_alert=True)
+                return
+            
+            # 取消订单
+            success = order_manager.cancel_order(order_id)
+            
+            if success:
+                order_cancelled = t(user_id, 'payment_order_cancelled')
+                query.answer(order_cancelled, show_alert=True)
+                
+                # 删除原订单消息（使用保存的 message_id）
+                try:
+                    message_id = payment_db.get_order_message_id(order_id)
+                    if message_id:
+                        query.bot.delete_message(chat_id=user_id, message_id=message_id)
+                        logger.info(f"✅ 已删除订单消息: {message_id}")
+                except Exception as e:
+                    logger.warning(f"删除订单消息失败: {e}")
+                
+                # 同时尝试删除当前回调消息
+                try:
+                    query.message.delete()
+                except Exception as e:
+                    logger.warning(f"删除当前消息失败: {e}")
+                
+                # 发送新的纯文本消息 - 使用 i18n
+                try:
+                    from telegram import Bot
+                    bot = query.bot if hasattr(query, 'bot') else Bot(token=os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN"))
+                    
+                    cancelled_title = t(user_id, 'payment_order_cancelled_title')
+                    order_id_label = t(user_id, 'payment_order_id')
+                    status_label = t(user_id, 'payment_status')
+                    cancelled_status = t(user_id, 'payment_order_cancelled_status')
+                    repurchase_hint = t(user_id, 'payment_repurchase_hint')
+                    repurchase_btn = t(user_id, 'btn_repurchase')
+                    back_main_btn = t(user_id, 'btn_back_main_menu')
+                    
+                    text = f"""
+❌ <b>{cancelled_title}</b>
+
+• {order_id_label}: <code>{order_id}</code>
+• {status_label}: {cancelled_status}
+
+{repurchase_hint}
+                    """
+                    
+                    keyboard = InlineKeyboardMarkup([
+                        [InlineKeyboardButton(repurchase_btn, callback_data="usdt_payment")],
+                        [InlineKeyboardButton(back_main_btn, callback_data="back_to_main")]
+                    ])
+                    
+                    bot.send_message(
+                        chat_id=user_id,
+                        text=text,
+                        parse_mode='HTML',
+                        reply_markup=keyboard
+                    )
+                except Exception as e:
+                    logger.error(f"发送取消消息失败: {e}")
+            else:
+                query.answer("❌ 取消失败，请稍后重试", show_alert=True)
+            
+        except Exception as e:
+            logger.error(f"取消订单失败: {e}")
+            query.answer("❌ 操作失败，请稍后重试", show_alert=True)
+    
+    def handle_vip_redeem(self, query):
+        """处理兑换卡密"""
+        user_id = query.from_user.id
+        query.answer()
+        
+        # 设置用户状态
+        self.db.save_user(
+            user_id,
+            query.from_user.username or "",
+            query.from_user.first_name or "",
+            "waiting_redeem_code"
+        )
+        
+        text = f"""
+<b>{t(user_id, 'redeem_title')}</b>
+
+<b>{t(user_id, 'redeem_input_prompt')}</b>
+
+{t(user_id, 'redeem_tip_title')}
+{t(user_id, 'redeem_tip1')}
+{t(user_id, 'redeem_tip2')}
+{t(user_id, 'redeem_tip3')}
+
+<i>{t(user_id, 'redeem_timeout')}</i>
+        """
+        
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton(t(user_id, 'member_btn_cancel'), callback_data="vip_menu")]
+        ])
+        
+        self.safe_edit_message(query, text, 'HTML', keyboard)
+    
+    def handle_redeem_code_input(self, update, user_id: int, code: str):
+        """处理用户输入的兑换码"""
+        # 清除状态
+        self.db.save_user(user_id, "", "", "")
+        
+        # 验证兑换码
+        code = code.strip()
+        if len(code) > 10:
+            self.safe_send_message(update, f"❌ {t(user_id, 'redeem_input_prompt')}")
+            return
+        
+        # 执行兑换
+        success, message, days = self.db.redeem_code(user_id, code)
+        
+        if success:
+            # 获取新的会员状态
+            is_member, level, expiry = self.db.check_membership(user_id)
+            
+            # 翻译会员等级
+            if level == "会员":
+                translated_level = t(user_id, 'member_level_member')
+            elif level == "管理员":
+                translated_level = t(user_id, 'member_level_admin')
+            else:
+                translated_level = level  # 保留其他未知等级
+            
+            text = f"""
+<b>{t(user_id, 'redeem_success')}</b>
+
+<b>{t(user_id, 'redeem_info_title')}</b>
+{t(user_id, 'redeem_info_code').format(code=code.upper())}
+{t(user_id, 'redeem_info_level').format(level=translated_level)}
+{t(user_id, 'redeem_info_days').format(days=days)}
+
+<b>{t(user_id, 'redeem_current_status')}</b>
+{t(user_id, 'redeem_current_level').format(level=translated_level)}
+{t(user_id, 'redeem_current_expire').format(time=expiry)}
+
+{t(user_id, 'redeem_thanks')}
+            """
+            
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton(f"🔙 {t(user_id, 'btn_back_to_menu')}", callback_data="back_to_main")]
+            ])
+            
+            self.safe_send_message(update, text, 'HTML', keyboard)
+        else:
+            # Translate error message
+            error_msg = message
+            if "已被使用" in message:
+                error_msg = t(user_id, 'redeem_error_used')
+            elif "不存在" in message:
+                error_msg = t(user_id, 'redeem_error_not_exist')
+            elif "已过期" in message:
+                error_msg = t(user_id, 'redeem_error_expired')
+            elif "状态无效" in message:
+                error_msg = t(user_id, 'redeem_error_invalid')
+            
+            text = f"""
+<b>{t(user_id, 'redeem_failed')}</b>
+
+{error_msg}
+
+{t(user_id, 'redeem_error_check')}
+            """
+            
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton(t(user_id, 'member_btn_retry'), callback_data="vip_redeem")],
+                [InlineKeyboardButton(t(user_id, 'member_btn_back_center'), callback_data="vip_menu")]
+            ])
+            
+            self.safe_send_message(update, text, 'HTML', keyboard)
+    
+    def handle_admin_card_menu(self, query):
+        """Admin Card Activation Menu"""
+        user_id = query.from_user.id
+        
+        if not self.db.is_admin(user_id):
+            query.answer(t(user_id, 'admin_panel_access_denied'))
+            return
+        
+        query.answer()
+        
+        text = f"""
+<b>{t(user_id, 'card_activation_title')}</b>
+
+<b>{t(user_id, 'card_activation_description')}</b>
+• {t(user_id, 'card_activation_desc_select')}
+• {t(user_id, 'card_activation_desc_count')}
+• {t(user_id, 'card_activation_desc_format')}
+• {t(user_id, 'card_activation_desc_usage')}
+
+<b>{t(user_id, 'card_activation_select_validity')}</b>
+{t(user_id, 'card_activation_select_prompt')}
+        """
+        
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton(t(user_id, 'gift_membership_1day'), callback_data="admin_card_days_1"),
+                InlineKeyboardButton(t(user_id, 'gift_membership_7days'), callback_data="admin_card_days_7")
+            ],
+            [
+                InlineKeyboardButton(t(user_id, 'gift_membership_30days'), callback_data="admin_card_days_30"),
+                InlineKeyboardButton(t(user_id, 'gift_membership_60days'), callback_data="admin_card_days_60")
+            ],
+            [
+                InlineKeyboardButton(t(user_id, 'gift_membership_90days'), callback_data="admin_card_days_90"),
+                InlineKeyboardButton(t(user_id, 'gift_membership_360days'), callback_data="admin_card_days_360")
+            ],
+            [InlineKeyboardButton(t(user_id, 'admin_btn_back_panel'), callback_data="admin_panel")]
+        ])
+        
+        self.safe_edit_message(query, text, 'HTML', keyboard)
+    
+    def handle_admin_card_generate(self, query, days: int):
+        """Admin Generate Card"""
+        user_id = query.from_user.id
+        
+        if not self.db.is_admin(user_id):
+            query.answer(t(user_id, 'admin_panel_access_denied'))
+            return
+        
+        query.answer()
+        
+        # Generate card
+        success, code, message = self.db.create_redeem_code(t(user_id, 'member_level_member'), days, None, user_id)
+        
+        if success:
+            text = f"""
+{t(user_id, 'card_activation_success')}
+
+<b>{t(user_id, 'card_activation_info')}</b>
+• {t(user_id, 'card_activation_code')}: <code>{code}</code>
+• {t(user_id, 'user_detail_level')}: {t(user_id, 'member_level_member')}
+• {t(user_id, 'card_activation_validity')}: {days}{t(user_id, 'gift_membership_1day').replace('1', '')}
+• {t(user_id, 'card_activation_status')}: {t(user_id, 'card_activation_unused')}
+
+<b>{t(user_id, 'card_activation_tips')}</b>
+• {t(user_id, 'card_activation_tip_save')}
+• {t(user_id, 'card_activation_tip_copy')}
+            """
+        else:
+            text = f"""
+❌ <b>{t(user_id, 'redeem_failed')}</b>
+
+{message}
+            """
+        
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton(t(user_id, 'card_activation_btn_continue'), callback_data="admin_card_menu")],
+            [InlineKeyboardButton(t(user_id, 'admin_btn_back_panel'), callback_data="admin_panel")]
+        ])
+        
+        self.safe_edit_message(query, text, 'HTML', keyboard)
+    
+    def handle_admin_manual_menu(self, query):
+        """Admin Manual Activation Menu"""
+        user_id = query.from_user.id
+        
+        if not self.db.is_admin(user_id):
+            query.answer(t(user_id, 'admin_panel_access_denied'))
+            return
+        
+        query.answer()
+        
+        # Set user status
+        self.db.save_user(
+            user_id,
+            query.from_user.username or "",
+            query.from_user.first_name or "",
+            "waiting_manual_user"
+        )
+        
+        text = f"""
+<b>{t(user_id, 'manual_activation_title')}</b>
+
+<b>{t(user_id, 'manual_activation_prompt')}</b>
+
+{t(user_id, 'manual_activation_formats')}
+• {t(user_id, 'manual_activation_format_id')}: <code>123456789</code>
+• {t(user_id, 'manual_activation_format_username')}: <code>@username</code> or <code>username</code>
+
+<b>💡 {t(user_id, 'card_activation_tips')}</b>
+• {t(user_id, 'manual_activation_requirement')}
+• {t(user_id, 'manual_activation_note1')}
+• {t(user_id, 'manual_activation_note2')}
+
+⏰ <i>{t(user_id, 'search_user_timeout')}</i>
+        """
+        
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton(t(user_id, 'btn_cancel'), callback_data="admin_panel")]
+        ])
+        
+        self.safe_edit_message(query, text, 'HTML', keyboard)
+    
+    def handle_manual_user_input(self, update, admin_id: int, text: str):
+        """处理管理员输入的用户信息"""
+        # 清除状态
+        self.db.save_user(admin_id, "", "", "")
+        
+        # 解析用户输入
+        text = text.strip()
+        target_user_id = None
+        
+        # 尝试作为用户ID解析
+        if text.isdigit():
+            target_user_id = int(text)
+        else:
+            # 尝试作为用户名解析
+            username = text.replace("@", "")
+            target_user_id = self.db.get_user_id_by_username(username)
+        
+        if not target_user_id:
+            self.safe_send_message(
+                update,
+                "❌ <b>用户不存在</b>\n\n"
+                "该用户未与机器人交互过，请确认：\n"
+                "• 用户ID或用户名正确\n"
+                "• 用户已发送过 /start 命令",
+                'HTML'
+            )
+            return
+        
+        # 获取用户信息
+        user_info = self.db.get_user_membership_info(target_user_id)
+        if not user_info:
+            self.safe_send_message(
+                update,
+                "❌ <b>用户不存在</b>\n\n"
+                "该用户未与机器人交互过",
+                'HTML'
+            )
+            return
+        
+        # 保存到待处理列表
+        self.pending_manual_open[admin_id] = target_user_id
+        
+        # 获取用户会员信息
+        is_member, level, expiry = self.db.check_membership(target_user_id)
+        
+        username = user_info.get('username', '')
+        first_name = user_info.get('first_name', '')
+        display_name = first_name or username or f"用户{target_user_id}"
+        
+        if is_member:
+            member_status = f"💎 {level}\n• 到期: {expiry}"
+        else:
+            member_status = "❌ 暂无会员"
+        
+        text = f"""
+<b>👤 确认用户信息</b>
+
+<b>📋 用户信息</b>
+• 昵称: {display_name}
+• ID: <code>{target_user_id}</code>
+• 用户名: @{username if username else '无'}
+
+<b>💎 当前会员状态</b>
+{member_status}
+
+<b>🎯 选择开通天数</b>
+请选择要为该用户开通的会员天数
+        """
+        
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("1天", callback_data="admin_manual_days_1"),
+                InlineKeyboardButton("7天", callback_data="admin_manual_days_7")
+            ],
+            [
+                InlineKeyboardButton("30天", callback_data="admin_manual_days_30"),
+                InlineKeyboardButton("60天", callback_data="admin_manual_days_60")
+            ],
+            [
+                InlineKeyboardButton("90天", callback_data="admin_manual_days_90"),
+                InlineKeyboardButton("360天", callback_data="admin_manual_days_360")
+            ],
+            [InlineKeyboardButton("❌ 取消", callback_data="admin_panel")]
+        ])
+        
+        self.safe_send_message(update, text, 'HTML', keyboard)
+    
+    def handle_admin_manual_grant(self, query, context, days: int):
+        """管理员执行人工开通"""
+        admin_id = query.from_user.id
+        
+        if not self.db.is_admin(admin_id):
+            query.answer("❌ 仅管理员可访问")
+            return
+        
+        # 检查是否有待处理的用户
+        if admin_id not in self.pending_manual_open:
+            query.answer("❌ 没有待处理的用户")
+            return
+        
+        target_user_id = self.pending_manual_open[admin_id]
+        
+        # 执行授予
+        success = self.db.grant_membership_days(target_user_id, days, "会员")
+        
+        if success:
+            # 获取新的会员状态
+            is_member, level, expiry = self.db.check_membership(target_user_id)
+            
+            # 获取用户信息
+            user_info = self.db.get_user_membership_info(target_user_id)
+            username = user_info.get('username', '')
+            first_name = user_info.get('first_name', '')
+            display_name = first_name or username or f"用户{target_user_id}"
+            
+            text = f"""
+✅ <b>开通成功！</b>
+
+<b>📋 开通信息</b>
+• 目标用户: {display_name}
+• 用户ID: <code>{target_user_id}</code>
+• 增加天数: {days}天
+
+<b>💎 当前会员状态</b>
+• 会员等级: {level}
+• 到期时间: {expiry}
+            """
+            
+            query.answer("✅ 开通成功")
+            
+            # 尝试通知用户
+            try:
+                context.bot.send_message(
+                    chat_id=target_user_id,
+                    text=f"""
+🎉 <b>恭喜！您已获得会员</b>
+
+管理员为您开通了 {days}天 会员
+
+<b>💎 当前会员状态</b>
+• 会员等级: {level}
+• 到期时间: {expiry}
+
+感谢您的支持！
+                    """,
+                    parse_mode='HTML'
+                )
+            except:
+                pass
+        else:
+            text = "❌ <b>开通失败</b>\n\n请稍后重试"
+            query.answer("❌ 开通失败")
+        
+        # 清理待处理任务
+        if admin_id in self.pending_manual_open:
+            del self.pending_manual_open[admin_id]
+        
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔄 继续开通", callback_data="admin_manual_menu")],
+            [InlineKeyboardButton("🔙 返回管理面板", callback_data="admin_panel")]
+        ])
+        
+        self.safe_edit_message(query, text, 'HTML', keyboard)
+    
+    # ================================
+    # 撤销会员功能
+    # ================================
+    
+    def handle_admin_revoke_menu(self, query):
+        """Admin Revoke Membership Menu"""
+        user_id = query.from_user.id
+        
+        if not self.db.is_admin(user_id):
+            query.answer(t(user_id, 'admin_panel_access_denied'))
+            return
+        
+        query.answer()
+        
+        # Set user status
+        self.db.save_user(
+            user_id,
+            query.from_user.username or "",
+            query.from_user.first_name or "",
+            "waiting_revoke_user"
+        )
+        
+        text = f"""
+<b>{t(user_id, 'revoke_membership_title')}</b>
+
+<b>{t(user_id, 'revoke_membership_prompt')}</b>
+
+{t(user_id, 'manual_activation_formats')}
+• {t(user_id, 'manual_activation_format_id')}: <code>123456789</code>
+• {t(user_id, 'manual_activation_format_username')}: <code>@username</code> or <code>username</code>
+
+<b>💡 {t(user_id, 'card_activation_tips')}</b>
+• {t(user_id, 'manual_activation_requirement')}
+• {t(user_id, 'revoke_membership_note')}
+
+⏰ <i>{t(user_id, 'revoke_membership_timeout')}</i>
+        """
+        
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton(t(user_id, 'btn_cancel'), callback_data="admin_panel")]
+        ])
+        
+        self.safe_edit_message(query, text, 'HTML', keyboard)
+    
+    def handle_revoke_user_input(self, update, admin_id: int, text: str):
+        """处理管理员输入的要撤销的用户信息"""
+        # 清除状态
+        self.db.save_user(admin_id, "", "", "")
+        
+        # 解析用户输入
+        text = text.strip()
+        target_user_id = None
+        
+        # 尝试作为用户ID解析
+        if text.isdigit():
+            target_user_id = int(text)
+        else:
+            # 尝试作为用户名解析
+            username = text.replace("@", "")
+            user_row = self.db.get_user_by_username(username)
+            if user_row:
+                target_user_id = user_row[0]
+        
+        if not target_user_id:
+            self.safe_send_message(
+                update,
+                "❌ <b>未找到该用户</b>\n\n"
+                "未找到该用户，请确认对方已与机器人对话入库",
+                'HTML'
+            )
+            return
+        
+        # 获取用户信息
+        user_info = self.db.get_user_membership_info(target_user_id)
+        if not user_info:
+            self.safe_send_message(
+                update,
+                "❌ <b>未找到该用户</b>\n\n"
+                "未找到该用户，请确认对方已与机器人对话入库",
+                'HTML'
+            )
+            return
+        
+        # 获取用户会员信息
+        is_member, level, expiry = self.db.check_membership(target_user_id)
+        
+        username = user_info.get('username', '')
+        first_name = user_info.get('first_name', '')
+        display_name = first_name or username or f"用户{target_user_id}"
+        
+        if is_member:
+            member_status = f"💎 {level}\n• 到期时间: {expiry}"
+        else:
+            member_status = "❌ 暂无会员"
+        
+        text = f"""
+<b>⚠️ 确认撤销会员</b>
+
+<b>📋 用户信息</b>
+• 昵称: {display_name}
+• ID: <code>{target_user_id}</code>
+• 用户名: @{username if username else '无'}
+
+<b>💎 当前会员状态</b>
+{member_status}
+
+<b>⚠️ 确认要撤销该用户的会员吗？</b>
+此操作将删除该用户的所有会员权限，且无法恢复。
+        """
+        
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ 确认撤销", callback_data=f"admin_revoke_confirm_{target_user_id}")],
+            [InlineKeyboardButton("❌ 取消", callback_data="admin_revoke_cancel")]
+        ])
+        
+        self.safe_send_message(update, text, 'HTML', keyboard)
+    
+    def handle_admin_revoke_confirm(self, query, context, target_user_id: int):
+        """管理员确认撤销会员"""
+        admin_id = query.from_user.id
+        
+        if not self.db.is_admin(admin_id):
+            query.answer("❌ 仅管理员可访问")
+            return
+        
+        query.answer()
+        
+        # 获取用户信息（撤销前）
+        user_info = self.db.get_user_membership_info(target_user_id)
+        is_member, level, expiry = self.db.check_membership(target_user_id)
+        
+        username = user_info.get('username', '')
+        first_name = user_info.get('first_name', '')
+        display_name = first_name or username or f"用户{target_user_id}"
+        
+        # 执行撤销
+        success = self.db.revoke_membership(target_user_id)
+        
+        if success:
+            text = f"""
+✅ <b>撤销成功！</b>
+
+<b>📋 撤销信息</b>
+• 目标用户: {display_name}
+• 用户ID: <code>{target_user_id}</code>
+• 原会员等级: {level}
+• 原到期时间: {expiry}
+
+已成功撤销该用户的会员权限。
+            """
+            
+            # 尝试通知用户
+            try:
+                context.bot.send_message(
+                    chat_id=target_user_id,
+                    text="""
+⚠️ <b>会员权限已被撤销</b>
+
+您的会员权限已被管理员撤销。
+
+如有疑问，请联系管理员。
+                    """,
+                    parse_mode='HTML'
+                )
+            except:
+                pass
+        else:
+            text = "❌ <b>撤销失败</b>\n\n该用户可能没有会员权限，或撤销操作失败。"
+        
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔄 继续撤销", callback_data="admin_revoke_menu")],
+            [InlineKeyboardButton("🔙 返回管理面板", callback_data="admin_panel")]
+        ])
+        
+        self.safe_edit_message(query, text, 'HTML', keyboard)
+    
+    def payment_stats_command(self, update: Update, context: CallbackContext):
+        """管理员支付统计命令"""
+        user_id = update.effective_user.id
+        
+        # 检查是否是管理员
+        if not self.db.is_admin(user_id):
+            update.message.reply_text("❌ 无权访问")
+            return
+        
+        try:
+            import sys
+            sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+            from tron import PaymentDatabase, OrderStatus
+            
+            payment_db = PaymentDatabase()
+            
+            # 获取统计数据
+            conn = sqlite3.connect(payment_db.db_path)
+            c = conn.cursor()
+            
+            # 总订单数
+            c.execute("SELECT COUNT(*) FROM orders")
+            total_orders = c.fetchone()[0]
+            
+            # 已完成订单
+            c.execute("SELECT COUNT(*) FROM orders WHERE status = ?", (OrderStatus.COMPLETED.value,))
+            completed_orders = c.fetchone()[0]
+            
+            # 总收入
+            c.execute("SELECT SUM(amount) FROM orders WHERE status = ?", (OrderStatus.COMPLETED.value,))
+            total_revenue = c.fetchone()[0] or 0
+            
+            # 今日订单
+            today = datetime.now(BEIJING_TZ).strftime('%Y-%m-%d')
+            c.execute("SELECT COUNT(*) FROM orders WHERE status = ? AND created_at LIKE ?", 
+                      (OrderStatus.COMPLETED.value, f"{today}%"))
+            today_orders = c.fetchone()[0]
+            
+            # 今日收入
+            c.execute("SELECT SUM(amount) FROM orders WHERE status = ? AND created_at LIKE ?",
+                      (OrderStatus.COMPLETED.value, f"{today}%"))
+            today_revenue = c.fetchone()[0] or 0
+            
+            # 待支付订单
+            c.execute("SELECT COUNT(*) FROM orders WHERE status = ?", (OrderStatus.PENDING.value,))
+            pending_orders = c.fetchone()[0]
+            
+            # 已取消订单
+            c.execute("SELECT COUNT(*) FROM orders WHERE status = ?", (OrderStatus.CANCELLED.value,))
+            cancelled_orders = c.fetchone()[0]
+            
+            # 已过期订单
+            c.execute("SELECT COUNT(*) FROM orders WHERE status = ?", (OrderStatus.EXPIRED.value,))
+            expired_orders = c.fetchone()[0]
+            
+            conn.close()
+            
+            # 计算转化率
+            completion_rate = (completed_orders / total_orders * 100) if total_orders > 0 else 0
+            
+            stats_text = f"""
+📊 <b>支付统计面板</b>
+
+<b>━━━━━━━━━━━━━━━━━━━━</b>
+<b>📈 总体统计</b>
+• 总订单数: {total_orders}
+• 已完成订单: {completed_orders}
+• 待支付订单: {pending_orders}
+• 已取消订单: {cancelled_orders}
+• 已过期订单: {expired_orders}
+• 💰 总收入: <b>{total_revenue:.4f} USDT</b>
+
+<b>━━━━━━━━━━━━━━━━━━━━</b>
+<b>📅 今日统计 ({today})</b>
+• 今日订单: {today_orders}
+• 💰 今日收入: <b>{today_revenue:.4f} USDT</b>
+
+<b>━━━━━━━━━━━━━━━━━━━━</b>
+<b>📉 转化分析</b>
+• 完成率: {completion_rate:.1f}%
+• 取消率: {(cancelled_orders/total_orders*100) if total_orders > 0 else 0:.1f}%
+• 过期率: {(expired_orders/total_orders*100) if total_orders > 0 else 0:.1f}%
+
+<i>💡 提示: 使用 /start 查看主菜单</i>
+            """
+            
+            update.message.reply_text(stats_text, parse_mode='HTML')
+            
+        except Exception as e:
+            logger.error(f"获取支付统计失败: {e}")
+            update.message.reply_text(f"❌ 获取统计失败: {e}")
+    
+    def handle_admin_revoke_cancel(self, query):
+        """取消撤销会员"""
+        query.answer()
+        
+        text = "❌ <b>已取消撤销操作</b>"
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔙 返回管理面板", callback_data="admin_panel")]
+        ])
+        
+        self.safe_edit_message(query, text, 'HTML', keyboard)
+    
+    # ================================
+    # 广播消息功能
+    # ================================
+    
+    def handle_broadcast_callbacks_router(self, update: Update, context: CallbackContext):
+        """
+        专用广播回调路由器 - 处理所有 broadcast_* 回调
+        注册为独立的 CallbackQueryHandler，优先级高于通用处理器
+        """
+        query = update.callback_query
+        data = query.data
+        user_id = query.from_user.id
+        
+        # 始终先调用 query.answer() 避免 Telegram 超时和加载动画
+        try:
+            query.answer()
+        except Exception as e:
+            print(f"⚠️ query.answer() 失败: {e}")
+        
+        # 权限检查
+        if not self.db.is_admin(user_id):
+            try:
+                query.answer("❌ 仅管理员可访问广播功能", show_alert=True)
+            except:
+                pass
+            return
+        
+        # 分发表：将所有 broadcast_* 回调映射到对应的处理方法
+        dispatch_table = {
+            # 主菜单和向导
+            "broadcast_menu": lambda: self.show_broadcast_menu(query),
+            "broadcast_create": lambda: self.start_broadcast_wizard(query, update, context),
+            "broadcast_history": lambda: self.show_broadcast_history(query),
+            "broadcast_cancel": lambda: self.cancel_broadcast(query, user_id),
+            "broadcast_edit": lambda: self.restart_broadcast_wizard(query, update, context),
+            "broadcast_confirm_send": lambda: self.start_broadcast_sending(query, update, context),
+            
+            # 媒体操作
+            "broadcast_media": lambda: self.handle_broadcast_media(query, update, context),
+            "broadcast_media_view": lambda: self.handle_broadcast_media_view(query, update, context),
+            "broadcast_media_clear": lambda: self.handle_broadcast_media_clear(query, update, context),
+            
+            # 文本操作
+            "broadcast_text": lambda: self.handle_broadcast_text(query, update, context),
+            "broadcast_text_view": lambda: self.handle_broadcast_text_view(query, update, context),
+            
+            # 按钮操作
+            "broadcast_buttons": lambda: self.handle_broadcast_buttons(query, update, context),
+            "broadcast_buttons_view": lambda: self.handle_broadcast_buttons_view(query, update, context),
+            "broadcast_buttons_clear": lambda: self.handle_broadcast_buttons_clear(query, update, context),
+            
+            # 导航
+            "broadcast_preview": lambda: self.handle_broadcast_preview(query, update, context),
+            "broadcast_back": lambda: self.handle_broadcast_back(query, update, context),
+            "broadcast_next": lambda: self.handle_broadcast_next(query, update, context),
+        }
+        
+        # 处理简单的固定回调
+        if data in dispatch_table:
+            try:
+                dispatch_table[data]()
+            except Exception as e:
+                print(f"❌ 广播回调处理失败 [{data}]: {e}")
+                import traceback
+                traceback.print_exc()
+                try:
+                    self.safe_edit_message(query, f"❌ 操作失败: {str(e)[:100]}")
+                except:
+                    pass
+            return
+        
+        # 处理带参数的回调（历史详情、目标选择等）
+        try:
+            if data.startswith("broadcast_history_detail_"):
+                broadcast_id = int(data.split("_")[-1])
+                self.show_broadcast_detail(query, broadcast_id)
+            elif data.startswith("broadcast_target_"):
+                target = data.split("_", 2)[-1]  # 支持 broadcast_target_active_7d 这种格式
+                self.handle_broadcast_target_selection(query, update, context, target)
+            elif data.startswith("broadcast_alert_"):
+                # 广播消息中的自定义回调按钮
+                self.handle_broadcast_alert_button(query, data)
+            else:
+                print(f"⚠️ 未识别的广播回调: {data}")
+                try:
+                    query.answer("⚠️ 未识别的操作", show_alert=True)
+                except:
+                    pass
+        except Exception as e:
+            print(f"❌ 广播回调处理失败 [{data}]: {e}")
+            import traceback
+            traceback.print_exc()
+            try:
+                self.safe_edit_message(query, f"❌ 操作失败: {str(e)[:100]}")
+            except:
+                pass
+    
+    def handle_broadcast_callbacks(self, update, context, query, data):
+        """
+        旧版广播回调处理器 - 保持向后兼容
+        现在通过 handle_broadcast_callbacks_router 调用
+        """
+        user_id = query.from_user.id
+        
+        # 权限检查
+        if not self.db.is_admin(user_id):
+            try:
+                query.answer("❌ 仅管理员可访问广播功能", show_alert=True)
+            except:
+                pass
+            return
+        
+        # 调用新的路由器（去掉 query.answer，因为路由器已经处理）
+        if data == "broadcast_menu":
+            self.show_broadcast_menu(query)
+        elif data == "broadcast_create":
+            self.start_broadcast_wizard(query, update, context)
+        elif data == "broadcast_history":
+            self.show_broadcast_history(query)
+        elif data.startswith("broadcast_history_detail_"):
+            broadcast_id = int(data.split("_")[-1])
+            self.show_broadcast_detail(query, broadcast_id)
+        elif data.startswith("broadcast_target_"):
+            target = data.split("_")[-1]
+            self.handle_broadcast_target_selection(query, update, context, target)
+        elif data == "broadcast_confirm_send":
+            self.start_broadcast_sending(query, update, context)
+        elif data == "broadcast_edit":
+            self.restart_broadcast_wizard(query, update, context)
+        elif data == "broadcast_cancel":
+            self.cancel_broadcast(query, user_id)
+    
+    def show_broadcast_menu(self, query):
+        """显示广播菜单"""
+        try:
+            query.answer()
+        except:
+            pass
+        
+        text = """
+<b>📢 群发通知管理</b>
+
+<b>💡 功能说明</b>
+• 支持HTML格式内容（粗体、斜体、链接等）
+• 支持单张图片 + 文本组合
+• 可添加自定义按钮（URL或回调）
+• 智能节流避免触发限制
+• 实时进度显示
+• 完整历史记录
+
+<b>🎯 选择操作</b>
+点击下方按钮开始使用
+        """
+        
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📝 创建群发", callback_data="broadcast_create")],
+            [InlineKeyboardButton("📜 历史记录", callback_data="broadcast_history")],
+            [InlineKeyboardButton("🔙 返回", callback_data="admin_panel")]
+        ])
+        
+        self.safe_edit_message(query, text, 'HTML', keyboard)
+    
+    # ================================
+    # 广播向导 - 新增媒体/文本/按钮操作方法
+    # ================================
+    
+    def handle_broadcast_media(self, query, update, context):
+        """处理媒体设置"""
+        user_id = query.from_user.id
+        
+        if user_id not in self.pending_broadcasts:
+            self.safe_edit_message(query, "❌ 没有待处理的广播任务")
+            return
+        
+        task = self.pending_broadcasts[user_id]
+        
+        # 更新用户状态
+        self.db.save_user(
+            user_id,
+            query.from_user.username or "",
+            query.from_user.first_name or "",
+            "waiting_broadcast_media"
+        )
+        
+        text = """
+<b>📸 设置广播媒体</b>
+
+<b>📋 请上传一张图片</b>
+
+• 支持格式：JPG、PNG、GIF
+• 图片将与文本一起发送
+• 单次广播只支持一张图片
+
+⏰ <i>5分钟内未上传将自动取消</i>
+        """
+        
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("❌ 取消", callback_data="broadcast_cancel")]
+        ])
+        
+        self.safe_edit_message(query, text, 'HTML', keyboard)
+    
+    def handle_broadcast_media_view(self, query, update, context):
+        """查看当前设置的媒体"""
+        user_id = query.from_user.id
+        
+        if user_id not in self.pending_broadcasts:
+            self.safe_edit_message(query, "❌ 没有待处理的广播任务")
+            return
+        
+        task = self.pending_broadcasts[user_id]
+        
+        if 'media_file_id' not in task or not task['media_file_id']:
+            try:
+                query.answer("⚠️ 尚未设置媒体", show_alert=True)
+            except:
+                pass
+            return
+        
+        # 发送媒体预览
+        try:
+            context.bot.send_photo(
+                chat_id=user_id,
+                photo=task['media_file_id'],
+                caption="📸 当前广播媒体预览"
+            )
+            try:
+                query.answer("✅ 已发送媒体预览")
+            except:
+                pass
+        except Exception as e:
+            try:
+                query.answer(f"❌ 预览失败: {str(e)[:50]}", show_alert=True)
+            except:
+                pass
+    
+    def handle_broadcast_media_clear(self, query, update, context):
+        """清除媒体设置"""
+        user_id = query.from_user.id
+        
+        if user_id not in self.pending_broadcasts:
+            self.safe_edit_message(query, "❌ 没有待处理的广播任务")
+            return
+        
+        task = self.pending_broadcasts[user_id]
+        task['media_file_id'] = None
+        task['media_type'] = None
+        
+        try:
+            query.answer("✅ 已清除媒体设置")
+        except:
+            pass
+        
+        # 返回编辑界面
+        self.show_broadcast_wizard_editor(query, update, context)
+    
+    def handle_broadcast_text(self, query, update, context):
+        """处理文本设置"""
+        user_id = query.from_user.id
+        
+        if user_id not in self.pending_broadcasts:
+            self.safe_edit_message(query, "❌ 没有待处理的广播任务")
+            return
+        
+        task = self.pending_broadcasts[user_id]
+        
+        # 更新用户状态
+        self.db.save_user(
+            user_id,
+            query.from_user.username or "",
+            query.from_user.first_name or "",
+            "waiting_broadcast_content"
+        )
+        
+        text = """
+<b>📝 设置广播文本</b>
+
+<b>📄 请输入广播内容</b>
+
+• 支持HTML格式：
+  <code>&lt;b&gt;粗体&lt;/b&gt;</code>
+  <code>&lt;i&gt;斜体&lt;/i&gt;</code>
+  <code>&lt;a href="URL"&gt;链接&lt;/a&gt;</code>
+  <code>&lt;code&gt;代码&lt;/code&gt;</code>
+
+⏰ <i>5分钟内未输入将自动取消</i>
+        """
+        
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("❌ 取消", callback_data="broadcast_cancel")]
+        ])
+        
+        self.safe_edit_message(query, text, 'HTML', keyboard)
+    
+    def handle_broadcast_text_view(self, query, update, context):
+        """查看当前设置的文本"""
+        user_id = query.from_user.id
+        
+        if user_id not in self.pending_broadcasts:
+            self.safe_edit_message(query, "❌ 没有待处理的广播任务")
+            return
+        
+        task = self.pending_broadcasts[user_id]
+        
+        if not task.get('content'):
+            try:
+                query.answer("⚠️ 尚未设置文本内容", show_alert=True)
+            except:
+                pass
+            return
+        
+        # 显示文本预览
+        preview = task['content'][:500]
+        if len(task['content']) > 500:
+            preview += "\n\n<i>... (内容过长，已截断)</i>"
+        
+        text = f"""
+<b>📄 文本内容预览</b>
+
+{preview}
+
+<b>字符数:</b> {len(task['content'])}
+        """
+        
+        self.safe_edit_message(query, text, 'HTML')
+        try:
+            query.answer("✅ 已显示文本预览")
+        except:
+            pass
+    
+    def handle_broadcast_buttons(self, query, update, context):
+        """处理按钮设置"""
+        user_id = query.from_user.id
+        
+        if user_id not in self.pending_broadcasts:
+            self.safe_edit_message(query, "❌ 没有待处理的广播任务")
+            return
+        
+        task = self.pending_broadcasts[user_id]
+        
+        # 更新用户状态
+        self.db.save_user(
+            user_id,
+            query.from_user.username or "",
+            query.from_user.first_name or "",
+            "waiting_broadcast_buttons"
+        )
+        
+        text = """
+<b>🔘 设置广播按钮</b>
+
+<b>请输入自定义按钮（可选）</b>
+
+• 每行一个按钮（最多4个）
+• URL按钮格式：<code>文本|https://example.com</code>
+• 回调按钮格式：<code>文本|callback:提示信息</code>
+
+示例：
+<code>官方网站|https://telegram.org
+点我试试|callback:你点击了按钮！</code>
+
+💡 <i>输入"跳过"或"skip"可跳过此步骤</i>
+⏰ <i>5分钟内未输入将自动取消</i>
+        """
+        
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("❌ 取消", callback_data="broadcast_cancel")]
+        ])
+        
+        self.safe_edit_message(query, text, 'HTML', keyboard)
+    
+    def handle_broadcast_buttons_view(self, query, update, context):
+        """查看当前设置的按钮"""
+        user_id = query.from_user.id
+        
+        if user_id not in self.pending_broadcasts:
+            self.safe_edit_message(query, "❌ 没有待处理的广播任务")
+            return
+        
+        task = self.pending_broadcasts[user_id]
+        
+        if not task.get('buttons'):
+            try:
+                query.answer("⚠️ 尚未设置按钮", show_alert=True)
+            except:
+                pass
+            return
+        
+        # 显示按钮列表
+        text = "<b>🔘 按钮列表</b>\n\n"
+        for i, btn in enumerate(task['buttons'], 1):
+            if btn['type'] == 'url':
+                text += f"{i}. {btn['text']} → {btn['url']}\n"
+            else:
+                text += f"{i}. {btn['text']} (回调)\n"
+        
+        self.safe_edit_message(query, text, 'HTML')
+        try:
+            query.answer(f"✅ 共 {len(task['buttons'])} 个按钮")
+        except:
+            pass
+    
+    def handle_broadcast_buttons_clear(self, query, update, context):
+        """清除按钮设置"""
+        user_id = query.from_user.id
+        
+        if user_id not in self.pending_broadcasts:
+            self.safe_edit_message(query, "❌ 没有待处理的广播任务")
+            return
+        
+        task = self.pending_broadcasts[user_id]
+        task['buttons'] = []
+        
+        try:
+            query.answer("✅ 已清除所有按钮")
+        except:
+            pass
+        
+        # 返回编辑界面
+        self.show_broadcast_wizard_editor(query, update, context)
+    
+    def handle_broadcast_preview(self, query, update, context):
+        """显示完整预览"""
+        user_id = query.from_user.id
+        
+        if user_id not in self.pending_broadcasts:
+            self.safe_edit_message(query, "❌ 没有待处理的广播任务")
+            return
+        
+        task = self.pending_broadcasts[user_id]
+        
+        # 检查必填项
+        if not task.get('content'):
+            try:
+                query.answer("⚠️ 请先设置文本内容", show_alert=True)
+            except:
+                pass
+            return
+        
+        # 发送预览消息
+        try:
+            # 构建按钮
+            keyboard = None
+            if task.get('buttons'):
+                button_rows = []
+                for btn in task['buttons']:
+                    if btn['type'] == 'url':
+                        button_rows.append([InlineKeyboardButton(btn['text'], url=btn['url'])])
+                    else:
+                        button_rows.append([InlineKeyboardButton(btn['text'], callback_data=btn['data'])])
+                keyboard = InlineKeyboardMarkup(button_rows)
+            
+            # 发送预览
+            if task.get('media_file_id'):
+                context.bot.send_photo(
+                    chat_id=user_id,
+                    photo=task['media_file_id'],
+                    caption=f"<b>📢 预览</b>\n\n{task['content']}",
+                    parse_mode='HTML',
+                    reply_markup=keyboard
+                )
+            else:
+                context.bot.send_message(
+                    chat_id=user_id,
+                    text=f"<b>📢 预览</b>\n\n{task['content']}",
+                    parse_mode='HTML',
+                    reply_markup=keyboard
+                )
+            
+            try:
+                query.answer("✅ 已发送预览")
+            except:
+                pass
+        except Exception as e:
+            try:
+                query.answer(f"❌ 预览失败: {str(e)[:50]}", show_alert=True)
+            except:
+                pass
+    
+    def handle_broadcast_back(self, query, update, context):
+        """返回上一步"""
+        user_id = query.from_user.id
+        
+        if user_id not in self.pending_broadcasts:
+            self.safe_edit_message(query, "❌ 没有待处理的广播任务")
+            return
+        
+        # 返回编辑界面
+        self.show_broadcast_wizard_editor(query, update, context)
+    
+    def handle_broadcast_next(self, query, update, context):
+        """下一步：选择目标"""
+        user_id = query.from_user.id
+        
+        if user_id not in self.pending_broadcasts:
+            self.safe_edit_message(query, "❌ 没有待处理的广播任务")
+            return
+        
+        task = self.pending_broadcasts[user_id]
+        
+        # 检查必填项
+        if not task.get('content'):
+            try:
+                query.answer("⚠️ 请先设置文本内容", show_alert=True)
+            except:
+                pass
+            return
+        
+        # 进入目标选择
+        self.show_target_selection(update, context, user_id)
+    
+    def handle_broadcast_alert_button(self, query, data):
+        """处理广播消息中的自定义回调按钮"""
+        # 从广播任务中查找对应的提示信息
+        # 这里简化处理，直接显示通用提示
+        try:
+            query.answer("✨ 感谢您的关注！", show_alert=True)
+        except:
+            pass
+    
+    def show_broadcast_wizard_editor(self, query, update, context):
+        """显示广播编辑器 - 两栏布局的 zh-CN UI"""
+        user_id = query.from_user.id
+        
+        if user_id not in self.pending_broadcasts:
+            self.safe_edit_message(query, "❌ 没有待处理的广播任务")
+            return
+        
+        task = self.pending_broadcasts[user_id]
+        
+        # 状态指示器
+        media_status = "✅" if task.get('media_file_id') else "⚪"
+        text_status = "✅" if task.get('content') else "⚪"
+        buttons_status = "✅" if task.get('buttons') else "⚪"
+        
+        text = f"""
+<b>📝 创建群发通知</b>
+
+<b>📊 当前状态</b>
+{media_status} 媒体: {'已设置' if task.get('media_file_id') else '未设置'}
+{text_status} 文本: {'已设置' if task.get('content') else '未设置'}
+{buttons_status} 按钮: {len(task.get('buttons', []))} 个
+
+<b>💡 操作提示</b>
+• 文本为必填项
+• 媒体和按钮为可选项
+• 设置完成后点击"下一步"
+        """
+        
+        # 两栏布局按钮
+        keyboard = InlineKeyboardMarkup([
+            # 第一行：媒体操作
+            [
+                InlineKeyboardButton("📸 媒体", callback_data="broadcast_media"),
+                InlineKeyboardButton("👁️ 查看", callback_data="broadcast_media_view"),
+                InlineKeyboardButton("🗑️ 清除", callback_data="broadcast_media_clear")
+            ],
+            # 第二行：文本操作
+            [
+                InlineKeyboardButton("📝 文本", callback_data="broadcast_text"),
+                InlineKeyboardButton("👁️ 查看", callback_data="broadcast_text_view")
+            ],
+            # 第三行：按钮操作
+            [
+                InlineKeyboardButton("🔘 按钮", callback_data="broadcast_buttons"),
+                InlineKeyboardButton("👁️ 查看", callback_data="broadcast_buttons_view"),
+                InlineKeyboardButton("🗑️ 清除", callback_data="broadcast_buttons_clear")
+            ],
+            # 第四行：预览和导航
+            [
+                InlineKeyboardButton("🔍 完整预览", callback_data="broadcast_preview")
+            ],
+            [
+                InlineKeyboardButton("🔙 返回", callback_data="broadcast_cancel"),
+                InlineKeyboardButton("➡️ 下一步", callback_data="broadcast_next")
+            ]
+        ])
+        
+        self.safe_edit_message(query, text, 'HTML', keyboard)
+    
+    def start_broadcast_wizard(self, query, update, context):
+        """开始广播创建向导 - 新版两栏 UI"""
+        user_id = query.from_user.id
+        try:
+            query.answer()
+        except:
+            pass
+        
+        # 初始化广播任务
+        self.pending_broadcasts[user_id] = {
+            'step': 'editor',
+            'started_at': time.time(),
+            'title': f"广播_{int(time.time())}",  # 自动生成标题
+            'content': '',
+            'buttons': [],
+            'media_file_id': None,
+            'media_type': None,
+            'target': '',
+            'preview_message_id': None,
+            'broadcast_id': None
+        }
+        
+        # 显示编辑器界面
+        self.show_broadcast_wizard_editor(query, update, context)
+    
+    def handle_broadcast_title_input(self, update, context, user_id, title):
+        """处理标题输入"""
+        if user_id not in self.pending_broadcasts:
+            self.safe_send_message(update, "❌ 没有待处理的广播任务")
+            return
+        
+        task = self.pending_broadcasts[user_id]
+        
+        # 检查超时
+        if time.time() - task['started_at'] > 300:  # 5分钟
+            del self.pending_broadcasts[user_id]
+            self.db.save_user(user_id, "", "", "")
+            self.safe_send_message(update, "❌ 操作超时，请重新开始")
+            return
+        
+        # 验证标题
+        title = title.strip()
+        if not title:
+            self.safe_send_message(update, "❌ 标题不能为空，请重新输入")
+            return
+        
+        if len(title) > 100:
+            self.safe_send_message(update, "❌ 标题过长（最多100字符），请重新输入")
+            return
+        
+        # 保存标题并进入下一步
+        task['title'] = title
+        task['step'] = 'content'
+        
+        # 更新状态
+        self.db.save_user(user_id, "", "", "waiting_broadcast_content")
+        
+        text = f"""
+<b>📝 创建群发通知 - 步骤 2/4</b>
+
+✅ 标题已设置: <code>{title}</code>
+
+<b>📄 请输入通知内容</b>
+
+• 支持HTML格式：
+  <code>&lt;b&gt;粗体&lt;/b&gt;</code>
+  <code>&lt;i&gt;斜体&lt;/i&gt;</code>
+  <code>&lt;a href="URL"&gt;链接&lt;/a&gt;</code>
+  <code>&lt;code&gt;代码&lt;/code&gt;</code>
+
+⏰ <i>5分钟内未输入将自动取消</i>
+        """
+        
+        self.safe_send_message(update, text, 'HTML')
+    
+    def handle_broadcast_content_input(self, update, context, user_id, content):
+        """处理内容输入"""
+        if user_id not in self.pending_broadcasts:
+            self.safe_send_message(update, "❌ 没有待处理的广播任务")
+            return
+        
+        task = self.pending_broadcasts[user_id]
+        
+        # 检查超时
+        if time.time() - task['started_at'] > 300:
+            del self.pending_broadcasts[user_id]
+            self.db.save_user(user_id, "", "", "")
+            self.safe_send_message(update, "❌ 操作超时，请重新开始")
+            return
+        
+        # 验证内容
+        content = content.strip()
+        if not content:
+            self.safe_send_message(update, "❌ 内容不能为空，请重新输入")
+            return
+        
+        # 保存内容
+        task['content'] = content
+        
+        # 清空用户状态
+        self.db.save_user(user_id, "", "", "")
+        
+        # 返回编辑器
+        self.safe_send_message(update, "✅ <b>内容已保存</b>\n\n返回编辑器继续设置", 'HTML')
+        self.show_broadcast_wizard_editor_as_new_message(update, context)
+    
+    def handle_broadcast_buttons_input(self, update, context, user_id, buttons_text):
+        """处理按钮输入"""
+        if user_id not in self.pending_broadcasts:
+            self.safe_send_message(update, "❌ 没有待处理的广播任务")
+            return
+        
+        task = self.pending_broadcasts[user_id]
+        
+        # 检查超时
+        if time.time() - task['started_at'] > 300:
+            del self.pending_broadcasts[user_id]
+            self.db.save_user(user_id, "", "", "")
+            self.safe_send_message(update, "❌ 操作超时，请重新开始")
+            return
+        
+        # 检查是否跳过
+        buttons_text = buttons_text.strip()
+        if buttons_text.lower() in ['跳过', 'skip', '']:
+            task['buttons'] = []
+            # 清空用户状态
+            self.db.save_user(user_id, "", "", "")
+            self.safe_send_message(update, "✅ <b>已跳过按钮设置</b>\n\n返回编辑器继续设置", 'HTML')
+            self.show_broadcast_wizard_editor_as_new_message(update, context)
+            return
+        
+        # 解析按钮
+        buttons = []
+        lines = buttons_text.split('\n')[:4]  # 最多4个按钮
+        
+        for line in lines:
+            line = line.strip()
+            if not line or '|' not in line:
+                continue
+            
+            parts = line.split('|', 1)
+            if len(parts) != 2:
+                continue
+            
+            text = parts[0].strip()
+            value = parts[1].strip()
+            
+            if not text or not value:
+                continue
+            
+            # 判断按钮类型
+            if value.startswith('callback:'):
+                # 回调按钮
+                callback_text = value[9:].strip()
+                buttons.append({
+                    'type': 'callback',
+                    'text': text,
+                    'data': f'broadcast_alert_{len(buttons)}',
+                    'alert': callback_text
+                })
+            elif value.startswith('http://') or value.startswith('https://'):
+                # URL按钮
+                buttons.append({
+                    'type': 'url',
+                    'text': text,
+                    'url': value
+                })
+            else:
+                # 尝试作为URL处理
+                if '.' in value:
+                    buttons.append({
+                        'type': 'url',
+                        'text': text,
+                        'url': f'https://{value}'
+                    })
+        
+        task['buttons'] = buttons
+        
+        # 清空用户状态
+        self.db.save_user(user_id, "", "", "")
+        
+        # 返回编辑器
+        self.safe_send_message(update, f"✅ <b>已保存 {len(buttons)} 个按钮</b>\n\n返回编辑器继续设置", 'HTML')
+        self.show_broadcast_wizard_editor_as_new_message(update, context)
+    
+    
+    def show_target_selection(self, update, context, user_id):
+        """显示目标用户选择"""
+        if user_id not in self.pending_broadcasts:
+            return
+        
+        task = self.pending_broadcasts[user_id]
+        task['step'] = 'target'
+        
+        # 更新状态
+        self.db.save_user(user_id, "", "", "")
+        
+        # 获取各类用户数量
+        all_users = len(self.db.get_target_users('all'))
+        members = len(self.db.get_target_users('members'))
+        active_7d = len(self.db.get_target_users('active_7d'))
+        new_7d = len(self.db.get_target_users('new_7d'))
+        
+        text = f"""
+<b>📝 创建群发通知 - 步骤 4/4</b>
+
+✅ 标题: <code>{task['title']}</code>
+✅ 内容已设置
+✅ 按钮: {len(task['buttons'])} 个
+
+<b>🎯 请选择目标用户</b>
+
+请选择要发送通知的用户群体：
+        """
+        
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton(f"👥 全部用户 ({all_users})", callback_data="broadcast_target_all")],
+            [InlineKeyboardButton(f"💎 仅会员 ({members})", callback_data="broadcast_target_members")],
+            [InlineKeyboardButton(f"🔥 活跃用户(7天) ({active_7d})", callback_data="broadcast_target_active_7d")],
+            [InlineKeyboardButton(f"🆕 新用户(7天) ({new_7d})", callback_data="broadcast_target_new_7d")],
+            [InlineKeyboardButton("❌ 取消", callback_data="broadcast_cancel")]
+        ])
+        
+        self.safe_send_message(update, text, 'HTML', keyboard)
+    
+    def handle_broadcast_target_selection(self, query, update, context, target):
+        """处理目标选择"""
+        user_id = query.from_user.id
+        query.answer()
+        
+        if user_id not in self.pending_broadcasts:
+            self.safe_edit_message(query, "❌ 没有待处理的广播任务")
+            return
+        
+        task = self.pending_broadcasts[user_id]
+        task['target'] = target
+        
+        # 获取目标用户列表
+        target_users = self.db.get_target_users(target)
+        
+        if not target_users:
+            self.safe_edit_message(query, "❌ 未找到符合条件的用户")
+            return
+        
+        # 目标名称映射
+        target_names = {
+            'all': '全部用户',
+            'members': '仅会员',
+            'active_7d': '活跃用户(7天)',
+            'new_7d': '新用户(7天)'
+        }
+        
+        # 生成预览
+        buttons_preview = ""
+        if task['buttons']:
+            buttons_preview = "\n\n<b>🔘 按钮:</b>\n"
+            for i, btn in enumerate(task['buttons'], 1):
+                if btn['type'] == 'url':
+                    buttons_preview += f"{i}. {btn['text']} → {btn['url']}\n"
+                else:
+                    buttons_preview += f"{i}. {btn['text']} (点击提示)\n"
+        
+        text = f"""
+<b>📢 群发通知预览</b>
+
+<b>📋 标题:</b> {task['title']}
+<b>🎯 目标:</b> {target_names.get(target, target)} ({len(target_users)} 人)
+
+<b>📄 内容:</b>
+{task['content'][:200]}{'...' if len(task['content']) > 200 else ''}{buttons_preview}
+
+<b>⚠️ 确认发送？</b>
+• 预计耗时: {len(target_users) * 0.05:.1f} 秒
+• 发送模式: 智能节流批量发送
+        """
+        
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ 开始发送", callback_data="broadcast_confirm_send")],
+            [InlineKeyboardButton("✏️ 返回修改", callback_data="broadcast_edit")],
+            [InlineKeyboardButton("❌ 取消", callback_data="broadcast_cancel")]
+        ])
+        
+        self.safe_edit_message(query, text, 'HTML', keyboard)
+    
+    def start_broadcast_sending(self, query, update, context):
+        """开始发送广播"""
+        user_id = query.from_user.id
+        query.answer()
+        
+        if user_id not in self.pending_broadcasts:
+            self.safe_edit_message(query, "❌ 没有待处理的广播任务")
+            return
+        
+        task = self.pending_broadcasts[user_id]
+        
+        # 插入广播记录
+        buttons_json = json.dumps(task['buttons'], ensure_ascii=False)
+        broadcast_id = self.db.insert_broadcast_record(
+            task['title'],
+            task['content'],
+            buttons_json,
+            task['target'],
+            user_id
+        )
+        
+        if not broadcast_id:
+            self.safe_edit_message(query, "❌ 创建广播记录失败")
+            return
+        
+        task['broadcast_id'] = broadcast_id
+        
+        # 启动异步发送
+        def send_broadcast():
+            asyncio.run(self.execute_broadcast_sending(update, context, user_id, broadcast_id))
+        
+        thread = threading.Thread(target=send_broadcast, daemon=True)
+        thread.start()
+        
+        self.safe_edit_message(query, "📤 <b>开始发送广播...</b>\n\n正在初始化...", 'HTML')
+    
+    async def execute_broadcast_sending(self, update, context, admin_id, broadcast_id):
+        """执行广播发送"""
+        if admin_id not in self.pending_broadcasts:
+            return
+        
+        task = self.pending_broadcasts[admin_id]
+        start_time = time.time()
+        
+        # 获取目标用户
+        target_users = self.db.get_target_users(task['target'])
+        total = len(target_users)
+        
+        if total == 0:
+            context.bot.send_message(
+                chat_id=admin_id,
+                text="❌ 未找到符合条件的用户",
+                parse_mode='HTML'
+            )
+            del self.pending_broadcasts[admin_id]
+            return
+        
+        # 构建按钮
+        keyboard = None
+        if task['buttons']:
+            button_rows = []
+            for btn in task['buttons']:
+                if btn['type'] == 'url':
+                    button_rows.append([InlineKeyboardButton(btn['text'], url=btn['url'])])
+                else:
+                    button_rows.append([InlineKeyboardButton(btn['text'], callback_data=btn['data'])])
+            keyboard = InlineKeyboardMarkup(button_rows)
+        
+        # 发送统计
+        success_count = 0
+        failed_count = 0
+        
+        # 批量发送
+        batch_size = 25
+        progress_msg = None
+        
+        try:
+            # 发送进度消息
+            progress_msg = context.bot.send_message(
+                chat_id=admin_id,
+                text=f"📤 <b>广播发送中...</b>\n\n• 目标: {total} 人\n• 进度: 0/{total}\n• 成功: 0\n• 失败: 0",
+                parse_mode='HTML'
+            )
+            
+            for i in range(0, total, batch_size):
+                batch = target_users[i:i + batch_size]
+                batch_start = time.time()
+                
+                for user_id in batch:
+                    try:
+                        context.bot.send_message(
+                            chat_id=user_id,
+                            text=task['content'],
+                            parse_mode='HTML',
+                            reply_markup=keyboard
+                        )
+                        success_count += 1
+                        self.db.add_broadcast_log(broadcast_id, user_id, 'success')
+                    except RetryAfter as e:
+                        # 处理速率限制
+                        await asyncio.sleep(e.retry_after + 1)
+                        try:
+                            context.bot.send_message(
+                                chat_id=user_id,
+                                text=task['content'],
+                                parse_mode='HTML',
+                                reply_markup=keyboard
+                            )
+                            success_count += 1
+                            self.db.add_broadcast_log(broadcast_id, user_id, 'success')
+                        except Exception as retry_err:
+                            failed_count += 1
+                            self.db.add_broadcast_log(broadcast_id, user_id, 'failed', str(retry_err))
+                    except BadRequest as e:
+                        # 用户屏蔽机器人或其他错误
+                        failed_count += 1
+                        error_msg = str(e)
+                        if 'bot was blocked' in error_msg.lower():
+                            self.db.add_broadcast_log(broadcast_id, user_id, 'blocked', 'User blocked bot')
+                        else:
+                            self.db.add_broadcast_log(broadcast_id, user_id, 'failed', error_msg)
+                    except Exception as e:
+                        failed_count += 1
+                        self.db.add_broadcast_log(broadcast_id, user_id, 'failed', str(e))
+                
+                # 更新进度
+                processed = success_count + failed_count
+                elapsed = time.time() - start_time
+                speed = processed / elapsed if elapsed > 0 else 0
+                eta = (total - processed) / speed if speed > 0 else 0
+                
+                if progress_msg and processed % batch_size == 0:
+                    try:
+                        progress_msg.edit_text(
+                            f"📤 <b>广播发送中...</b>\n\n"
+                            f"• 目标: {total} 人\n"
+                            f"• 进度: {processed}/{total} ({processed/total*100:.1f}%)\n"
+                            f"• 成功: {success_count}\n"
+                            f"• 失败: {failed_count}\n"
+                            f"• 速度: {speed:.1f} 人/秒\n"
+                            f"• 预计剩余: {int(eta)} 秒",
+                            parse_mode='HTML'
+                        )
+                    except:
+                        pass
+                
+                # 批次间延迟
+                if i + batch_size < total:
+                    await asyncio.sleep(random.uniform(0.8, 1.2))
+            
+            # 完成
+            duration = time.time() - start_time
+            self.db.update_broadcast_progress(
+                broadcast_id, success_count, failed_count, 'completed', duration
+            )
+            
+            # 发送完成消息
+            success_rate = (success_count / total * 100) if total > 0 else 0
+            final_text = f"""
+✅ <b>广播发送完成！</b>
+
+<b>📊 发送统计</b>
+• 目标用户: {total} 人
+• ✅ 成功: {success_count} 人 ({success_rate:.1f}%)
+• ❌ 失败: {failed_count} 人
+• ⏱️ 总用时: {duration:.1f} 秒
+• 🚀 平均速度: {total/duration:.1f} 人/秒
+
+<b>📋 广播ID:</b> <code>{broadcast_id}</code>
+            """
+            
+            context.bot.send_message(
+                chat_id=admin_id,
+                text=final_text,
+                parse_mode='HTML'
+            )
+            
+        except Exception as e:
+            print(f"❌ 广播发送失败: {e}")
+            import traceback
+            traceback.print_exc()
+            
+            # 更新状态
+            duration = time.time() - start_time
+            self.db.update_broadcast_progress(
+                broadcast_id, success_count, failed_count, 'failed', duration
+            )
+            
+            context.bot.send_message(
+                chat_id=admin_id,
+                text=f"❌ <b>广播发送失败</b>\n\n错误: {str(e)}",
+                parse_mode='HTML'
+            )
+        
+        finally:
+            # 清理任务
+            if admin_id in self.pending_broadcasts:
+                del self.pending_broadcasts[admin_id]
+    
+    def show_broadcast_history(self, query):
+        """显示广播历史"""
+        query.answer()
+        
+        history = self.db.get_broadcast_history(10)
+        
+        if not history:
+            text = """
+<b>📜 广播历史记录</b>
+
+暂无广播记录
+            """
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔙 返回", callback_data="broadcast_menu")]
+            ])
+            self.safe_edit_message(query, text, 'HTML', keyboard)
+            return
+        
+        text = "<b>📜 广播历史记录</b>\n\n"
+        
+        buttons = []
+        for record in history:
+            broadcast_id, title, target, created_at, status, total, success, failed = record
+            
+            # 状态图标
+            status_icon = {
+                'pending': '⏳',
+                'completed': '✅',
+                'failed': '❌'
+            }.get(status, '❓')
+            
+            # 目标名称
+            target_names = {
+                'all': '全部',
+                'members': '会员',
+                'active_7d': '活跃',
+                'new_7d': '新用户'
+            }
+            target_name = target_names.get(target, target)
+            
+            text += f"{status_icon} <b>{title}</b>\n"
+            text += f"   🎯 {target_name} | 👥 {total} | ✅ {success} | ❌ {failed}\n"
+            text += f"   📅 {created_at}\n\n"
+            
+            buttons.append([
+                InlineKeyboardButton(
+                    f"📋 {title[:20]}{'...' if len(title) > 20 else ''}",
+                    callback_data=f"broadcast_history_detail_{broadcast_id}"
+                )
+            ])
+        
+        buttons.append([InlineKeyboardButton("🔙 返回", callback_data="broadcast_menu")])
+        keyboard = InlineKeyboardMarkup(buttons)
+        
+        self.safe_edit_message(query, text, 'HTML', keyboard)
+    
+    def show_broadcast_detail(self, query, broadcast_id):
+        """显示广播详情"""
+        query.answer()
+        
+        detail = self.db.get_broadcast_detail(broadcast_id)
+        
+        if not detail:
+            self.safe_edit_message(query, "❌ 未找到广播记录")
+            return
+        
+        # 状态图标
+        status_icon = {
+            'pending': '⏳ 待发送',
+            'completed': '✅ 已完成',
+            'failed': '❌ 失败'
+        }.get(detail['status'], '❓ 未知')
+        
+        # 目标名称
+        target_names = {
+            'all': '全部用户',
+            'members': '仅会员',
+            'active_7d': '活跃用户(7天)',
+            'new_7d': '新用户(7天)'
+        }
+        target_name = target_names.get(detail['target'], detail['target'])
+        
+        # 按钮信息
+        buttons_info = ""
+        if detail['buttons_json']:
+            try:
+                buttons = json.loads(detail['buttons_json'])
+                if buttons:
+                    buttons_info = "\n\n<b>🔘 按钮:</b>\n"
+                    for i, btn in enumerate(buttons, 1):
+                        if btn['type'] == 'url':
+                            buttons_info += f"{i}. {btn['text']} → {btn['url']}\n"
+                        else:
+                            buttons_info += f"{i}. {btn['text']} (回调)\n"
+            except:
+                pass
+        
+        success_rate = (detail['success'] / detail['total'] * 100) if detail['total'] > 0 else 0
+        
+        text = f"""
+<b>📋 广播详情</b>
+
+<b>🆔 ID:</b> <code>{detail['id']}</code>
+<b>📋 标题:</b> {detail['title']}
+<b>📅 创建时间:</b> {detail['created_at']}
+<b>⚙️ 状态:</b> {status_icon}
+
+<b>🎯 目标群体:</b> {target_name}
+<b>👥 目标人数:</b> {detail['total']} 人
+
+<b>📊 发送结果:</b>
+• ✅ 成功: {detail['success']} 人 ({success_rate:.1f}%)
+• ❌ 失败: {detail['failed']} 人
+• ⏱️ 用时: {detail['duration_sec']:.1f} 秒
+
+<b>📄 内容:</b>
+{detail['content'][:300]}{'...' if len(detail['content']) > 300 else ''}{buttons_info}
+        """
+        
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔙 返回历史", callback_data="broadcast_history")]
+        ])
+        
+        self.safe_edit_message(query, text, 'HTML', keyboard)
+    
+    def cancel_broadcast(self, query, user_id):
+        """取消广播"""
+        query.answer()
+        
+        if user_id in self.pending_broadcasts:
+            del self.pending_broadcasts[user_id]
+        
+        self.db.save_user(user_id, "", "", "")
+        
+        text = "❌ <b>已取消创建广播</b>"
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔙 返回", callback_data="broadcast_menu")]
+        ])
+        
+        self.safe_edit_message(query, text, 'HTML', keyboard)
+    
+    def restart_broadcast_wizard(self, query, update, context):
+        """重新开始广播向导"""
+        user_id = query.from_user.id
+        
+        if user_id in self.pending_broadcasts:
+            del self.pending_broadcasts[user_id]
+        
+        self.start_broadcast_wizard(query, update, context)
+    
+    # ================================
+    # 文件重命名功能
+    # ================================
+    
+    def handle_rename_start(self, query):
+        """开始文件重命名流程"""
+        user_id = query.from_user.id
+        query.answer()
+        
+        # 初始化任务
+        self.pending_rename[user_id] = {
+            'temp_dir': None,
+            'file_path': None,
+            'orig_name': None,
+            'ext': None
+        }
+        
+        # 设置用户状态
+        self.db.save_user(
+            user_id,
+            query.from_user.username or "",
+            query.from_user.first_name or "",
+            "waiting_rename_file"
+        )
+        
+        text = f"""
+<b>{t(user_id, 'rename_title')}</b>
+
+<b>{t(user_id, 'rename_features')}</b>
+{t(user_id, 'rename_feature1')}
+{t(user_id, 'rename_feature2')}
+{t(user_id, 'rename_feature3')}
+{t(user_id, 'rename_feature4')}
+
+<b>{t(user_id, 'rename_upload_prompt')}</b>
+
+<i>{t(user_id, 'rename_timeout_upload')}</i>
+        """
+        
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton(f"❌ {t(user_id, 'rename_btn_cancel')}", callback_data="back_to_main")]
+        ])
+        
+        self.safe_edit_message(query, text, 'HTML', keyboard)
+    
+    def handle_rename_file_upload(self, update: Update, context: CallbackContext, document):
+        """处理重命名文件上传"""
+        user_id = update.effective_user.id
+        
+        if user_id not in self.pending_rename:
+            self.safe_send_message(update, t(user_id, 'rename_no_task'))
+            return
+        
+        # 创建临时目录
+        temp_dir = tempfile.mkdtemp(prefix="temp_rename_")
+        orig_name = document.file_name
+        
+        # 分离文件名和扩展名
+        if '.' in orig_name:
+            name_parts = orig_name.rsplit('.', 1)
+            base_name = name_parts[0]
+            ext = '.' + name_parts[1]
+        else:
+            base_name = orig_name
+            ext = ''
+        
+        # 下载文件
+        file_path = os.path.join(temp_dir, orig_name)
+        try:
+            document.get_file().download(file_path)
+        except Exception as e:
+            self.safe_send_message(update, t(user_id, 'rename_download_failed').format(error=str(e)))
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            return
+        
+        # 保存任务信息
+        self.pending_rename[user_id]['temp_dir'] = temp_dir
+        self.pending_rename[user_id]['file_path'] = file_path
+        self.pending_rename[user_id]['orig_name'] = orig_name
+        self.pending_rename[user_id]['ext'] = ext
+        
+        # 更新状态，等待新文件名
+        self.db.save_user(
+            user_id,
+            update.effective_user.username or "",
+            update.effective_user.first_name or "",
+            "waiting_rename_newname"
+        )
+        
+        text = f"""
+<b>{t(user_id, 'rename_file_received')}</b>
+
+<b>{t(user_id, 'rename_original_name').format(filename=orig_name)}</b>
+<b>{t(user_id, 'rename_file_size').format(size=f"{document.file_size / 1024:.2f} KB")}</b>
+
+<b>{t(user_id, 'rename_enter_new_name')}</b>
+
+{t(user_id, 'rename_name_only')}
+{t(user_id, 'rename_ext_keep').format(ext=f"<code>{ext}</code>")}
+{t(user_id, 'rename_illegal_clean')}
+
+⏰ <i>{t(user_id, 'rename_timeout_input')}</i>
+        """
+        
+        self.safe_send_message(update, text, 'HTML')
+    
+    def handle_rename_newname_input(self, update: Update, context: CallbackContext, user_id: int, text: str):
+        """处理新文件名输入"""
+        if user_id not in self.pending_rename:
+            self.safe_send_message(update, t(user_id, 'rename_no_task'))
+            return
+        
+        task = self.pending_rename[user_id]
+        
+        # 调试日志：记录原始输入
+        logger.debug(f"重命名输入 - 用户{user_id} - 原始文本: {repr(text)}")
+        logger.debug(f"重命名输入 - 用户{user_id} - text.strip(): {repr(text.strip())}")
+        
+        # 清理并验证新文件名
+        new_name = self.sanitize_filename(text.strip())
+        logger.debug(f"重命名输入 - 用户{user_id} - 清理后: {repr(new_name)}")
+        
+        if not new_name:
+            self.safe_send_message(update, t(user_id, 'rename_invalid_name'))
+            return
+        
+        # 构建完整的新文件名
+        new_filename = new_name + task['ext']
+        new_file_path = os.path.join(task['temp_dir'], new_filename)
+        
+        # 重命名文件
+        try:
+            shutil.move(task['file_path'], new_file_path)
+        except Exception as e:
+            self.safe_send_message(update, t(user_id, 'rename_failed').format(error=str(e)))
+            self.cleanup_rename_task(user_id)
+            return
+        
+        # 发送重命名后的文件
+        # 注意：显式指定filename参数以确保Telegram使用正确的文件名
+        old_name_html = f"<code>{task['orig_name']}</code>"
+        new_name_html = f"<code>{new_filename}</code>"
+        caption = (
+            f"<b>{t(user_id, 'rename_success')}</b>\n\n"
+            f"{t(user_id, 'rename_old_name').format(old_name=old_name_html)}\n"
+            f"{t(user_id, 'rename_new_name').format(new_name=new_name_html)}\n\n"
+            f"{t(user_id, 'rename_telegram_tip')}"
+        )
+        
+        if self.send_document_safely(user_id, new_file_path, caption, new_filename):
+            self.safe_send_message(update, f"<b>{t(user_id, 'rename_file_sent')}</b>", 'HTML')
+        else:
+            self.safe_send_message(update, t(user_id, 'rename_send_failed'))
+        
+        # 清理任务
+        self.cleanup_rename_task(user_id)
+    
+    def cleanup_rename_task(self, user_id: int):
+        """清理重命名任务"""
+        if user_id in self.pending_rename:
+            task = self.pending_rename[user_id]
+            if task['temp_dir'] and os.path.exists(task['temp_dir']):
+                shutil.rmtree(task['temp_dir'], ignore_errors=True)
+            del self.pending_rename[user_id]
+        
+        # 清除用户状态
+        self.db.save_user(user_id, "", "", "")
+    
+    # ================================
+    # 账户合并功能
+    # ================================
+    
+    def handle_merge_start(self, query):
+        """开始账户合并流程"""
+        user_id = query.from_user.id
+        query.answer()
+        
+        # 创建临时目录
+        temp_dir = tempfile.mkdtemp(prefix="temp_merge_")
+        
+        # 初始化任务
+        self.pending_merge[user_id] = {
+            'temp_dir': temp_dir,
+            'files': []
+        }
+        
+        # 设置用户状态
+        self.db.save_user(
+            user_id,
+            query.from_user.username or "",
+            query.from_user.first_name or "",
+            "waiting_merge_files"
+        )
+        
+        user_id = query.from_user.id
+        text = f"""
+<b>{t(user_id, 'merge_title')}</b>
+
+<b>{t(user_id, 'merge_features')}</b>
+{t(user_id, 'merge_feature1')}
+{t(user_id, 'merge_feature2')}
+{t(user_id, 'merge_feature3')}
+{t(user_id, 'merge_feature4')}
+
+<b>{t(user_id, 'merge_upload_prompt')}</b>
+
+<b>{t(user_id, 'merge_zip_only')}</b>
+{t(user_id, 'merge_multi_upload')}
+{t(user_id, 'merge_auto_scan')}
+
+{t(user_id, 'merge_click_complete')}
+        """
+        
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton(t(user_id, 'merge_btn_complete'), callback_data="merge_finish")],
+            [InlineKeyboardButton(t(user_id, 'merge_btn_cancel'), callback_data="back_to_main")]
+        ])
+        
+        self.safe_edit_message(query, text, 'HTML', keyboard)
+    
+    def handle_merge_file_upload(self, update: Update, context: CallbackContext, document):
+        """处理合并文件上传 - 仅接受ZIP文件"""
+        user_id = update.effective_user.id
+        
+        if user_id not in self.pending_merge:
+            self.safe_send_message(update, t(user_id, 'merge_no_task'))
+            return
+        
+        task = self.pending_merge[user_id]
+        filename = document.file_name
+        
+        # 检查文件类型 - 仅接受ZIP文件
+        if not filename.lower().endswith('.zip'):
+            self.safe_send_message(update, t(user_id, 'merge_zip_only_error'))
+            return
+        
+        # 下载文件
+        file_path = os.path.join(task['temp_dir'], filename)
+        try:
+            document.get_file().download(file_path)
+            task['files'].append(filename)
+            
+            total_files = len(task['files'])
+            
+            # 创建即时操作按钮
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton(t(user_id, 'merge_btn_continue'), callback_data="merge_continue")],
+                [InlineKeyboardButton(t(user_id, 'merge_btn_complete'), callback_data="merge_finish")],
+                [InlineKeyboardButton(t(user_id, 'merge_btn_cancel'), callback_data="merge_cancel")]
+            ])
+            
+            self.safe_send_message(
+                update,
+                f"{t(user_id, 'merge_received_zip').format(count=total_files)}\n\n"
+                f"{t(user_id, 'merge_filename').format(filename=filename)}\n\n"
+                f"<b>{t(user_id, 'merge_select_action')}</b>\n"
+                f"{t(user_id, 'merge_action_continue')}\n"
+                f"{t(user_id, 'merge_action_complete')}",
+                'HTML',
+                reply_markup=keyboard
+            )
+        except Exception as e:
+            self.safe_send_message(update, t(user_id, 'merge_download_failed').format(error=str(e)))
+    
+    
+    def handle_merge_continue(self, query):
+        """处理继续上传文件"""
+        user_id = query.from_user.id
+        query.answer(t(user_id, 'merge_continue_upload_hint'))
+        
+        if user_id not in self.pending_merge:
+            self.safe_edit_message(query, t(user_id, 'merge_no_task'))
+            return
+        
+        task = self.pending_merge[user_id]
+        total_files = len(task['files'])
+        
+        text = f"""
+<b>{t(user_id, 'merge_btn_continue')}</b>
+
+{t(user_id, 'merge_received_files').format(count=total_files)}
+
+<b>{t(user_id, 'merge_zip_only')}</b>
+{t(user_id, 'merge_upload_next')}
+{t(user_id, 'merge_or_complete')}
+        """
+        
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton(t(user_id, 'merge_btn_complete'), callback_data="merge_finish")],
+            [InlineKeyboardButton(t(user_id, 'merge_btn_cancel'), callback_data="merge_cancel")]
+        ])
+        
+        self.safe_edit_message(query, text, 'HTML', keyboard)
+    
+    
+    def handle_merge_cancel(self, query):
+        """处理取消合并"""
+        query.answer()
+        user_id = query.from_user.id
+        
+        if user_id in self.pending_merge:
+            self.cleanup_merge_task(user_id)
+        
+        self.safe_edit_message(query, t(user_id, 'merge_cancelled'))
+        
+        # 返回主菜单
+        time.sleep(1)
+        fake_update = type('obj', (object,), {
+            'effective_user': type('obj', (object,), {'id': user_id})()
+        })()
+        self.show_main_menu(fake_update, user_id)
+    
+    def handle_merge_finish(self, update: Update, context: CallbackContext, query):
+        """完成合并，开始处理"""
+        user_id = query.from_user.id
+        query.answer()
+        
+        if user_id not in self.pending_merge:
+            self.safe_edit_message(query, t(user_id, 'merge_no_task'))
+            return
+        
+        task = self.pending_merge[user_id]
+        
+        if not task['files']:
+            self.safe_edit_message(query, t(user_id, 'merge_no_files'))
+            return
+        
+        self.safe_edit_message(query, f"<b>{t(user_id, 'merge_processing')}</b>", 'HTML')
+        
+        # 在后台线程中处理
+        def process_merge():
+            asyncio.run(self.process_merge_files(update, context, user_id))
+        
+        thread = threading.Thread(target=process_merge, daemon=True)
+        thread.start()
+    
+    def extract_phone_from_json(self, json_path: str) -> Optional[str]:
+        """从JSON文件中提取手机号"""
+        try:
+            with open(json_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                phone = data.get('phone', '')
+                if phone:
+                    # 清理手机号格式：移除+号和其他非数字字符
+                    phone_clean = ''.join(c for c in phone if c.isdigit())
+                    if phone_clean and len(phone_clean) >= 10:
+                        return phone_clean
+        except Exception as e:
+            print(f"⚠️ 从JSON提取手机号失败 {json_path}: {e}")
+        return None
+    
+    def extract_phone_from_tdata_path(self, account_root: str, tdata_dir_name: str) -> Optional[str]:
+        """从TData目录路径中提取手机号"""
+        try:
+            # 方法1: 检查tdata父目录名是否是手机号
+            parent_dir = os.path.basename(account_root)
+            phone_clean = parent_dir.lstrip('+')
+            if phone_clean.isdigit() and len(phone_clean) >= 10:
+                return phone_clean
+            
+            # 方法2: 检查account_root的上级目录
+            path_parts = account_root.split(os.sep)
+            for part in reversed(path_parts):
+                if not part:
+                    continue
+                phone_clean = part.lstrip('+')
+                if phone_clean.isdigit() and len(phone_clean) >= 10:
+                    return phone_clean
+        except Exception as e:
+            print(f"⚠️ 从TData路径提取手机号失败: {e}")
+        return None
+
+    async def process_merge_files(self, update, context, user_id: int):
+        """处理账户文件合并 - 解压所有ZIP并递归扫描"""
+        if user_id not in self.pending_merge:
+            return
+        
+        task = self.pending_merge[user_id]
+        temp_dir = task['temp_dir']
+        files = task['files']
+        
+        # 创建解压工作目录
+        extract_dir = os.path.join(temp_dir, 'extracted')
+        os.makedirs(extract_dir, exist_ok=True)
+        
+        # 第一步：解压所有ZIP文件
+        for filename in files:
+            file_path = os.path.join(temp_dir, filename)
+            if filename.lower().endswith('.zip'):
+                try:
+                    # 为每个ZIP创建单独的子目录
+                    zip_extract_dir = os.path.join(extract_dir, filename.replace('.zip', ''))
+                    os.makedirs(zip_extract_dir, exist_ok=True)
+                    
+                    with zipfile.ZipFile(file_path, 'r') as zf:
+                        zf.extractall(zip_extract_dir)
+                except Exception as e:
+                    print(f"❌ 解压失败 {filename}: {e}")
+        
+        # 第二步：递归扫描所有解压后的内容 - 使用统一扫描函数
+        print("📂 开始扫描账号...")
+        
+        # 使用统一的 tdata 扫描函数
+        tdata_accounts_unified = scan_tdata_accounts(extract_dir)
+        
+        # 转换为原有格式 (account_root, tdata_dir_name)
+        tdata_accounts = []
+        for account in tdata_accounts_unified:
+            account_root = account['account_path']
+            tdata_dir_name = 'tdata'  # 统一使用 'tdata' 作为目录名
+            tdata_accounts.append((account_root, tdata_dir_name))
+            print(f"📂 找到TData账号: {account['phone']} -> {account['tdata_path']}")
+        
+        # 扫描Session文件
+        session_json_pairs = []  # 存储 Session+JSON 配对
+        
+        def scan_sessions(dir_path):
+            """递归扫描Session文件"""
+            try:
+                for root, dirs, filenames in os.walk(dir_path):
+                    # 检查当前目录中的 Session 文件 (支持纯Session或Session+JSON配对)
+                    session_files = {}
+                    json_files = {}
+                    
+                    for fname in filenames:
+                        if fname.lower().endswith('.session'):
+                            # 过滤系统文件
+                            if fname == 'tdata.session' or fname.startswith('batch_validate_') or fname.startswith('temp_') or fname.startswith('user_'):
+                                continue
+                            basename = fname[:-8]  # 去掉 .session
+                            session_files[basename] = os.path.join(root, fname)
+                        elif fname.lower().endswith('.json'):
+                            basename = fname[:-5]  # 去掉 .json
+                            json_files[basename] = os.path.join(root, fname)
+                    
+                    # 添加所有session文件，优先使用配对的JSON（如果有）
+                    # 元组格式: (session_path, json_path, basename) 其中 json_path 可以为 None
+                    for basename in session_files.keys():
+                        session_path = session_files[basename]
+                        json_path = json_files.get(basename, None)  # JSON可选，可能为None
+                        session_json_pairs.append((session_path, json_path, basename))
+            except Exception as e:
+                print(f"❌ 扫描Session文件失败 {dir_path}: {e}")
+        
+        # 扫描所有Session文件
+        scan_sessions(extract_dir)
+        print(f"📱 找到 {len(session_json_pairs)} 个Session文件")
+        
+        # 第三步：提取手机号并去重 - 同时追踪重复项
+        # 为TData账户提取手机号
+        tdata_with_phones = {}  # phone -> (account_root, tdata_dir_name)
+        tdata_without_phones = []  # 没有手机号的账户
+        tdata_duplicates = []  # 重复的TData账户: [(phone, account_root, tdata_dir_name), ...]
+        
+        for account_root, tdata_dir_name in tdata_accounts:
+            phone = self.extract_phone_from_tdata_path(account_root, tdata_dir_name)
+            if phone:
+                # 去重：如果手机号已存在，保留第一个，将重复的添加到duplicates
+                if phone not in tdata_with_phones:
+                    tdata_with_phones[phone] = (account_root, tdata_dir_name)
+                else:
+                    print(f"⚠️ 发现重复TData账户，手机号: {phone}，将单独打包")
+                    tdata_duplicates.append((phone, account_root, tdata_dir_name))
+            else:
+                tdata_without_phones.append((account_root, tdata_dir_name))
+        
+        # 为Session文件提取手机号 (支持纯Session或Session+JSON配对)
+        session_json_with_phones = {}  # phone -> (session_path, json_path)
+        session_json_duplicates = []  # 重复的Session文件: [(phone, session_path, json_path), ...]
+        
+        for session_path, json_path, basename in session_json_pairs:
+            # 尝试从JSON提取手机号（如果JSON存在）
+            phone = None
+            if json_path:
+                phone = self.extract_phone_from_json(json_path)
+            
+            if phone:
+                # 去重：如果手机号已存在，保留第一个，将重复的添加到duplicates
+                if phone not in session_json_with_phones:
+                    session_json_with_phones[phone] = (session_path, json_path)
+                else:
+                    print(f"⚠️ 发现重复Session，手机号: {phone}，将单独打包")
+                    session_json_duplicates.append((phone, session_path, json_path))
+            else:
+                # 如果JSON中没有手机号或没有JSON，使用basename作为标识
+                if basename not in session_json_with_phones:
+                    session_json_with_phones[basename] = (session_path, json_path)
+                    if not json_path:
+                        print(f"ℹ️ 处理纯Session文件（无JSON）: {basename}")
+        
+        # 第四步：创建输出 ZIP 文件
+        result_dir = os.path.join(temp_dir, 'results')
+        os.makedirs(result_dir, exist_ok=True)
+        
+        timestamp = int(time.time())
+        zip_files_created = []
+        
+        # 统计去重后的数量
+        total_tdata = len(tdata_with_phones) + len(tdata_without_phones)
+        total_session_json = len(session_json_with_phones)
+        total_tdata_duplicates = len(tdata_duplicates)
+        total_session_duplicates = len(session_json_duplicates)
+        duplicates_removed = total_tdata_duplicates + total_session_duplicates
+        
+        # 打包 TData 账户（使用手机号作为目录名）
+        if tdata_with_phones or tdata_without_phones:
+            tdata_zip_path = os.path.join(result_dir, f'tdata_only_{timestamp}.zip')
+            with zipfile.ZipFile(tdata_zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+                # 先处理有手机号的账户
+                for phone, (account_root, tdata_dir_name) in tdata_with_phones.items():
+                    tdata_full_path = os.path.join(account_root, tdata_dir_name)
+                    
+                    # 递归添加 tdata 目录下的所有文件
+                    for root, dirs, filenames in os.walk(tdata_full_path):
+                        for fname in filenames:
+                            file_path = os.path.join(root, fname)
+                            # 计算相对路径
+                            rel_path = os.path.relpath(file_path, account_root)
+                            # 使用手机号作为目录名: phone/tdata/...
+                            arcname = os.path.join(phone, rel_path)
+                            zf.write(file_path, arcname)
+                
+                # 处理没有手机号的账户（使用account_N命名）
+                for idx, (account_root, tdata_dir_name) in enumerate(tdata_without_phones, 1):
+                    account_name = f'account_{idx}'
+                    tdata_full_path = os.path.join(account_root, tdata_dir_name)
+                    
+                    for root, dirs, filenames in os.walk(tdata_full_path):
+                        for fname in filenames:
+                            file_path = os.path.join(root, fname)
+                            rel_path = os.path.relpath(file_path, account_root)
+                            arcname = os.path.join(account_name, rel_path)
+                            zf.write(file_path, arcname)
+            
+            zip_files_created.append(('TData 账户', tdata_zip_path, total_tdata))
+        
+        # 打包 Session 文件（支持纯Session或Session+JSON配对，使用手机号作为文件名）
+        if session_json_with_phones:
+            session_json_zip_path = os.path.join(result_dir, f'session_json_{timestamp}.zip')
+            with zipfile.ZipFile(session_json_zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+                for phone, (session_path, json_path) in session_json_with_phones.items():
+                    # 使用手机号作为文件名
+                    zf.write(session_path, f'{phone}.session')
+                    # 只在JSON存在时添加JSON文件
+                    if json_path and os.path.exists(json_path):
+                        zf.write(json_path, f'{phone}.json')
+            
+            zip_files_created.append(('Session 文件', session_json_zip_path, total_session_json))
+        
+        # 【新增】单独打包重复的 TData 账户
+        if tdata_duplicates:
+            tdata_dup_zip_path = os.path.join(result_dir, f'tdata_duplicates_{timestamp}.zip')
+            with zipfile.ZipFile(tdata_dup_zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+                for idx, (phone, account_root, tdata_dir_name) in enumerate(tdata_duplicates, 1):
+                    tdata_full_path = os.path.join(account_root, tdata_dir_name)
+                    
+                    # 使用 phone_duplicate_N 格式命名
+                    duplicate_name = f'{phone}_duplicate_{idx}'
+                    
+                    # 递归添加 tdata 目录下的所有文件
+                    for root, dirs, filenames in os.walk(tdata_full_path):
+                        for fname in filenames:
+                            file_path = os.path.join(root, fname)
+                            rel_path = os.path.relpath(file_path, account_root)
+                            arcname = os.path.join(duplicate_name, rel_path)
+                            zf.write(file_path, arcname)
+            
+            zip_files_created.append(('TData 重复账户', tdata_dup_zip_path, total_tdata_duplicates))
+        
+        # 【新增】单独打包重复的 Session 文件
+        if session_json_duplicates:
+            session_dup_zip_path = os.path.join(result_dir, f'session_duplicates_{timestamp}.zip')
+            with zipfile.ZipFile(session_dup_zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+                for idx, (phone, session_path, json_path) in enumerate(session_json_duplicates, 1):
+                    # 使用 phone_duplicate_N 格式命名
+                    duplicate_name = f'{phone}_duplicate_{idx}'
+                    
+                    zf.write(session_path, f'{duplicate_name}.session')
+                    if json_path and os.path.exists(json_path):
+                        zf.write(json_path, f'{duplicate_name}.json')
+            
+            zip_files_created.append(('Session 重复文件', session_dup_zip_path, total_session_duplicates))
+        
+        # 发送结果
+        duplicate_info = ""
+        if duplicates_removed > 0:
+            duplicate_info = f"""
+<b>🔄 重复文件处理</b>
+• TData 重复: {total_tdata_duplicates} 个
+• Session 重复: {total_session_duplicates} 个
+• 已单独打包，不与正常文件混合
+"""
+        
+        summary = f"""
+<b>{t(user_id, 'merge_complete')}</b>
+
+<b>{t(user_id, 'merge_results')}</b>
+{t(user_id, 'merge_result_zip').format(count=len(files))}
+{t(user_id, 'merge_result_tdata').format(count=total_tdata)}
+{t(user_id, 'merge_result_session').format(count=total_session_json)}
+{duplicate_info}
+<b>{t(user_id, 'merge_generated')}</b>
+{t(user_id, 'merge_total_files').format(count=len(zip_files_created))}
+        """
+        
+        context.bot.send_message(chat_id=user_id, text=summary, parse_mode='HTML')
+        
+        # 发送所有生成的 ZIP 文件
+        for category, zip_path, count in zip_files_created:
+            # Translate category names
+            if 'Session' in category:
+                category_text = t(user_id, 'merge_session_files').format(count=count)
+            elif 'TData' in category:
+                category_text = t(user_id, 'merge_tdata_files').format(count=count)
+            else:
+                category_text = f"📦 {category} ({count} 项)"
+            
+            caption = category_text
+            with open(zip_path, 'rb') as f:
+                context.bot.send_document(
+                    chat_id=user_id,
+                    document=f,
+                    caption=caption,
+                    filename=os.path.basename(zip_path)
+                )
+        
+        # 清理任务
+        self.cleanup_merge_task(user_id)
+    
+    def is_tdata_zip(self, zip_path: str) -> bool:
+        """检测 ZIP 文件是否包含 TData 标识（case-insensitive）"""
+        try:
+            with zipfile.ZipFile(zip_path, 'r') as zf:
+                # 检查是否包含 D877F783D5D3EF8C 目录（case-insensitive）
+                namelist = zf.namelist()
+                for name in namelist:
+                    if 'D877F783D5D3EF8C'.lower() in name.lower():
+                        return True
+            return False
+        except:
+            return False
+    
+    def cleanup_merge_task(self, user_id: int):
+        """清理合并任务"""
+        if user_id in self.pending_merge:
+            task = self.pending_merge[user_id]
+            if task['temp_dir'] and os.path.exists(task['temp_dir']):
+                shutil.rmtree(task['temp_dir'], ignore_errors=True)
+            del self.pending_merge[user_id]
+        
+        # 清除用户状态
+        self.db.save_user(user_id, "", "", "")
+    
+    # ================================
+    # 一键清理功能
+    # ================================
+    
+    def handle_cleanup_start(self, query):
+        """开始一键清理流程"""
+        user_id = query.from_user.id
+        query.answer()
+        
+        # 检查是否启用
+        if not config.ENABLE_ONE_CLICK_CLEANUP:
+            self.safe_edit_message(query, t(user_id, 'cleanup_feature_disabled'))
+            return
+        
+        # 检查会员权限
+        is_member, _, _ = self.db.check_membership(user_id)
+        if not is_member and not self.db.is_admin(user_id):
+            self.safe_edit_message(query, t(user_id, 'cleanup_need_member'))
+            return
+        
+        # 设置用户状态
+        self.db.save_user(
+            user_id,
+            query.from_user.username or "",
+            query.from_user.first_name or "",
+            "waiting_cleanup_file"
+        )
+        
+        text = f"""
+<b>{t(user_id, 'cleanup_title')}</b>
+
+<b>{t(user_id, 'cleanup_important')}</b>
+{t(user_id, 'cleanup_intro')}
+• {t(user_id, 'cleanup_action1')}
+• {t(user_id, 'cleanup_action2')}
+• {t(user_id, 'cleanup_action3')}
+• {t(user_id, 'cleanup_action4')}
+
+<b>{t(user_id, 'cleanup_irreversible')}</b>
+{t(user_id, 'cleanup_irreversible_warn')}
+
+<b>{t(user_id, 'cleanup_safety')}</b>
+• {t(user_id, 'cleanup_safety1')}
+• {t(user_id, 'cleanup_safety2')}
+• {t(user_id, 'cleanup_safety3')}
+
+<b>{t(user_id, 'cleanup_upload_prompt')}</b>
+
+⏰ <i>{t(user_id, 'cleanup_timeout')}</i>
+        """
+        
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton(t(user_id, 'cleanup_btn_cancel'), callback_data="back_to_main")]
+        ])
+        
+        self.safe_edit_message(query, text, 'HTML', keyboard)
+    
+    async def process_cleanup(self, update, context, document):
+        """处理一键清理"""
+        user_id = update.effective_user.id
+        start_time = time.time()
+        
+        progress_msg = self.safe_send_message(update, f"📥 <b>{t(user_id, 'cleanup_processing_file')}...</b>", 'HTML')
+        if not progress_msg:
+            return
+        
+        temp_zip = None
+        temp_dir = None
+        
+        try:
+            # 下载文件
+            temp_dir = tempfile.mkdtemp(prefix="temp_cleanup_")
+            temp_zip = os.path.join(temp_dir, document.file_name)
+            document.get_file().download(temp_zip)
+            
+            # 扫描ZIP文件
+            task_id = f"{user_id}_{int(start_time)}"
+            files, extract_dir, file_type = self.processor.scan_zip_file(temp_zip, user_id, task_id)
+            
+            if not files:
+                try:
+                    progress_msg.edit_text(
+                        f"❌ <b>{t(user_id, 'cleanup_no_valid_files')}</b>\n\n{t(user_id, 'cleanup_ensure_format')}",
+                        parse_mode='HTML'
+                    )
+                except:
+                    pass
+                return
+            
+            total_files = len(files)
+            file_type_text = t(user_id, 'cleanup_type_session') if file_type == 'session' else t(user_id, 'cleanup_type_tdata')
+            
+            # 显示确认消息
+            try:
+                progress_msg.edit_text(
+                    f"{t(user_id, 'cleanup_found_accounts').format(count=total_files)}\n"
+                    f"{file_type_text}\n\n"
+                    f"<b>{t(user_id, 'cleanup_confirm_title')}</b>\n\n"
+                    f"{t(user_id, 'cleanup_confirm_intro')}\n"
+                    f"{t(user_id, 'cleanup_confirm_action1')}\n"
+                    f"{t(user_id, 'cleanup_confirm_action2')}\n"
+                    f"{t(user_id, 'cleanup_confirm_action3')}\n"
+                    f"{t(user_id, 'cleanup_confirm_action4')}\n\n"
+                    f"<b>{t(user_id, 'cleanup_confirm_warn')}</b>",
+                    parse_mode='HTML',
+                    reply_markup=InlineKeyboardMarkup([
+                        [
+                            InlineKeyboardButton(t(user_id, 'cleanup_btn_confirm'), callback_data="cleanup_confirm"),
+                            InlineKeyboardButton(t(user_id, 'cleanup_btn_cancel'), callback_data="cleanup_cancel")
+                        ]
+                    ])
+                )
+            except:
+                pass
+            
+            # 保存任务信息
+            self.pending_cleanup[user_id] = {
+                'files': files,
+                'extract_dir': extract_dir,
+                'file_type': file_type,
+                'temp_dir': temp_dir,
+                'progress_msg': progress_msg,
+                'started_at': time.time()
+            }
+            
+        except Exception as e:
+            logger.error(f"Error in process_cleanup: {e}")
+            import traceback
+            traceback.print_exc()
+            
+            try:
+                progress_msg.edit_text(
+                    f"❌ <b>{t(user_id, 'cleanup_processing_failed')}</b>\n\n{t(user_id, 'cleanup_error').format(error=str(e))}",
+                    parse_mode='HTML'
+                )
+            except:
+                pass
+            
+            # 清理临时文件
+            if temp_dir and os.path.exists(temp_dir):
+                shutil.rmtree(temp_dir, ignore_errors=True)
+    
+    def _is_frozen_error(self, error: Exception) -> bool:
+        """检查是否为冻结账户错误"""
+        error_str = str(error).upper()
+        return any(keyword in error_str for keyword in self.FROZEN_KEYWORDS)
+    
+    async def _cleanup_single_account(self, client, account_name: str, file_path: str, progress_callback=None, user_id: int = None) -> Dict[str, Any]:
+        """清理单个账号"""
+        start_time = time.time()
+        
+        actions = []
+        stats = {
+            'profile_cleared': 0,
+            'groups_left': 0,
+            'channels_left': 0,
+            'histories_deleted': 0,
+            'contacts_deleted': 0,
+            'dialogs_closed': 0,
+            'errors': 0,
+            'skipped': 0
+        }
+        
+        # 用于详细报告的错误列表
+        error_details = []
+        
+        try:
+            # 0. 清理账号资料（头像、名字、简介）
+            logger.info(f"清理账号资料: {account_name}")
+            if progress_callback and user_id:
+                await progress_callback(t(user_id, 'cleanup_status_profile'))
+            
+            try:
+                # 添加超时保护
+                async with asyncio.timeout(CLEANUP_OPERATION_TIMEOUT):
+                    from telethon.tl.functions.account import UpdateProfileRequest
+                    from telethon.tl.functions.photos import DeletePhotosRequest, GetUserPhotosRequest
+                    
+                    # 获取当前账号信息
+                    me = await client.get_me()
+                
+                # 随机修改名字和简介为符号字母
+                profile_cleared = False
+                try:
+                    # 生成随机符号字母组合（使用secrets确保随机性）
+                    charset = string.ascii_letters + string.digits + '._-'
+                    random_chars = ''.join(secrets.choice(charset) for _ in range(secrets.randbelow(6) + 3))  # 3-8位
+                    random_bio = ''.join(secrets.choice(charset + ' ') for _ in range(secrets.randbelow(11) + 5))  # 5-15位
+                    
+                    await client(UpdateProfileRequest(
+                        first_name=random_chars,  # 随机名字
+                        last_name='',              # 清空姓氏
+                        about=random_bio           # 随机简介
+                    ))
+                    logger.info(f"已修改名字和简介为随机字符: {random_chars}")
+                    profile_cleared = True
+                except Exception as e:
+                    logger.warning(f"修改名字/简介失败: {e}")
+                    # 检查是否为冻结账户
+                    if self._is_frozen_error(e):
+                        error_details.append(f"❄️ 账户已冻结 (FROZEN): {str(e)}")
+                        logger.error(f"检测到冻结账户，终止清理: {account_name}")
+                        return {
+                            'success': False,
+                            'error': 'FROZEN_ACCOUNT',
+                            'error_message': f"账户已冻结: {str(e)}",
+                            'statistics': stats,
+                            'error_details': error_details,
+                            'is_frozen': True
+                        }
+                    error_details.append(f"修改资料失败: {str(e)}")
+                
+                # 删除所有头像
+                try:
+                    photos = await client(GetUserPhotosRequest(
+                        user_id=me,
+                        offset=0,
+                        max_id=0,
+                        limit=100
+                    ))
+                    
+                    if hasattr(photos, 'photos') and photos.photos:
+                        photo_ids = list(photos.photos)
+                        await client(DeletePhotosRequest(id=photo_ids))
+                        logger.info(f"已删除 {len(photo_ids)} 个头像")
+                        if profile_cleared:
+                            stats['profile_cleared'] = 1
+                except Exception as e:
+                    logger.warning(f"删除头像失败: {e}")
+                
+                await asyncio.sleep(config.CLEANUP_ACTION_SLEEP)
+                
+            except asyncio.TimeoutError:
+                logger.warning(f"清理账号资料超时 ({CLEANUP_OPERATION_TIMEOUT}秒)")
+                stats['errors'] += 1
+                error_details.append(f"清理账号资料超时")
+            except Exception as e:
+                logger.error(f"清理账号资料错误: {e}")
+                stats['errors'] += 1
+            
+            # 1. 获取所有对话
+            logger.info(f"获取对话列表: {account_name}")
+            if progress_callback and user_id:
+                await progress_callback(t(user_id, 'cleanup_status_get_dialogs'))
+            
+            dialogs = await client.get_dialogs()
+            logger.info(f"找到 {len(dialogs)} 个对话")
+            
+            # 分类对话
+            from telethon.tl.types import Channel, Chat, User
+            groups = []
+            channels = []
+            users = []
+            bots = []
+            
+            for dialog in dialogs:
+                entity = dialog.entity
+                if isinstance(entity, Channel):
+                    if entity.broadcast:
+                        channels.append(dialog)
+                    else:
+                        groups.append(dialog)
+                elif isinstance(entity, Chat):
+                    groups.append(dialog)
+                elif isinstance(entity, User):
+                    if entity.bot:
+                        bots.append(dialog)
+                    else:
+                        users.append(dialog)
+            
+            logger.info(f"分类: {len(groups)}群组, {len(channels)}频道, {len(users)}用户, {len(bots)}机器人")
+            
+            if progress_callback and user_id:
+                await progress_callback(t(user_id, 'cleanup_status_found_dialogs').format(
+                    groups=len(groups), 
+                    channels=len(channels), 
+                    users=len(users)
+                ))
+            
+            # 1. 离开群组和频道
+            if progress_callback and user_id:
+                await progress_callback(t(user_id, 'cleanup_status_leave_groups').format(
+                    count=len(groups) + len(channels)
+                ))
+            from telethon.tl.functions.channels import LeaveChannelRequest
+            from telethon.tl.functions.messages import DeleteChatUserRequest
+            
+            # 添加超时保护，防止卡死
+            try:
+                async with asyncio.timeout(CLEANUP_OPERATION_TIMEOUT):
+                    for dialog in groups + channels:
+                        entity = dialog.entity
+                        chat_id = entity.id
+                        title = getattr(entity, 'title', 'Unknown')
+                        chat_type = 'channel' if isinstance(entity, Channel) and entity.broadcast else 'group'
+                        
+                        action = CleanupAction(chat_id=chat_id, title=title, chat_type=chat_type)
+                        
+                        try:
+                            await asyncio.sleep(config.CLEANUP_ACTION_SLEEP + random.uniform(0, 0.2))
+                            
+                            if isinstance(entity, Channel):
+                                await client(LeaveChannelRequest(entity))
+                            else:
+                                me = await client.get_me()
+                                await client(DeleteChatUserRequest(chat_id, me))
+                            
+                            action.actions_done.append('left')
+                            action.status = 'success'
+                            
+                            if chat_type == 'channel':
+                                stats['channels_left'] += 1
+                            else:
+                                stats['groups_left'] += 1
+                            
+                            logger.debug(f"离开 {chat_type}: {title}")
+                            
+                        except FloodWaitError as e:
+                            # 如果等待时间超过60秒，跳过以避免卡住
+                            if e.seconds > 60:
+                                logger.warning(f"FloodWait离开{title}: {e.seconds}秒 - 跳过以避免卡住")
+                                action.status = 'skipped'
+                                action.error = f"FloodWait {e.seconds}秒，已跳过"
+                                stats['skipped'] += 1
+                            else:
+                                logger.warning(f"FloodWait离开{title}: {e.seconds}秒")
+                                await asyncio.sleep(e.seconds)
+                                try:
+                                    if isinstance(entity, Channel):
+                                        await client(LeaveChannelRequest(entity))
+                                    else:
+                                        me = await client.get_me()
+                                        await client(DeleteChatUserRequest(chat_id, me))
+                                    action.actions_done.append('left')
+                                    action.status = 'success'
+                                    if chat_type == 'channel':
+                                        stats['channels_left'] += 1
+                                    else:
+                                        stats['groups_left'] += 1
+                                except Exception as retry_error:
+                                    action.status = 'failed'
+                                    action.error = f"重试失败: {str(retry_error)}"
+                                    stats['errors'] += 1
+                            
+                        except Exception as e:
+                            action.status = 'failed'
+                            action.error = str(e)
+                            stats['errors'] += 1
+                            logger.error(f"离开{title}错误: {e}")
+                        
+                        actions.append(action)
+            
+            except asyncio.TimeoutError:
+                logger.warning(f"退出群组/频道操作超时 ({CLEANUP_OPERATION_TIMEOUT}秒)，已处理 {stats['groups_left'] + stats['channels_left']} 个")
+                error_details.append(f"退出群组/频道超时")
+                stats['skipped'] += 1
+            
+            # 2. 删除聊天记录
+            if progress_callback and user_id:
+                await progress_callback(t(user_id, 'cleanup_status_delete_histories').format(
+                    count=len(users) + len(bots)
+                ))
+            
+            from telethon.tl.functions.messages import DeleteHistoryRequest
+            
+            # 添加超时保护
+            try:
+                async with asyncio.timeout(CLEANUP_OPERATION_TIMEOUT):
+                    for dialog in users + bots:
+                        entity = dialog.entity
+                        chat_id = entity.id
+                        
+                        if hasattr(entity, 'first_name') and entity.first_name:
+                            title = entity.first_name
+                        elif hasattr(entity, 'username') and entity.username:
+                            title = entity.username
+                        else:
+                            title = 'Unknown'
+                        
+                        chat_type = 'bot' if entity.bot else 'user'
+                        action = CleanupAction(chat_id=chat_id, title=title, chat_type=chat_type)
+                        
+                        try:
+                            await asyncio.sleep(config.CLEANUP_ACTION_SLEEP + random.uniform(0, 0.2))
+                            
+                            # 尝试撤回删除
+                            if config.CLEANUP_REVOKE_DEFAULT:
+                                try:
+                                    await client(DeleteHistoryRequest(
+                                        peer=entity,
+                                        max_id=0,
+                                        just_clear=False,
+                                        revoke=True
+                                    ))
+                                    action.actions_done.extend(['history_deleted', 'revoked'])
+                                    action.status = 'success'
+                                except Exception:
+                                    # 回退到单向删除
+                                    await client(DeleteHistoryRequest(
+                                        peer=entity,
+                                        max_id=0,
+                                        just_clear=False,
+                                        revoke=False
+                                    ))
+                                    action.actions_done.append('history_deleted')
+                                    action.status = 'partial'
+                                    action.error = '部分: 仅删除自己的消息'
+                            else:
+                                await client(DeleteHistoryRequest(
+                                    peer=entity,
+                                    max_id=0,
+                                    just_clear=False,
+                                    revoke=False
+                                ))
+                                action.actions_done.append('history_deleted')
+                                action.status = 'success'
+                            
+                            stats['histories_deleted'] += 1
+                            logger.debug(f"删除历史记录: {title}")
+                            
+                        except FloodWaitError as e:
+                            # 如果等待时间超过60秒，跳过以避免卡住
+                            if e.seconds > 60:
+                                logger.warning(f"FloodWait删除{title}: {e.seconds}秒 - 跳过以避免卡住")
+                                action.status = 'skipped'
+                                action.error = f"FloodWait {e.seconds}秒，已跳过"
+                                stats['skipped'] += 1
+                            else:
+                                logger.warning(f"FloodWait删除{title}: {e.seconds}秒")
+                                await asyncio.sleep(e.seconds)
+                                try:
+                                    await client(DeleteHistoryRequest(
+                                        peer=entity,
+                                        max_id=0,
+                                        just_clear=False,
+                                        revoke=False
+                                    ))
+                                    action.actions_done.append('history_deleted')
+                                    action.status = 'success'
+                                    stats['histories_deleted'] += 1
+                                except Exception as retry_error:
+                                    action.status = 'failed'
+                                    action.error = f"重试失败: {str(retry_error)}"
+                                    stats['errors'] += 1
+                            
+                        except Exception as e:
+                            action.status = 'failed'
+                            action.error = str(e)
+                            stats['errors'] += 1
+                            logger.error(f"删除{title}历史记录错误: {e}")
+                        
+                        actions.append(action)
+            
+            except asyncio.TimeoutError:
+                logger.warning(f"删除对话记录操作超时 ({CLEANUP_OPERATION_TIMEOUT}秒)，已处理 {stats['histories_deleted']} 个")
+                error_details.append(f"删除对话记录超时")
+                stats['skipped'] += 1
+            
+            # 3. 删除联系人
+            if progress_callback and user_id:
+                await progress_callback(t(user_id, 'cleanup_status_delete_contacts'))
+            
+            from telethon.tl.functions.contacts import DeleteContactsRequest, GetContactsRequest
+            
+            # 添加超时保护
+            try:
+                async with asyncio.timeout(CLEANUP_OPERATION_TIMEOUT):
+                    result = await client(GetContactsRequest(hash=0))
+                    
+                    if hasattr(result, 'users') and result.users:
+                        contact_ids = [user.id for user in result.users]
+                        logger.info(f"删除 {len(contact_ids)} 个联系人...")
+                        
+                        batch_size = 100
+                        for i in range(0, len(contact_ids), batch_size):
+                            batch = contact_ids[i:i + batch_size]
+                            
+                            try:
+                                await client(DeleteContactsRequest(id=batch))
+                                stats['contacts_deleted'] += len(batch)
+                                logger.debug(f"已删除 {len(batch)} 个联系人")
+                                
+                                if i + batch_size < len(contact_ids):
+                                    await asyncio.sleep(config.CLEANUP_ACTION_SLEEP * 2)
+                                    
+                            except FloodWaitError as e:
+                                # 如果等待时间超过60秒，跳过以避免卡住
+                                if e.seconds > 60:
+                                    logger.warning(f"FloodWait删除联系人: {e.seconds}秒 - 跳过以避免卡住")
+                                    stats['skipped'] += 1
+                                else:
+                                    logger.warning(f"FloodWait删除联系人: {e.seconds}秒")
+                                    await asyncio.sleep(e.seconds)
+                                    try:
+                                        await client(DeleteContactsRequest(id=batch))
+                                        stats['contacts_deleted'] += len(batch)
+                                    except Exception:
+                                        stats['errors'] += 1
+                            
+                            except Exception as e:
+                                stats['errors'] += 1
+                                logger.error(f"删除联系人批次错误: {e}")
+                        
+                        logger.info(f"已删除 {stats['contacts_deleted']} 个联系人")
+            
+            except asyncio.TimeoutError:
+                logger.warning(f"删除联系人操作超时 ({CLEANUP_OPERATION_TIMEOUT}秒)，已删除 {stats['contacts_deleted']} 个")
+                error_details.append(f"删除联系人超时")
+                stats['skipped'] += 1
+            except Exception as e:
+                stats['errors'] += 1
+                logger.error(f"获取/删除联系人错误: {e}")
+            
+            # 4. 归档剩余对话
+            if progress_callback and user_id:
+                await progress_callback(t(user_id, 'cleanup_status_archive_dialogs'))
+            
+            # 添加超时保护
+            try:
+                async with asyncio.timeout(CLEANUP_OPERATION_TIMEOUT):
+                    remaining_dialogs = await client.get_dialogs()
+                    archived_count = 0
+                    
+                    for dialog in remaining_dialogs:
+                        try:
+                            await client.edit_folder(dialog.entity, folder=1)
+                            archived_count += 1
+                            await asyncio.sleep(config.CLEANUP_ACTION_SLEEP)
+                        except FloodWaitError as e:
+                            # 如果等待时间超过60秒，跳过以避免卡住
+                            if e.seconds > 60:
+                                logger.warning(f"FloodWait归档: {e.seconds}秒 - 跳过以避免卡住")
+                                stats['skipped'] += 1
+                            else:
+                                logger.warning(f"FloodWait归档: {e.seconds}秒")
+                                await asyncio.sleep(e.seconds)
+                                try:
+                                    await client.edit_folder(dialog.entity, folder=1)
+                                    archived_count += 1
+                                except Exception:
+                                    pass
+                        except Exception as e:
+                            logger.debug(f"无法归档对话: {e}")
+                    
+                    stats['dialogs_closed'] = archived_count
+                    logger.info(f"已归档 {archived_count} 个对话")
+            
+            except asyncio.TimeoutError:
+                logger.warning(f"归档对话操作超时 ({CLEANUP_OPERATION_TIMEOUT}秒)")
+                error_details.append(f"归档对话超时")
+                stats['skipped'] += 1
+            except Exception as e:
+                logger.error(f"归档对话错误: {e}")
+            
+            # 返回清理结果（不生成单独报告）
+            elapsed_time = time.time() - start_time
+            
+            return {
+                'success': True,
+                'elapsed_time': elapsed_time,
+                'statistics': stats,
+                'actions': actions  # 返回动作列表用于汇总报告
+            }
+            
+        except Exception as e:
+            logger.error(f"清理失败: {e}", exc_info=True)
+            return {
+                'success': False,
+                'error': str(e),
+                'statistics': stats
+            }
+    
+    def handle_cleanup_confirm(self, update, context, query):
+        """确认清理"""
+        user_id = query.from_user.id
+        query.answer()
+        
+        if user_id not in self.pending_cleanup:
+            self.safe_edit_message(query, t(user_id, 'cleanup_no_pending_task'))
+            return
+        
+        task = self.pending_cleanup[user_id]
+        
+        # 检查超时（10分钟）
+        if time.time() - task['started_at'] > 600:
+            self.cleanup_cleanup_task(user_id)
+            self.safe_edit_message(query, t(user_id, 'cleanup_operation_timeout'))
+            return
+        
+        # 启动异步清理
+        def execute_cleanup():
+            asyncio.run(self.execute_cleanup(update, context, user_id))
+        
+        thread = threading.Thread(target=execute_cleanup, daemon=True)
+        thread.start()
+        
+        self.safe_edit_message(query, f"🧹 <b>{t(user_id, 'cleanup_starting')}...</b>\n\n{t(user_id, 'cleanup_initializing')}", 'HTML')
+    
+    async def _process_single_account_full(self, file_info: tuple, file_type: str, progress_msg, all_files_count: int, completed_count: dict, lock: asyncio.Lock, start_time: float, user_id: int) -> dict:
+        """处理单个账户的完整流程（包含连接和清理）"""
+        file_path, file_name = file_info
+        result_data = {
+            'file_path': file_path,
+            'file_name': file_name,
+            'original_path': file_path,  # 保存原始文件路径用于打包
+            'file_type': file_type,  # 保存文件类型
+            'success': False,
+            'error': None,
+            'is_frozen': False,
+            'statistics': {},
+            'error_details': []
+        }
+        
+        client = None
+        try:
+            # 如果是TData，需要先转换为Session
+            if file_type == 'tdata':
+                # 提取手机号用于日志
+                phone_for_log = extract_phone_from_tdata_path(file_path) or file_name
+                
+                # 使用安全转换函数，带超时和错误处理
+                session_path, error_msg = await safe_convert_tdata(file_path, phone_for_log)
+                
+                if session_path is None:
+                    # 转换失败，跳过该账号
+                    logger.warning(f"⚠️ 跳过账号 {phone_for_log}，转换失败: {error_msg}")
+                    result_data['error'] = error_msg
+                    result_data['error_details'].append(error_msg)
+                    return result_data
+                
+                # 使用转换后的session创建不接收更新的客户端以提升清理速度
+                try:
+                    from telethon import TelegramClient as TelethonClient
+                    client = TelethonClient(
+                        os.path.splitext(session_path)[0],
+                        int(config.API_ID),
+                        str(config.API_HASH),
+                        receive_updates=False
+                    )
+                    await client.connect()
+                    
+                    # 检查授权
+                    if not await client.is_user_authorized():
+                        logger.warning(f"Session not authorized after conversion: {file_name}")
+                        result_data['error'] = "转换后Session未授权"
+                        await client.disconnect()
+                        return result_data
+                        
+                except Exception as e:
+                    logger.error(f"Failed to connect after TData conversion for {file_name}: {e}")
+                    # 检查是否为冻结账户错误
+                    if self._is_frozen_error(e):
+                        result_data['error'] = 'FROZEN_ACCOUNT'
+                        result_data['error_message'] = f"账户已冻结: {str(e)}"
+                        result_data['is_frozen'] = True
+                        logger.info(f"❄️ 转换后连接时检测到冻结账户: {file_name}")
+                    else:
+                        result_data['error'] = f"转换后连接失败: {str(e)}"
+                    return result_data
+            else:
+                # 直接使用Session
+                session_path = os.path.splitext(file_path)[0]
+                
+                # 获取代理配置
+                proxy_dict = None
+                proxy_enabled = self.db.get_proxy_enabled() if self.db else True
+                use_proxy = config.USE_PROXY and proxy_enabled and self.proxy_manager.proxies
+                
+                if use_proxy:
+                    proxy_info = self.proxy_manager.get_next_proxy()
+                    if proxy_info:
+                        proxy_dict = self.checker.create_proxy_dict(proxy_info)
+                        logger.info(f"使用代理连接账号: {file_name}")
+                
+                try:
+                    client = TelegramClient(
+                        session_path,
+                        int(config.API_ID),
+                        str(config.API_HASH),
+                        proxy=proxy_dict,
+                        receive_updates=False  # 禁用更新接收，提升清理速度
+                    )
+                    await client.connect()
+                    
+                    if not await client.is_user_authorized():
+                        logger.warning(f"Session not authorized: {file_name}")
+                        result_data['error'] = "Session未授权"
+                        await client.disconnect()
+                        return result_data
+                except Exception as e:
+                    logger.error(f"Session connection failed for {file_name}: {e}")
+                    # 检查是否为冻结账户错误
+                    if self._is_frozen_error(e):
+                        result_data['error'] = 'FROZEN_ACCOUNT'
+                        result_data['error_message'] = f"账户已冻结: {str(e)}"
+                        result_data['is_frozen'] = True
+                        logger.info(f"❄️ 连接时检测到冻结账户: {file_name}")
+                    else:
+                        result_data['error'] = f"连接失败: {str(e)}"
+                    return result_data
+            
+            # 进度更新节流（避免触发 Telegram 限制）- 改为基于时间而非账号数量
+            last_update_time = {'value': 0}  # 上次更新的时间戳
+            PROGRESS_UPDATE_INTERVAL = 10  # 每10秒更新一次进度
+            
+            # 创建进度回调函数
+            async def update_progress(status_text):
+                current_idx = completed_count['value'] + 1
+                
+                if not progress_msg:
+                    return
+                
+                current_time = time.time()
+                time_since_last_update = current_time - last_update_time['value']
+                
+                # 节流逻辑：只在以下情况更新
+                # 1. 距离上次更新已超过10秒
+                # 2. 是第一个账户
+                # 3. 是最后一个账户
+                should_update = (
+                    time_since_last_update >= PROGRESS_UPDATE_INTERVAL or
+                    current_idx == 1 or
+                    current_idx == all_files_count
+                )
+                
+                if not should_update:
+                    return
+                
+                async with lock:
+                    try:
+                        progress_percent = int((current_idx / all_files_count) * 100)
+                        
+                        # 更新时间戳
+                        last_update_time['value'] = current_time
+                        
+                        filled = int(progress_percent / 10)
+                        empty = 10 - filled
+                        progress_bar = "█" * filled + "░" * empty
+                        
+                        status_display = status_text[:30] + '...' if len(status_text) > 30 else status_text
+                        
+                        # 计算预计完成时间
+                        elapsed_time = time.time() - start_time
+                        if current_idx > 0:
+                            avg_time_per_account = elapsed_time / current_idx
+                            remaining_accounts = all_files_count - current_idx
+                            estimated_remaining_seconds = avg_time_per_account * remaining_accounts
+                            
+                            hours = int(estimated_remaining_seconds // 3600)
+                            minutes = int((estimated_remaining_seconds % 3600) // 60)
+                            seconds = int(estimated_remaining_seconds % 60)
+                            
+                            if hours > 0:
+                                time_remaining = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+                            else:
+                                time_remaining = f"{minutes:02d}:{seconds:02d}"
+                        else:
+                            time_remaining = t(user_id, 'cleanup_initializing')
+                        
+                        message_text = (
+                            f"<b>{t(user_id, 'cleanup_in_progress')}</b>\n\n"
+                            f"{t(user_id, 'cleanup_current').format(filename=file_name)}\n"
+                            f"{t(user_id, 'cleanup_total_progress').format(current=current_idx, total=all_files_count, percent=progress_percent)}\n"
+                            f"⚙️ [{progress_bar}]\n"
+                            f"{t(user_id, 'cleanup_eta').format(time=time_remaining)}"
+                        )
+                        
+                        # 移除按钮，直接显示进度信息，减少刷新频率避免限流
+                        progress_msg.edit_text(
+                            message_text,
+                            parse_mode='HTML'
+                        )
+                    except Exception as e:
+                        # 如果是限流错误，静默处理
+                        if "too many requests" in str(e).lower() or "retry after" in str(e).lower():
+                            logger.warning(f"进度更新触发限流: {e}")
+                        pass
+            
+            # 执行清理 - 添加整体超时保护
+            try:
+                cleanup_result = await asyncio.wait_for(
+                    self._cleanup_single_account(
+                        client=client,
+                        account_name=file_name,
+                        file_path=file_path,
+                        progress_callback=update_progress,
+                        user_id=user_id
+                    ),
+                    timeout=CLEANUP_SINGLE_ACCOUNT_TIMEOUT
+                )
+            except asyncio.TimeoutError:
+                logger.error(f"账号 {file_name} 清理超时 ({CLEANUP_SINGLE_ACCOUNT_TIMEOUT}秒)")
+                cleanup_result = {
+                    'success': False,
+                    'error': f'清理超时 ({CLEANUP_SINGLE_ACCOUNT_TIMEOUT}秒)',
+                    'statistics': {},
+                    'error_details': [f'整个清理过程超时']
+                }
+            
+            # 断开客户端
+            try:
+                await client.disconnect()
+            except:
+                pass
+            
+            # 更新完成计数
+            async with lock:
+                completed_count['value'] += 1
+            
+            # 合并结果
+            result_data.update(cleanup_result)
+            return result_data
+            
+        except Exception as e:
+            logger.error(f"处理账户失败 {file_name}: {e}")
+            import traceback
+            traceback.print_exc()
+            result_data['error'] = str(e)
+            
+            if client:
+                try:
+                    await client.disconnect()
+                except:
+                    pass
+            
+            return result_data
+    
+    async def execute_cleanup(self, update, context, user_id: int):
+        """执行一键清理（并发版本）"""
+        if user_id not in self.pending_cleanup:
+            return
+        
+        task = self.pending_cleanup[user_id]
+        files = task['files']
+        file_type = task['file_type']
+        extract_dir = task['extract_dir']
+        progress_msg = task.get('progress_msg')
+        
+        results_summary = {
+            'total': len(files),
+            'success': 0,
+            'failed': 0,
+            'frozen': 0,
+            'reports': [],
+            'success_files': [],
+            'failed_files': [],
+            'frozen_files': [],
+            'detailed_results': []
+        }
+        
+        # 初始化变量，确保在 finally 块中可用
+        summary_report_path = None
+        result_zips = []
+        
+        try:
+            # 创建信号量控制并发数
+            semaphore = asyncio.Semaphore(config.CLEANUP_ACCOUNT_CONCURRENCY)
+            lock = asyncio.Lock()
+            completed_count = {'value': 0}
+            start_time = time.time()
+            
+            async def process_with_semaphore(file_info):
+                async with semaphore:
+                    return await self._process_single_account_full(
+                        file_info, file_type, progress_msg, len(files), completed_count, lock, start_time, user_id
+                    )
+            
+            # 并发处理所有账户
+            logger.info(f"开始并发清理 {len(files)} 个账户，并发数: {config.CLEANUP_ACCOUNT_CONCURRENCY}")
+            tasks = [process_with_semaphore(file_info) for file_info in files]
+            all_results = await asyncio.gather(*tasks, return_exceptions=True)
+            
+            # 汇总结果
+            for idx, result in enumerate(all_results, 1):
+                if isinstance(result, BaseException):
+                    logger.error(f"处理异常: {result}")
+                    results_summary['failed'] += 1
+                    # 从原始files列表获取文件信息，包含file_type
+                    results_summary['failed_files'].append((files[idx-1][0], files[idx-1][1], files[idx-1][0], file_type))
+                    results_summary['detailed_results'].append({
+                        'file_name': files[idx-1][1],
+                        'status': 'failed',
+                        'error': str(result)
+                    })
+                    continue
+                
+                # 保存详细结果
+                results_summary['detailed_results'].append({
+                    'file_name': result['file_name'],
+                    'status': 'frozen' if result.get('is_frozen') else ('success' if result.get('success') else 'failed'),
+                    'error': result.get('error'),
+                    'error_details': result.get('error_details', []),
+                    'statistics': result.get('statistics', {})
+                })
+                
+                # 分类统计
+                # 冻结账户直接归类为失败账户（符合issue要求）
+                # 注意：冻结账户会同时计入frozen和failed，这是有意为之：
+                # - frozen_files用于统计和报告冻结账户数量
+                # - failed_files用于将冻结账户打包到失败账户zip中
+                if result.get('is_frozen'):
+                    results_summary['frozen'] += 1
+                    results_summary['frozen_files'].append((result['file_path'], result['file_name'], result.get('original_path'), result.get('file_type')))
+                    # 冻结账户同时加入失败列表，以便打包到失败zip中
+                    results_summary['failed'] += 1
+                    results_summary['failed_files'].append((result['file_path'], result['file_name'], result.get('original_path'), result.get('file_type')))
+                    logger.info(f"❄️ 冻结账户（归类为失败）: {result['file_name']}")
+                elif result.get('success'):
+                    results_summary['success'] += 1
+                    results_summary['success_files'].append((result['file_path'], result['file_name'], result.get('original_path'), result.get('file_type')))
+                    logger.info(f"✅ 清理成功: {result['file_name']}")
+                else:
+                    results_summary['failed'] += 1
+                    results_summary['failed_files'].append((result['file_path'], result['file_name'], result.get('original_path'), result.get('file_type')))
+                    logger.info(f"❌ 清理失败: {result['file_name']}")
+            
+            # 生成详细的TXT报告
+            timestamp = datetime.now(BEIJING_TZ).strftime("%Y%m%d_%H%M%S")
+            summary_report_path = os.path.join(config.CLEANUP_REPORTS_DIR, f"cleanup_summary_{timestamp}.txt")
+            
+            with open(summary_report_path, 'w', encoding='utf-8') as f:
+                f.write("=" * 80 + "\n")
+                f.write(f"              {t(user_id, 'cleanup_report_title')}\n")
+                f.write("=" * 80 + "\n\n")
+                
+                success_rate = (results_summary['success'] / results_summary['total'] * 100) if results_summary['total'] > 0 else 0
+                frozen_rate = (results_summary['frozen'] / results_summary['total'] * 100) if results_summary['total'] > 0 else 0
+                
+                f.write(f"{t(user_id, 'cleanup_report_time')}: {timestamp}\n")
+                f.write(f"{t(user_id, 'cleanup_report_concurrency')}: {config.CLEANUP_ACCOUNT_CONCURRENCY} {t(user_id, 'cleanup_report_concurrent_accounts')}\n")
+                f.write(f"{t(user_id, 'cleanup_report_total')}: {results_summary['total']}\n")
+                f.write(f"✅ {t(user_id, 'cleanup_report_success')}: {results_summary['success']} ({success_rate:.1f}%)\n")
+                f.write(f"❄️ {t(user_id, 'cleanup_report_frozen')}: {results_summary['frozen']} ({frozen_rate:.1f}%)\n")
+                f.write(f"❌ {t(user_id, 'cleanup_report_failed')}: {results_summary['failed']}\n\n")
+                
+                # 详细结果
+                f.write("=" * 80 + "\n")
+                f.write(f"                    {t(user_id, 'cleanup_report_details')}\n")
+                f.write("=" * 80 + "\n\n")
+                
+                for idx, detail in enumerate(results_summary['detailed_results'], 1):
+                    status_icon = "✅" if detail['status'] == 'success' else ("❄️" if detail['status'] == 'frozen' else "❌")
+                    status_text = t(user_id, 'cleanup_report_status_success') if detail['status'] == 'success' else (t(user_id, 'cleanup_report_status_frozen') if detail['status'] == 'frozen' else t(user_id, 'cleanup_report_status_failed'))
+                    
+                    f.write(f"{idx}. {status_icon} {detail['file_name']} - {status_text}\n")
+                    
+                    if detail.get('error'):
+                        f.write(f"   {t(user_id, 'cleanup_report_error')} {detail['error']}\n")
+                    
+                    if detail.get('error_details'):
+                        f.write(f"   {t(user_id, 'cleanup_report_error_details')}\n")
+                        for err in detail['error_details']:
+                            f.write(f"   - {err}\n")
+                    
+                    stats = detail.get('statistics', {})
+                    if stats:
+                        f.write(f"   {t(user_id, 'cleanup_report_stats')} ")
+                        stat_parts = []
+                        if stats.get('profile_cleared'): stat_parts.append(t(user_id, 'cleanup_report_profile_cleared'))
+                        if stats.get('groups_left'): stat_parts.append(t(user_id, 'cleanup_report_groups_left').format(count=stats['groups_left']))
+                        if stats.get('channels_left'): stat_parts.append(t(user_id, 'cleanup_report_channels_left').format(count=stats['channels_left']))
+                        if stats.get('histories_deleted'): stat_parts.append(t(user_id, 'cleanup_report_histories_deleted').format(count=stats['histories_deleted']))
+                        if stats.get('contacts_deleted'): stat_parts.append(t(user_id, 'cleanup_report_contacts_deleted_label').format(count=stats['contacts_deleted']))
+                        if stat_parts:
+                            f.write(", ".join(stat_parts))
+                        f.write("\n")
+                    
+                    f.write("\n")
+                
+                # 分类汇总
+                if results_summary['success_files']:
+                    f.write("-" * 80 + "\n")
+                    f.write(f"{t(user_id, 'cleanup_report_success_list')} ({len(results_summary['success_files'])})\n")
+                    f.write("-" * 80 + "\n")
+                    for idx, file_info in enumerate(results_summary['success_files'], 1):
+                        fname = file_info[1] if len(file_info) > 1 else file_info[0]
+                        f.write(f"{idx}. ✅ {fname}\n")
+                    f.write("\n")
+                
+                if results_summary['frozen_files']:
+                    f.write("-" * 80 + "\n")
+                    f.write(f"{t(user_id, 'cleanup_report_frozen_accounts')} ({len(results_summary['frozen_files'])})\n")
+                    f.write("-" * 80 + "\n")
+                    for idx, file_info in enumerate(results_summary['frozen_files'], 1):
+                        fname = file_info[1] if len(file_info) > 1 else file_info[0]
+                        f.write(f"{idx}. ❄️ {fname}\n")
+                    f.write("\n")
+                
+                if results_summary['failed_files']:
+                    f.write("-" * 80 + "\n")
+                    f.write(f"{t(user_id, 'cleanup_report_failed_list')} ({len(results_summary['failed_files'])})\n")
+                    f.write("-" * 80 + "\n")
+                    for idx, file_info in enumerate(results_summary['failed_files'], 1):
+                        fname = file_info[1] if len(file_info) > 1 else file_info[0]
+                        f.write(f"{idx}. ❌ {fname}\n")
+                    f.write("\n")
+                
+                f.write("=" * 80 + "\n")
+                f.write(f"{t(user_id, 'cleanup_report_concurrent_mode').format(count=config.CLEANUP_ACCOUNT_CONCURRENCY)}\n")
+                f.write("=" * 80 + "\n")
+            
+            # 打包成功和失败的账户文件
+            result_zips = []
+            
+            # 打包成功清理的账户
+            if results_summary['success_files']:
+                success_zip_path = os.path.join(config.CLEANUP_REPORTS_DIR, f"cleaned_success_{timestamp}.zip")
+                with zipfile.ZipFile(success_zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+                    for file_info in results_summary['success_files']:
+                        file_path = file_info[0]
+                        file_name = file_info[1]
+                        original_path = file_info[2] if len(file_info) > 2 else file_path
+                        item_file_type = file_info[3] if len(file_info) > 3 else 'session'
+                        
+                        if item_file_type == 'tdata':
+                            # TData格式：每个账号独立打包到 手机号/tdata/... 结构
+                            # 提取手机号作为账号标识
+                            phone = extract_phone_from_tdata_path(original_path) or file_name
+                            # 去除特殊字符，确保是有效的目录名
+                            phone = str(phone).replace('.zip', '').replace('/', '_').replace('\\', '_')
+                            
+                            if os.path.isdir(original_path):
+                                # 遍历TData目录下的所有文件
+                                for root, dirs, files_in_dir in os.walk(original_path):
+                                    for file in files_in_dir:
+                                        file_full_path = os.path.join(root, file)
+                                        # 计算相对路径，保留TData目录结构
+                                        rel_path = os.path.relpath(file_full_path, os.path.dirname(original_path))
+                                        # 添加手机号前缀，格式：手机号/tdata/...
+                                        arc_path = os.path.join(phone, rel_path)
+                                        zipf.write(file_full_path, arc_path)
+                        else:
+                            # Session格式：添加session文件及相关文件
+                            if os.path.exists(file_path):
+                                zipf.write(file_path, file_name)
+                            # 如果有对应的session-journal文件也添加
+                            journal_path = file_path + '-journal'
+                            if os.path.exists(journal_path):
+                                zipf.write(journal_path, file_name + '-journal')
+                            # 如果有对应的json文件也添加
+                            json_path = os.path.splitext(file_path)[0] + '.json'
+                            if os.path.exists(json_path):
+                                zipf.write(json_path, os.path.splitext(file_name)[0] + '.json')
+                
+                result_zips.append(('success', success_zip_path, len(results_summary['success_files'])))
+            
+            # 打包失败的账户
+            if results_summary['failed_files']:
+                failed_zip_path = os.path.join(config.CLEANUP_REPORTS_DIR, f"cleaned_failed_{timestamp}.zip")
+                with zipfile.ZipFile(failed_zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+                    for file_info in results_summary['failed_files']:
+                        file_path = file_info[0]
+                        file_name = file_info[1]
+                        original_path = file_info[2] if len(file_info) > 2 else file_path
+                        item_file_type = file_info[3] if len(file_info) > 3 else 'session'
+                        
+                        if item_file_type == 'tdata':
+                            # TData格式：每个账号独立打包到 手机号/tdata/... 结构
+                            # 提取手机号作为账号标识
+                            phone = extract_phone_from_tdata_path(original_path) or file_name
+                            # 去除特殊字符，确保是有效的目录名
+                            phone = str(phone).replace('.zip', '').replace('/', '_').replace('\\', '_')
+                            
+                            if os.path.isdir(original_path):
+                                # 遍历TData目录下的所有文件
+                                for root, dirs, files_in_dir in os.walk(original_path):
+                                    for file in files_in_dir:
+                                        file_full_path = os.path.join(root, file)
+                                        # 计算相对路径，保留TData目录结构
+                                        rel_path = os.path.relpath(file_full_path, os.path.dirname(original_path))
+                                        # 添加手机号前缀，格式：手机号/tdata/...
+                                        arc_path = os.path.join(phone, rel_path)
+                                        zipf.write(file_full_path, arc_path)
+                        else:
+                            # Session格式：添加session文件及相关文件
+                            if os.path.exists(file_path):
+                                zipf.write(file_path, file_name)
+                            # 如果有对应的session-journal文件也添加
+                            journal_path = file_path + '-journal'
+                            if os.path.exists(journal_path):
+                                zipf.write(journal_path, file_name + '-journal')
+                            # 如果有对应的json文件也添加
+                            json_path = os.path.splitext(file_path)[0] + '.json'
+                            if os.path.exists(json_path):
+                                zipf.write(json_path, os.path.splitext(file_name)[0] + '.json')
+                
+                result_zips.append(('failed', failed_zip_path, len(results_summary['failed_files'])))
+            
+        except Exception as e:
+            logger.error(f"Cleanup execution failed: {e}")
+            import traceback
+            traceback.print_exc()
+            
+            # 标记清理过程失败
+            results_summary['cleanup_error'] = str(e)
+        
+        finally:
+            # 无论如何都要发送清理结果
+            try:
+                # 检查实际处理的账号数
+                actual_processed = results_summary['success'] + results_summary['failed']
+                is_complete = (actual_processed == results_summary['total'])
+                
+                # 发送完成消息
+                success_rate = (results_summary['success'] / results_summary['total'] * 100) if results_summary['total'] > 0 else 0
+                frozen_rate = (results_summary['frozen'] / results_summary['total'] * 100) if results_summary['total'] > 0 else 0
+                
+                if results_summary.get('cleanup_error'):
+                    # 清理过程出错，发送错误消息但仍尝试发送已有的结果
+                    final_text = f"""
+⚠️ <b>{t(user_id, 'cleanup_partial_complete')}</b>
+
+<b>{t(user_id, 'cleanup_already_processed')}</b>
+{t(user_id, 'cleanup_stat_total').format(count=results_summary['total'])}
+{t(user_id, 'cleanup_actual_processed').format(actual=actual_processed, total=results_summary['total'])}
+{t(user_id, 'cleanup_stat_success').format(count=results_summary['success'], percent=success_rate)}
+{t(user_id, 'cleanup_stat_frozen').format(count=results_summary['frozen'], percent=frozen_rate)}
+{t(user_id, 'cleanup_stat_failed').format(count=results_summary['failed'])}
+
+⚠️ <b>{t(user_id, 'cleanup_error_info')}</b> {results_summary['cleanup_error'][:200]}
+
+<b>{t(user_id, 'cleanup_sending_results')}</b>
+                    """
+                elif not is_complete:
+                    # 清理未完成（可能被中断）
+                    final_text = f"""
+⚠️ <b>{t(user_id, 'cleanup_incomplete')}</b>
+
+<b>{t(user_id, 'cleanup_already_processed')}</b>
+{t(user_id, 'cleanup_stat_total').format(count=results_summary['total'])}
+{t(user_id, 'cleanup_actual_processed').format(actual=actual_processed, total=results_summary['total'])}
+{t(user_id, 'cleanup_stat_success').format(count=results_summary['success'], percent=success_rate)}
+{t(user_id, 'cleanup_stat_frozen').format(count=results_summary['frozen'], percent=frozen_rate)}
+{t(user_id, 'cleanup_stat_failed').format(count=results_summary['failed'])}
+
+⚠️ {t(user_id, 'cleanup_may_interrupted')}
+
+<b>{t(user_id, 'cleanup_sending_results')}</b>
+                    """
+                else:
+                    # 清理正常完成
+                    final_text = f"""
+<b>{t(user_id, 'cleanup_complete')}</b>
+
+<b>{t(user_id, 'cleanup_statistics')}</b>
+{t(user_id, 'cleanup_stat_total').format(count=results_summary['total'])}
+{t(user_id, 'cleanup_stat_success').format(count=results_summary['success'], percent=success_rate)}
+{t(user_id, 'cleanup_stat_frozen').format(count=results_summary['frozen'], percent=frozen_rate)}
+{t(user_id, 'cleanup_stat_failed').format(count=results_summary['failed'])}
+
+<b>{t(user_id, 'cleanup_packing')}</b>
+                    """
+                
+                context.bot.send_message(
+                    chat_id=user_id,
+                    text=final_text,
+                    parse_mode='HTML'
+                )
+                
+                # 发送汇总报告（如果存在）
+                if summary_report_path and os.path.exists(summary_report_path):
+                    try:
+                        with open(summary_report_path, 'rb') as f:
+                            context.bot.send_document(
+                                chat_id=user_id,
+                                document=f,
+                                caption=t(user_id, 'cleanup_summary_report'),
+                                filename=os.path.basename(summary_report_path)
+                            )
+                    except Exception as e:
+                        logger.error(f"Failed to send summary report: {e}")
+                
+                # 发送账户ZIP文件
+                for zip_type, zip_path, count in result_zips:
+                    try:
+                        if zip_type == 'success':
+                            caption = t(user_id, 'cleanup_success_accounts').format(count=count)
+                        else:
+                            caption = t(user_id, 'cleanup_failed_accounts').format(count=count)
+                        with open(zip_path, 'rb') as f:
+                            context.bot.send_document(
+                                chat_id=user_id,
+                                document=f,
+                                caption=caption,
+                                filename=os.path.basename(zip_path)
+                            )
+                    except Exception as e:
+                        logger.error(f"Failed to send {zip_type} accounts ZIP: {e}")
+                
+                logger.info(f"✅ {t(user_id, 'cleanup_results_sent')}")
+                
+            except Exception as send_error:
+                logger.error(f"Failed to send cleanup results: {send_error}")
+                # 尝试至少发送一个错误消息
+                try:
+                    context.bot.send_message(
+                        chat_id=user_id,
+                        text=f"❌ <b>{t(user_id, 'cleanup_send_failed')}</b>\n\n{t(user_id, 'cleanup_error').format(error=str(send_error)[:200])}",
+                        parse_mode='HTML'
+                    )
+                except:
+                    pass
+            
+            # 清理任务
+            self.cleanup_cleanup_task(user_id)
+    
+    def cleanup_cleanup_task(self, user_id: int):
+        """清理一键清理任务"""
+        if user_id in self.pending_cleanup:
+            task = self.pending_cleanup[user_id]
+            if task.get('temp_dir') and os.path.exists(task['temp_dir']):
+                shutil.rmtree(task['temp_dir'], ignore_errors=True)
+            del self.pending_cleanup[user_id]
+        
+        # 清除用户状态
+        self.db.save_user(user_id, "", "", "")
+    
+    def _cleanup_user_temp_sessions(self, user_id: int):
+        """清理指定用户的临时session文件和旧上传目录
+        
+        这确保每次上传只使用当前上传的账号，不会重复登录之前的账号
+        """
+        try:
+            # 1. 清理临时session文件
+            if os.path.exists(config.SESSIONS_BAK_DIR):
+                user_prefix = f"user_{user_id}_"
+                cleaned_count = 0
+                
+                for filename in os.listdir(config.SESSIONS_BAK_DIR):
+                    if filename.startswith(user_prefix):
+                        file_path = os.path.join(config.SESSIONS_BAK_DIR, filename)
+                        try:
+                            if os.path.isfile(file_path):
+                                os.remove(file_path)
+                                cleaned_count += 1
+                                logger.info(f"🧹 清理旧临时文件: {filename}")
+                        except Exception as e:
+                            logger.warning(f"⚠️ 清理文件失败 {filename}: {e}")
+                
+                if cleaned_count > 0:
+                    logger.info(f"✅ 清理了 {cleaned_count} 个用户 {user_id} 的旧临时session文件")
+                    print(f"✅ 清理了 {cleaned_count} 个用户 {user_id} 的旧临时session文件")
+            
+            # 2. 【新增】清理用户的旧上传目录（防止累积）
+            if os.path.exists(config.UPLOADS_DIR):
+                # 匹配两种格式: task_{user_id}_batch (旧格式) 和 task_{user_id}_batch_{timestamp} (新格式)
+                old_prefix = f"task_{user_id}_batch"
+                cleaned_dirs = 0
+                
+                for dirname in os.listdir(config.UPLOADS_DIR):
+                    if dirname.startswith(old_prefix):
+                        dir_path = os.path.join(config.UPLOADS_DIR, dirname)
+                        try:
+                            if os.path.isdir(dir_path):
+                                shutil.rmtree(dir_path)
+                                cleaned_dirs += 1
+                                logger.info(f"🧹 清理旧上传目录: {dirname}")
+                        except Exception as e:
+                            logger.warning(f"⚠️ 清理目录失败 {dirname}: {e}")
+                
+                if cleaned_dirs > 0:
+                    logger.info(f"✅ 清理了 {cleaned_dirs} 个用户 {user_id} 的旧上传目录")
+                    print(f"✅ 清理了 {cleaned_dirs} 个用户 {user_id} 的旧上传目录")
+        except Exception as e:
+            logger.error(f"❌ 清理临时文件失败: {e}")
+    
+    # ================================
+    # 批量创建群组/频道功能
+    # ================================
+    
+    async def process_batch_create_upload(self, update: Update, context: CallbackContext, document):
+        """处理批量创建文件上传"""
+        user_id = update.effective_user.id
+        
+        progress_msg = self.safe_send_message(update, t(user_id, 'processing_file'), 'HTML')
+        if not progress_msg:
+            return
+        
+        temp_zip = None
+        try:
+            # 【关键修复】在处理新上传前，清理该用户的旧临时session文件
+            # 这确保每次上传只使用当前上传的账号，不会重复登录之前的账号
+            self._cleanup_user_temp_sessions(user_id)
+            
+            # 【关键修复】为每次上传创建唯一的任务ID，确保完全隔离
+            # 使用时间戳确保每次上传都有独立的目录，不会混淆
+            unique_task_id = f"{user_id}_batch_{int(time.time() * 1000)}"
+            
+            # 下载文件
+            temp_dir = tempfile.mkdtemp(prefix="batch_create_")
+            temp_zip = os.path.join(temp_dir, document.file_name)
+            document.get_file().download(temp_zip)
+            
+            # 扫描文件 - 使用唯一任务ID，确保只提取当前上传的账号
+            files, extract_dir, file_type = self.processor.scan_zip_file(temp_zip, user_id, unique_task_id)
+            
+            if not files:
+                self.safe_edit_message_text(progress_msg, "❌ <b>未找到有效文件</b>\n\n请确保ZIP包含Session或TData格式的文件", parse_mode='HTML')
+                return
+            
+            self.safe_edit_message_text(
+                progress_msg,
+                t(user_id, 'batch_create_found_files').format(count=len(files)) + f"\n\n{t(user_id, 'batch_create_verifying')}",
+                parse_mode='HTML'
+            )
+            
+            # 验证账号
+            accounts = []
+            valid_count = 0
+            total_remaining = 0
+            
+            # 获取设备参数和代理
+            device_config = self.device_loader.get_random_device_config()
+            api_id = device_config.get('api_id', config.API_ID)
+            api_hash = device_config.get('api_hash', config.API_HASH)
+            
+            for i, (file_path, file_name) in enumerate(files):
+                # 更新进度
+                if (i + 1) % 5 == 0:
+                    self.safe_edit_message_text(
+                        progress_msg,
+                        f"{t(user_id, 'batch_create_verifying')}\n\n{t(user_id, 'batch_create_verifying_progress').format(done=i + 1, total=len(files))}",
+                        parse_mode='HTML'
+                    )
+                
+                # 创建账号信息
+                account = BatchAccountInfo(
+                    session_path=file_path,
+                    file_name=file_name,
+                    file_type=file_type
+                )
+                
+                # 获取代理
+                proxy_dict = None
+                if self.proxy_manager.is_proxy_mode_active(self.db):
+                    proxy_info = self.proxy_manager.get_next_proxy()
+                    if proxy_info:
+                        proxy_dict = (
+                            socks.SOCKS5 if proxy_info['type'] == 'socks5' else socks.HTTP,
+                            proxy_info['host'],
+                            proxy_info['port'],
+                            True,
+                            proxy_info.get('username'),
+                            proxy_info.get('password')
+                        )
+                
+                # 验证账号（传入user_id以确保临时文件隔离）
+                is_valid, error = await self.batch_creator.validate_account(
+                    account, api_id, api_hash, proxy_dict, user_id
+                )
+                
+                accounts.append(account)
+                
+                if is_valid:
+                    valid_count += 1
+                    total_remaining += account.daily_remaining
+            
+            # 保存任务信息
+            self.pending_batch_create[user_id] = {
+                'accounts': accounts,
+                'total_accounts': len(accounts),
+                'valid_accounts': valid_count,
+                'total_remaining': total_remaining,
+                'temp_dir': temp_dir,
+                'extract_dir': extract_dir
+            }
+            
+            # 显示验证结果
+            text = f"""
+{t(user_id, 'batch_create_verify_complete')}
+
+<b>{t(user_id, 'batch_create_statistics')}</b>
+{t(user_id, 'batch_create_total_accounts').format(count=len(accounts))}
+{t(user_id, 'batch_create_valid_accounts').format(count=valid_count)}
+{t(user_id, 'batch_create_invalid_accounts').format(count=len(accounts) - valid_count)}
+{t(user_id, 'batch_create_can_create_today').format(count=total_remaining)}
+
+<b>{t(user_id, 'batch_create_next_step')}</b>
+{t(user_id, 'batch_create_select_type')}
+"""
+            
+            keyboard = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton(f"📱 {t(user_id, 'batch_create_btn_group')}", callback_data="batch_create_type_group"),
+                    InlineKeyboardButton(f"📢 {t(user_id, 'batch_create_btn_channel')}", callback_data="batch_create_type_channel")
+                ],
+                [InlineKeyboardButton(f"❌ {t(user_id, 'batch_create_btn_cancel')}", callback_data="batch_create_cancel")]
+            ])
+            
+            self.safe_edit_message_text(progress_msg, text, parse_mode='HTML', reply_markup=keyboard)
+            
+        except Exception as e:
+            logger.error(f"Batch create upload failed: {e}")
+            import traceback
+            traceback.print_exc()
+            
+            self.safe_edit_message_text(
+                progress_msg,
+                f"❌ <b>处理失败</b>\n\n错误: {str(e)}",
+                parse_mode='HTML'
+            )
+            
+            # 清理
+            if temp_zip and os.path.exists(os.path.dirname(temp_zip)):
+                shutil.rmtree(os.path.dirname(temp_zip), ignore_errors=True)
+    
+    def handle_batch_create_start(self, query):
+        """处理批量创建开始"""
+        query.answer()
+        user_id = query.from_user.id
+        
+        # 检查功能是否启用
+        if not config.ENABLE_BATCH_CREATE or self.batch_creator is None:
+            self.safe_edit_message(query, t(user_id, 'batch_create_feature_disabled'))
+            return
+        
+        # 检查会员权限
+        is_member, level, expiry = self.db.check_membership(user_id)
+        if not is_member and not self.db.is_admin(user_id):
+            self.safe_edit_message(
+                query,
+                "⚠️ 批量创建功能需要会员权限\n\n请先开通会员",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("💳 开通会员", callback_data="vip_menu"),
+                    InlineKeyboardButton(t(user_id, 'btn_back'), callback_data="back_to_main")
+                ]])
+            )
+            return
+        
+        text = f"""
+{t(user_id, 'batch_create_title')}
+
+<b>{t(user_id, 'batch_create_features')}</b>
+{t(user_id, 'batch_create_feature1')}
+{t(user_id, 'batch_create_feature2')}
+{t(user_id, 'batch_create_feature3')}
+{t(user_id, 'batch_create_feature4').replace('10', str(config.BATCH_CREATE_DAILY_LIMIT))}
+{t(user_id, 'batch_create_feature5')}
+{t(user_id, 'batch_create_feature6')}
+{t(user_id, 'batch_create_feature7')}
+
+<b>{t(user_id, 'batch_create_steps')}</b>
+{t(user_id, 'batch_create_step1')}
+{t(user_id, 'batch_create_step2')}
+{t(user_id, 'batch_create_step3')}
+{t(user_id, 'batch_create_step4')}
+{t(user_id, 'batch_create_step5')}
+
+<b>{t(user_id, 'batch_create_notes')}</b>
+{t(user_id, 'batch_create_note1')}
+{t(user_id, 'batch_create_note2')}
+{t(user_id, 'batch_create_note3')}
+
+<b>{t(user_id, 'batch_create_upload_prompt')}</b>
+{t(user_id, 'batch_create_supported_formats')}
+"""
+        
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton(t(user_id, 'btn_back'), callback_data="back_to_main")
+        ]])
+        
+        self.safe_edit_message(query, text, parse_mode='HTML', reply_markup=keyboard)
+        
+        # 设置用户状态
+        self.db.save_user(user_id, "", "", "batch_create_upload")
+    
+    def handle_batch_create_callbacks(self, update: Update, context: CallbackContext, query, data: str):
+        """处理批量创建回调"""
+        user_id = query.from_user.id
+        
+        if data == "batch_create_noop":
+            # 这是进度按钮的空操作回调
+            query.answer("实时进度更新中...")
+            return
+        elif data == "batch_create_type_group":
+            self.handle_batch_create_select_type(query, user_id, "group")
+        elif data == "batch_create_type_channel":
+            self.handle_batch_create_select_type(query, user_id, "channel")
+        elif data == "batch_create_skip_admin":
+            query.answer()
+            if user_id in self.pending_batch_create:
+                self.pending_batch_create[user_id]['admin_username'] = ""
+                fake_update = self._create_fake_update(user_id)
+                self._ask_for_group_names(fake_update, user_id)
+        elif data == "batch_create_username_custom":
+            query.answer()
+            if user_id in self.pending_batch_create:
+                self.pending_batch_create[user_id]['username_mode'] = 'custom'
+                text = f"""
+<b>{t(user_id, 'batch_create_custom_title')}</b>
+
+{t(user_id, 'batch_create_custom_prompt')}
+
+<b>{t(user_id, 'batch_create_step2_format')}</b>{t(user_id, 'batch_create_custom_format')}
+
+<b>{t(user_id, 'batch_create_custom_example')}</b>
+<code>tech_community_001
+programming_hub
+game_lovers_group</code>
+
+{t(user_id, 'batch_create_custom_tip1')}
+{t(user_id, 'batch_create_custom_tip2')}
+"""
+                keyboard = InlineKeyboardMarkup([
+                    [InlineKeyboardButton(f"◀️ {t(user_id, 'batch_create_btn_back')}", callback_data="batch_create_cancel")]
+                ])
+                query.edit_message_text(text, parse_mode='HTML', reply_markup=keyboard)
+                self.db.save_user(user_id, "", "", "batch_create_usernames")
+        elif data == "batch_create_username_auto":
+            query.answer()
+            if user_id in self.pending_batch_create:
+                self.pending_batch_create[user_id]['username_mode'] = 'auto'
+                self.pending_batch_create[user_id]['custom_usernames'] = []
+                fake_update = self._create_fake_update(user_id)
+                self._show_batch_create_confirm(fake_update, user_id)
+        elif data == "batch_create_confirm":
+            self.handle_batch_create_execute(update, context, query, user_id)
+        elif data == "batch_create_cancel":
+            query.answer()
+            if user_id in self.pending_batch_create:
+                del self.pending_batch_create[user_id]
+            self.show_main_menu(update, user_id)
+    
+    def handle_batch_create_select_type(self, query, user_id: int, creation_type: str):
+        """选择创建类型"""
+        query.answer()
+        
+        if user_id not in self.pending_batch_create:
+            self.safe_edit_message(query, "❌ 会话已过期，请重新开始")
+            return
+        
+        task = self.pending_batch_create[user_id]
+        task['creation_type'] = creation_type
+        
+        type_name_key = 'batch_create_group_title' if creation_type == "group" else 'batch_create_channel_title'
+        example_key = 'batch_create_step1_example' if creation_type == "group" else 'batch_create_step1_example_channel'
+        
+        text = f"""
+{t(user_id, type_name_key)}
+
+<b>{t(user_id, 'batch_create_account_info')}</b>
+{t(user_id, 'batch_create_total_accounts').format(count=task['total_accounts'])}
+{t(user_id, 'batch_create_valid_accounts').format(count=task['valid_accounts'])}
+{t(user_id, 'batch_create_can_create_today').format(count=task['total_remaining'])}
+
+<b>{t(user_id, 'batch_create_step1_title')}</b>
+
+{t(user_id, 'batch_create_step1_prompt')}
+
+{t(user_id, example_key)}
+"""
+        
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton(f"◀️ {t(user_id, 'batch_create_btn_back')}", callback_data="batch_create_cancel")]
+        ])
+        
+        self.safe_edit_message(query, text, parse_mode='HTML', reply_markup=keyboard)
+        self.db.save_user(user_id, "", "", "batch_create_count")
+    
+    def handle_batch_create_count_input(self, update: Update, context: CallbackContext, user_id: int, text: str):
+        """处理每账号创建数量输入"""
+        if user_id not in self.pending_batch_create:
+            self.safe_send_message(update, t(user_id, 'batch_create_session_expired_restart'))
+            return
+        
+        task = self.pending_batch_create[user_id]
+        
+        try:
+            count = int(text.strip())
+            if count < 1 or count > 10:
+                self.safe_send_message(update, t(user_id, 'batch_create_count_range_error'))
+                return
+            
+            task['count_per_account'] = count
+            
+            count_set_key = 'batch_create_count_set_group' if task['creation_type'] == 'group' else 'batch_create_count_set_channel'
+            
+            text = f"""
+{t(user_id, count_set_key).format(count=count)}
+
+<b>{t(user_id, 'batch_create_step2_title')}</b>
+
+{t(user_id, 'batch_create_step2_prompt')}
+
+<b>{t(user_id, 'batch_create_step2_format')}</b>
+{t(user_id, 'batch_create_step2_format1')}
+{t(user_id, 'batch_create_step2_format2')}
+
+<b>{t(user_id, 'batch_create_step2_example')}</b>
+<code>admin1
+admin2
+admin3</code>
+
+{t(user_id, 'batch_create_step2_tip1')}
+{t(user_id, 'batch_create_step2_tip2')}
+{t(user_id, 'batch_create_step2_tip3')}
+"""
+            
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton(f"⏭️ {t(user_id, 'batch_create_btn_skip')}", callback_data="batch_create_skip_admin")],
+                [InlineKeyboardButton(f"◀️ {t(user_id, 'batch_create_btn_back')}", callback_data="batch_create_cancel")]
+            ])
+            
+            self.safe_send_message(update, text, parse_mode='HTML', reply_markup=keyboard)
+            self.db.save_user(user_id, "", "", "batch_create_admin")
+            
+        except ValueError:
+            self.safe_send_message(update, "❌ 请输入有效的数字（1-10）")
+    
+    def handle_batch_create_admin_input(self, update: Update, context: CallbackContext, user_id: int, text: str):
+        """处理管理员用户名输入（支持多个管理员，每行一个）"""
+        if user_id not in self.pending_batch_create:
+            self.safe_send_message(update, "❌ 会话已过期，请重新开始")
+            return
+        
+        task = self.pending_batch_create[user_id]
+        
+        text = text.strip()
+        if text.lower() in ['跳过', '无', 'skip', 'none', '']:
+            task['admin_usernames'] = []
+            task['admin_username'] = ""  # 向后兼容
+        else:
+            # 解析多个管理员（每行一个）
+            lines = text.split('\n')
+            admin_usernames = []
+            for line in lines:
+                line = line.strip()
+                if line and line.lower() not in ['跳过', '无', 'skip', 'none']:
+                    # 移除 @ 前缀
+                    admin_username = line.lstrip('@')
+                    if admin_username:
+                        admin_usernames.append(admin_username)
+            
+            task['admin_usernames'] = admin_usernames
+            # 向后兼容：保存第一个管理员
+            task['admin_username'] = admin_usernames[0] if admin_usernames else ""
+        
+        self._ask_for_group_names(update, user_id)
+    
+    def _create_fake_update(self, user_id: int):
+        """创建一个假的update对象用于内部调用"""
+        return type('obj', (object,), {
+            'effective_chat': type('obj', (object,), {'id': user_id})(),
+            'effective_user': type('obj', (object,), {'id': user_id})(),
+            'message': None  # 设置为None，强制使用bot.send_message而不是reply_text
+        })()
+    
+    def _ask_for_group_names(self, update: Update, user_id: int):
+        """询问群组名称和简介"""
+        task = self.pending_batch_create[user_id]
+        
+        total_to_create = task['valid_accounts'] * task['count_per_account']
+        
+        admin_usernames = task.get('admin_usernames', [])
+        admin_display = ', '.join([f"@{u}" for u in admin_usernames]) if admin_usernames else t(user_id, 'batch_create_admins_none')
+        
+        step3_title_key = 'batch_create_step3_title_group' if task['creation_type'] == 'group' else 'batch_create_step3_title_channel'
+        step3_prompt_key = 'batch_create_step3_prompt' if task['creation_type'] == 'group' else 'batch_create_step3_prompt_channel'
+        step3_format_key = 'batch_create_step3_format_group' if task['creation_type'] == 'group' else 'batch_create_step3_format_channel'
+        
+        text = f"""
+{t(user_id, 'batch_create_admins_set').format(admins=admin_display)}
+<i>{t(user_id, 'batch_create_admins_count').format(count=len(admin_usernames))}</i>
+
+<b>{t(user_id, step3_title_key)}</b>
+
+{t(user_id, step3_prompt_key)}
+
+<b>{t(user_id, 'batch_create_step3_format')}</b>
+<code>{t(user_id, step3_format_key)}</code>
+
+{t(user_id, 'batch_create_step3_tip1')}
+{t(user_id, 'batch_create_step3_tip2').format(count=total_to_create)}
+{t(user_id, 'batch_create_step3_tip3')}
+
+<b>{t(user_id, 'batch_create_step3_upload')}</b>
+"""
+        
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton(f"◀️ {t(user_id, 'batch_create_btn_back')}", callback_data="batch_create_cancel")]
+        ])
+        
+        self.safe_send_message(update, text, parse_mode='HTML', reply_markup=keyboard)
+        self.db.save_user(user_id, "", "", "batch_create_names")
+    
+    def handle_batch_create_names_input(self, update: Update, context: CallbackContext, user_id: int, text: str):
+        """处理群组名称和简介输入"""
+        if user_id not in self.pending_batch_create:
+            self.safe_send_message(update, "❌ 会话已过期，请重新开始")
+            return
+        
+        task = self.pending_batch_create[user_id]
+        
+        try:
+            lines = text.strip().split('\n')
+            group_names = []
+            group_descriptions = []
+            
+            for line in lines:
+                line = line.strip()
+                if not line:
+                    continue
+                
+                if '|' in line:
+                    parts = line.split('|', 1)
+                    name = parts[0].strip()
+                    desc = parts[1].strip() if len(parts) > 1 else ""
+                else:
+                    name = line
+                    desc = ""
+                
+                if name:
+                    group_names.append(name)
+                    group_descriptions.append(desc)
+            
+            if not group_names:
+                self.safe_send_message(update, "❌ 未找到有效的名称，请重新输入")
+                return
+            
+            task['group_names'] = group_names
+            task['group_descriptions'] = group_descriptions
+            
+            names_saved_key = 'batch_create_names_saved_group' if task['creation_type'] == 'group' else 'batch_create_names_saved_channel'
+            step4_title_key = 'batch_create_step4_title_group' if task['creation_type'] == 'group' else 'batch_create_step4_title_channel'
+            
+            text = f"""
+{t(user_id, names_saved_key).format(count=len(group_names))}
+
+<b>{t(user_id, step4_title_key)}</b>
+
+{t(user_id, 'batch_create_step4_prompt')}
+
+{t(user_id, 'batch_create_step4_option1')}
+{t(user_id, 'batch_create_step4_option2')}
+
+{t(user_id, 'batch_create_step4_tip1')}
+{t(user_id, 'batch_create_step4_tip2')}
+"""
+            
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton(f"📝 {t(user_id, 'batch_create_btn_custom')}", callback_data="batch_create_username_custom")],
+                [InlineKeyboardButton(f"🎲 {t(user_id, 'batch_create_btn_auto')}", callback_data="batch_create_username_auto")],
+                [InlineKeyboardButton(f"◀️ {t(user_id, 'batch_create_btn_back')}", callback_data="batch_create_cancel")]
+            ])
+            
+            self.safe_send_message(update, text, parse_mode='HTML', reply_markup=keyboard)
+            
+        except Exception as e:
+            self.safe_send_message(update, f"❌ 解析失败：{str(e)}")
+    
+    def handle_batch_create_usernames_input(self, update: Update, context: CallbackContext, user_id: int, text: str):
+        """处理自定义用户名输入"""
+        if user_id not in self.pending_batch_create:
+            self.safe_send_message(update, "❌ 会话已过期，请重新开始")
+            return
+        
+        task = self.pending_batch_create[user_id]
+        
+        try:
+            lines = text.strip().split('\n')
+            custom_usernames = []
+            
+            for line in lines:
+                line = line.strip()
+                if not line:
+                    continue
+                
+                # 移除 @ 前缀
+                username = line.lstrip('@')
+                if username:
+                    custom_usernames.append(username)
+            
+            if not custom_usernames:
+                self.safe_send_message(update, "❌ 未找到有效的用户名，请重新输入")
+                return
+            
+            task['custom_usernames'] = custom_usernames
+            
+            # 显示确认信息
+            self._show_batch_create_confirm(update, user_id)
+            
+        except Exception as e:
+            self.safe_send_message(update, f"❌ 解析失败：{str(e)}")
+    
+    def _show_batch_create_confirm(self, update: Update, user_id: int):
+        """显示最终确认信息"""
+        if user_id not in self.pending_batch_create:
+            return
+        
+        task = self.pending_batch_create[user_id]
+        
+        total_to_create = task['valid_accounts'] * task['count_per_account']
+        
+        username_mode_text = t(user_id, 'batch_create_confirm_link_auto') if task.get('username_mode', 'auto') == 'auto' else t(user_id, 'batch_create_confirm_link_custom')
+        
+        admin_usernames = task.get('admin_usernames', [])
+        if admin_usernames:
+            admin_text = t(user_id, 'batch_create_confirm_admins').format(
+                count=len(admin_usernames),
+                admins=', '.join([f'@{u}' for u in admin_usernames[:3]]) + ('...' if len(admin_usernames) > 3 else '')
+            )
+        else:
+            admin_text = t(user_id, 'batch_create_confirm_admins').format(count=0, admins=t(user_id, 'batch_create_admins_none'))
+        
+        type_key = 'batch_create_confirm_type_group' if task['creation_type'] == 'group' else 'batch_create_confirm_type_channel'
+        
+        text = f"""
+{t(user_id, 'batch_create_confirm_title')}
+
+<b>{t(user_id, type_key)}</b>
+
+<b>{t(user_id, 'batch_create_confirm_account_stats')}</b>
+{t(user_id, 'batch_create_confirm_valid_count').format(count=task['valid_accounts'])}
+{t(user_id, 'batch_create_confirm_per_account').format(count=task['count_per_account'])}
+{t(user_id, 'batch_create_confirm_total_estimate').format(count=total_to_create)}
+
+<b>{t(user_id, 'batch_create_confirm_config')}</b>
+{admin_text}
+{t(user_id, 'batch_create_confirm_names').format(count=len(task.get('group_names', [])))}
+{username_mode_text}
+
+<b>{t(user_id, 'batch_create_confirm_concurrency')}</b>
+{t(user_id, 'batch_create_confirm_concurrent_accounts').format(count=min(task['valid_accounts'], 10))}
+{t(user_id, 'batch_create_confirm_threads').format(count=10)}
+
+{t(user_id, 'batch_create_confirm_important')}
+{t(user_id, 'batch_create_confirm_tip1')}
+{t(user_id, 'batch_create_confirm_tip2')}
+{t(user_id, 'batch_create_confirm_tip3')}
+{t(user_id, 'batch_create_confirm_tip4')}
+
+<b>{t(user_id, 'batch_create_confirm_question')}</b>
+"""
+        
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton(f"✅ {t(user_id, 'batch_create_btn_confirm')}", callback_data="batch_create_confirm")],
+            [InlineKeyboardButton(f"❌ {t(user_id, 'batch_create_btn_cancel')}", callback_data="batch_create_cancel")]
+        ])
+        
+        self.safe_send_message(update, text, parse_mode='HTML', reply_markup=keyboard)
+    
+    def process_batch_create_names_file(self, update: Update, context: CallbackContext, document, user_id: int):
+        """处理群组名称文件上传"""
+        if user_id not in self.pending_batch_create:
+            self.safe_send_message(update, "❌ 会话已过期，请重新开始")
+            return
+        
+        try:
+            # 下载文件
+            file = document.get_file()
+            temp_file = tempfile.NamedTemporaryFile(mode='w+', delete=False, suffix='.txt', encoding='utf-8')
+            file.download(temp_file.name)
+            temp_file.close()
+            
+            # 读取文件内容
+            with open(temp_file.name, 'r', encoding='utf-8') as f:
+                content = f.read()
+            
+            # 清理临时文件
+            os.unlink(temp_file.name)
+            
+            # 使用现有的处理逻辑
+            fake_update = self._create_fake_update(user_id)
+            self.handle_batch_create_names_input(fake_update, context, user_id, content)
+            
+        except Exception as e:
+            logger.error(f"处理名称文件失败: {e}")
+            self.safe_send_message(update, f"❌ 文件处理失败：{str(e)}")
+    
+    def process_batch_create_usernames_file(self, update: Update, context: CallbackContext, document, user_id: int):
+        """处理用户名文件上传"""
+        if user_id not in self.pending_batch_create:
+            self.safe_send_message(update, "❌ 会话已过期，请重新开始")
+            return
+        
+        try:
+            # 下载文件
+            file = document.get_file()
+            temp_file = tempfile.NamedTemporaryFile(mode='w+', delete=False, suffix='.txt', encoding='utf-8')
+            file.download(temp_file.name)
+            temp_file.close()
+            
+            # 读取文件内容
+            with open(temp_file.name, 'r', encoding='utf-8') as f:
+                content = f.read()
+            
+            # 清理临时文件
+            os.unlink(temp_file.name)
+            
+            # 使用现有的处理逻辑
+            fake_update = self._create_fake_update(user_id)
+            self.handle_batch_create_usernames_input(fake_update, context, user_id, content)
+            
+        except Exception as e:
+            logger.error(f"处理用户名文件失败: {e}")
+            self.safe_send_message(update, f"❌ 文件处理失败：{str(e)}")
+    
+
+    
+    def handle_batch_create_execute(self, update: Update, context: CallbackContext, query, user_id: int):
+        """执行批量创建"""
+        query.answer("⏳ 开始创建...")
+        
+        if user_id not in self.pending_batch_create:
+            self.safe_edit_message(query, t(user_id, 'batch_create_session_expired'))
+            return
+        
+        task = self.pending_batch_create[user_id]
+        
+        # 在新线程中执行
+        def execute():
+            try:
+                self._execute_batch_create(update, context, user_id, task)
+            except Exception as e:
+                logger.error(f"Batch creation failed: {e}")
+                import traceback
+                traceback.print_exc()
+                context.bot.send_message(
+                    chat_id=user_id,
+                    text=f"{t(user_id, 'batch_create_failed')}\n\n{t(user_id, 'batch_create_error').format(error=str(e))}",
+                    parse_mode='HTML'
+                )
+            finally:
+                if user_id in self.pending_batch_create:
+                    del self.pending_batch_create[user_id]
+                self.db.save_user(user_id, "", "", "")
+        
+        thread = threading.Thread(target=execute, daemon=True)
+        thread.start()
+        
+        self.safe_edit_message(
+            query,
+            f"{t(user_id, 'batch_create_creating')}\n\n{t(user_id, 'batch_create_wait_report')}",
+            parse_mode='HTML'
+        )
+    
+    def _execute_batch_create(self, update: Update, context: CallbackContext, user_id: int, task: Dict):
+        """实际执行批量创建"""
+        import asyncio
+        
+        accounts = task['accounts']
+        creation_type = task['creation_type']
+        
+        # 构建配置
+        batch_config = BatchCreationConfig(
+            creation_type=creation_type,
+            count_per_account=task['count_per_account'],
+            admin_username=task.get('admin_username', ''),  # 向后兼容
+            admin_usernames=task.get('admin_usernames', []),  # 新增：支持多个管理员
+            group_names=task.get('group_names', []),
+            group_descriptions=task.get('group_descriptions', []),
+            username_mode=task.get('username_mode', 'auto'),
+            custom_usernames=task.get('custom_usernames', [])
+        )
+        
+        # 创建进度消息（使用内联按钮）
+        total_to_create = task['valid_accounts'] * task['count_per_account']
+        
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton(t(user_id, 'batch_create_btn_view_log'), callback_data="batch_create_noop")]
+        ])
+        
+        progress_msg = context.bot.send_message(
+            chat_id=user_id,
+            text=f"{t(user_id, 'batch_create_starting')}\n\n{t(user_id, 'batch_create_progress').format(done=0, total=total_to_create, percent=0)}\n{t(user_id, 'batch_create_status_preparing')}",
+            parse_mode='HTML',
+            reply_markup=keyboard
+        )
+        
+        # 执行批量创建
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
+        last_update_count = 0
+        
+        def progress_callback(current, total, message):
+            nonlocal last_update_count
+            # 每5个更新一次，或者是最后一个
+            if current - last_update_count >= 5 or current == total:
+                try:
+                    progress = int(current / total * 100)
+                    keyboard = InlineKeyboardMarkup([
+                        [InlineKeyboardButton(t(user_id, 'batch_create_btn_view_log'), callback_data="batch_create_noop")]
+                    ])
+                    logger.info(f"📊 更新进度: {current}/{total} ({progress}%)")
+                    print(f"📊 更新进度: {current}/{total} ({progress}%)", flush=True)
+                    
+                    context.bot.edit_message_text(
+                        chat_id=user_id,
+                        message_id=progress_msg.message_id,
+                        text=f"{t(user_id, 'batch_create_starting')}\n\n{t(user_id, 'batch_create_progress').format(done=current, total=total, percent=progress)}\n{message}",
+                        parse_mode='HTML',
+                        reply_markup=keyboard
+                    )
+                    last_update_count = current
+                except Exception as e:
+                    logger.warning(f"⚠️ 更新进度消息失败: {e}")
+                    print(f"⚠️ 更新进度消息失败: {e}", flush=True)
+        
+        try:
+            # 批量创建
+            logger.info(f"📊 开始批量创建 - 用户ID: {user_id}")
+            print(f"📊 开始批量创建 - 用户ID: {user_id}", flush=True)
+            
+            results = []
+            valid_accounts = [acc for acc in accounts if acc.is_valid and acc.daily_remaining > 0]
+            
+            logger.info(f"📋 有效账号数: {len(valid_accounts)}")
+            print(f"📋 有效账号数: {len(valid_accounts)}", flush=True)
+            
+            # 限制并发为10个账号
+            batch_size = min(len(valid_accounts), config.BATCH_CREATE_CONCURRENT)
+            logger.info(f"⚡ 批次大小: {batch_size} 个账号并发")
+            print(f"⚡ 批次大小: {batch_size} 个账号并发", flush=True)
+            
+            # 计算每个账号需要创建多少个
+            count_per_account = batch_config.count_per_account
+            logger.info(f"🔢 每账号创建数: {count_per_account}")
+            print(f"🔢 每账号创建数: {count_per_account}", flush=True)
+            
+            # 为每个账号创建指定数量的群组/频道
+            # 策略：10个账号并发处理，每个账号内的创建串行并添加延迟
+            
+            # 用于异步安全的结果收集和进度更新
+            results_lock = asyncio.Lock()
+            
+            async def process_account(account, account_idx, start_idx):
+                """为单个账号创建多个群组/频道（内部串行+延迟）"""
+                account_results = []
+                
+                for j in range(count_per_account):
+                    creation_idx = start_idx + j
+                    if creation_idx >= total_to_create:
+                        break
+                    
+                    logger.info(f"➕ 账号 {account.phone} 创建任务 #{creation_idx+1}/{total_to_create}")
+                    print(f"➕ 账号 {account.phone} 创建任务 #{creation_idx+1}/{total_to_create}", flush=True)
+                    
+                    # 执行单个创建任务
+                    result = await self.batch_creator.create_single_new(
+                        account,
+                        batch_config,
+                        creation_idx
+                    )
+                    account_results.append(result)
+                    
+                    # 异步安全地添加到总结果并更新进度
+                    async with results_lock:
+                        results.append(result)
+                        progress_callback(len(results), total_to_create, t(user_id, 'batch_create_status_completed').format(count=len(results)))
+                    
+                    # 检查是否是账号冻结错误，如果是则立即停止该账号的后续创建
+                    if result.status == 'failed' and result.error and 'FROZEN_METHOD_INVALID' in result.error:
+                        logger.warning(f"🛑 账号 {account.phone} 已冻结 (FROZEN_METHOD_INVALID)，停止该账号的后续创建")
+                        print(f"🛑 账号 {account.phone} 已冻结 (FROZEN_METHOD_INVALID)，停止该账号的后续创建", flush=True)
+                        # 标记剩余任务为跳过
+                        for k in range(j + 1, count_per_account):
+                            skipped_idx = start_idx + k
+                            if skipped_idx >= total_to_create:
+                                break
+                            skipped_result = BatchCreationResult(
+                                account_name=account.file_name,
+                                phone=account.phone or "未知",
+                                creation_type=batch_config.creation_type,
+                                name="",
+                                status='skipped',
+                                error=t(user_id, 'batch_create_account_frozen_skipped')
+                            )
+                            account_results.append(skipped_result)
+                            async with results_lock:
+                                results.append(skipped_result)
+                                progress_callback(len(results), total_to_create, t(user_id, 'batch_create_status_completed').format(count=len(results)))
+                        break
+                    
+                    # 在该账号的每次创建之后添加配置的延迟（避免触发Telegram频率限制）
+                    # 注意：只有不是最后一次创建时才延迟
+                    if j < count_per_account - 1:
+                        delay = random.uniform(config.BATCH_CREATE_MIN_INTERVAL, config.BATCH_CREATE_MAX_INTERVAL)
+                        logger.info(f"⏳ 账号 {account.phone} 创建间隔：等待 {delay:.1f} 秒...")
+                        print(f"⏳ 账号 {account.phone} 创建间隔：等待 {delay:.1f} 秒...", flush=True)
+                        await asyncio.sleep(delay)
+                
+                # 统计该账号结果
+                account_success = sum(1 for r in account_results if r.status == 'success')
+                account_failed = sum(1 for r in account_results if r.status == 'failed')
+                logger.info(f"✅ 账号 {account.phone} 完成: 成功 {account_success}, 失败 {account_failed}")
+                print(f"✅ 账号 {account.phone} 完成: 成功 {account_success}, 失败 {account_failed}", flush=True)
+                
+                return account_results
+            
+            # 异步批量处理函数
+            async def run_batch_creation():
+                """异步执行批量创建"""
+                nonlocal results
+                
+                # 分批处理账号（每批最多10个账号并发）
+                account_idx = 0
+                creation_idx = 0
+                
+                while account_idx < len(valid_accounts) and creation_idx < total_to_create:
+                    # 确定本批次的账号数量
+                    batch_end_idx = min(account_idx + batch_size, len(valid_accounts))
+                    batch_accounts = valid_accounts[account_idx:batch_end_idx]
+                    
+                    logger.info(f"🚀 启动批次: {len(batch_accounts)} 个账号并发处理")
+                    print(f"🚀 启动批次: {len(batch_accounts)} 个账号并发处理", flush=True)
+                    
+                    # 创建并发任务：每个账号一个任务
+                    account_tasks = []
+                    for i, account in enumerate(batch_accounts):
+                        logger.info(f"👤 准备账号: {account.phone} (批次内索引 {i+1}/{len(batch_accounts)})")
+                        print(f"👤 准备账号: {account.phone} (批次内索引 {i+1}/{len(batch_accounts)})", flush=True)
+                        
+                        # 每个账号的起始索引
+                        account_start_idx = creation_idx
+                        account_tasks.append(process_account(account, account_idx + i, account_start_idx))
+                        # 为下一个账号更新起始索引
+                        creation_idx += count_per_account
+                    
+                    # 并发执行本批次的所有账号任务
+                    batch_results = await asyncio.gather(*account_tasks)
+                    
+                    # 更新账号索引
+                    account_idx = batch_end_idx
+                    
+                    # 批次统计
+                    total_batch_success = sum(sum(1 for r in acc_results if r.status == 'success') for acc_results in batch_results)
+                    total_batch_failed = sum(sum(1 for r in acc_results if r.status == 'failed') for acc_results in batch_results)
+                    logger.info(f"✅ 批次完成: 成功 {total_batch_success}, 失败 {total_batch_failed}")
+                    print(f"✅ 批次完成: 成功 {total_batch_success}, 失败 {total_batch_failed}", flush=True)
+            
+            # 运行异步批量创建
+            loop.run_until_complete(run_batch_creation())
+            
+            # 关闭客户端
+            async def disconnect_clients():
+                for account in accounts:
+                    if account.client:
+                        try:
+                            await account.client.disconnect()
+                        except Exception as e:
+                            logger.warning(f"⚠️ 关闭客户端失败: {e}")
+            
+            loop.run_until_complete(disconnect_clients())
+            
+            # 生成报告
+            report = self.batch_creator.generate_report(results, user_id)
+            
+            # 保存报告文件
+            timestamp = datetime.now(BEIJING_TZ).strftime("%Y%m%d_%H%M%S")
+            report_filename = f"batch_create_report_{timestamp}.txt"
+            report_path = os.path.join(config.RESULTS_DIR, report_filename)
+            
+            with open(report_path, 'w', encoding='utf-8') as f:
+                f.write(report)
+            
+            # 发送统计信息
+            total = len(results)
+            success = len([r for r in results if r.status == 'success'])
+            failed = len([r for r in results if r.status == 'failed'])
+            skipped = len([r for r in results if r.status == 'skipped'])
+            
+            summary = f"""
+{t(user_id, 'batch_create_complete')}
+
+<b>{t(user_id, 'batch_create_statistics')}</b>
+{t(user_id, 'batch_create_stats_total').format(count=total)}
+{t(user_id, 'batch_create_stats_success').format(count=success)}
+{t(user_id, 'batch_create_stats_failed').format(count=failed)}
+{t(user_id, 'batch_create_stats_skipped').format(count=skipped)}
+
+<b>{t(user_id, 'batch_create_success_rate').format(percent=int(success/total*100) if total > 0 else 0)}</b>
+
+{t(user_id, 'batch_create_report_below')}
+"""
+            
+            context.bot.edit_message_text(
+                chat_id=user_id,
+                message_id=progress_msg.message_id,
+                text=summary,
+                parse_mode='HTML'
+            )
+            
+            # 发送报告文件
+            with open(report_path, 'rb') as f:
+                context.bot.send_document(
+                    chat_id=user_id,
+                    document=f,
+                    filename=report_filename,
+                    caption=t(user_id, 'batch_create_detailed_report')
+                )
+            
+            # 生成成功列表文件
+            success_results = [r for r in results if r.status == 'success']
+            if success_results:
+                success_filename = f"batch_create_success_{timestamp}.txt"
+                success_path = os.path.join(config.RESULTS_DIR, success_filename)
+                
+                with open(success_path, 'w', encoding='utf-8') as f:
+                    f.write("=" * 80 + "\n")
+                    f.write(t(user_id, 'report_success_list_title') + "\n")
+                    f.write("=" * 80 + "\n")
+                    f.write(t(user_id, 'report_success_list_generated').format(
+                        time=datetime.now(BEIJING_TZ).strftime('%Y-%m-%d %H:%M:%S CST')
+                    ) + "\n")
+                    f.write(t(user_id, 'report_success_list_count').format(count=len(success_results)) + "\n\n")
+                    
+                    for r in success_results:
+                        f.write("-" * 80 + "\n")
+                        name_key = 'report_success_list_group_name' if r.creation_type == 'group' else 'report_success_list_channel_name'
+                        desc_key = 'report_success_list_desc' if r.creation_type == 'group' else 'report_success_list_channel_desc'
+                        link_key = 'report_success_list_link' if r.creation_type == 'group' else 'report_success_list_channel_link'
+                        
+                        f.write(t(user_id, name_key).format(name=r.name) + "\n")
+                        f.write(t(user_id, desc_key).format(desc=r.description or t(user_id, 'report_batch_create_desc_none')) + "\n")
+                        f.write(t(user_id, link_key).format(link=r.invite_link or t(user_id, 'report_batch_create_desc_none')) + "\n")
+                        f.write(t(user_id, 'report_success_list_creator').format(account=r.phone) + "\n")
+                        # Display username with @ prefix, or @none if no username
+                        if r.creator_username and not r.creator_username.isdigit():
+                            creator_display = f"@{r.creator_username}"
+                        else:
+                            # No username, display @none using translation
+                            creator_display = t(user_id, 'report_batch_create_admins_none')
+                        f.write(t(user_id, 'report_success_list_creator_username').format(username=creator_display) + "\n")
+                        f.write(t(user_id, 'report_success_list_admin_username').format(admin=f"@{r.admin_username}" if r.admin_username else t(user_id, 'report_batch_create_admins_none')) + "\n")
+                        f.write("\n")
+                    
+                    f.write("=" * 80 + "\n")
+                
+                with open(success_path, 'rb') as f:
+                    context.bot.send_document(
+                        chat_id=user_id,
+                        document=f,
+                        filename=success_filename,
+                        caption=t(user_id, 'batch_create_success_list')
+                    )
+            
+            # 生成失败列表文件
+            failed_results = [r for r in results if r.status == 'failed']
+            if failed_results:
+                failure_filename = f"batch_create_failure_{timestamp}.txt"
+                failure_path = os.path.join(config.RESULTS_DIR, failure_filename)
+                
+                with open(failure_path, 'w', encoding='utf-8') as f:
+                    f.write("=" * 80 + "\n")
+                    f.write(t(user_id, 'report_failure_list_header') + "\n")
+                    f.write("=" * 80 + "\n")
+                    f.write(t(user_id, 'report_failure_list_generated').format(
+                        time=datetime.now(BEIJING_TZ).strftime('%Y-%m-%d %H:%M:%S CST')
+                    ) + "\n")
+                    f.write(t(user_id, 'report_failure_list_count').format(count=len(failed_results)) + "\n\n")
+                    
+                    for r in failed_results:
+                        f.write("-" * 80 + "\n")
+                        name_key = 'report_failure_list_group_name' if r.creation_type == 'group' else 'report_failure_list_channel_name'
+                        desc_key = 'report_failure_list_group_desc' if r.creation_type == 'group' else 'report_failure_list_channel_desc'
+                        
+                        f.write(t(user_id, name_key).format(name=r.name) + "\n")
+                        f.write(t(user_id, desc_key).format(desc=r.description or t(user_id, 'report_batch_create_desc_none')) + "\n")
+                        f.write(t(user_id, 'report_failure_list_creator').format(account=r.phone) + "\n")
+                        f.write(t(user_id, 'report_failure_list_reason').format(reason=r.error) + "\n")
+                        f.write("\n")
+                    
+                    f.write("=" * 80 + "\n")
+                
+                with open(failure_path, 'rb') as f:
+                    context.bot.send_document(
+                        chat_id=user_id,
+                        document=f,
+                        filename=failure_filename,
+                        caption=t(user_id, 'report_failure_list_title')
+                    )
+        
+        finally:
+            loop.close()
+            # 清理临时文件
+            if task.get('temp_dir') and os.path.exists(task['temp_dir']):
+                shutil.rmtree(task['temp_dir'], ignore_errors=True)
+            
+            # 清理TData转换的临时Session文件
+            for account in accounts:
+                if account.file_type == "tdata" and account.converted_session_path:
+                    try:
+                        session_file = f"{account.converted_session_path}.session"
+                        if os.path.exists(session_file):
+                            os.remove(session_file)
+                        session_journal = f"{account.converted_session_path}.session-journal"
+                        if os.path.exists(session_journal):
+                            os.remove(session_journal)
+                        logger.info(f"🧹 已清理TData转换的临时Session: {account.file_name}")
+                    except Exception as e:
+                        logger.warning(f"⚠️ 清理临时Session失败 {account.file_name}: {e}")
+    
+    # ================================
+    # 重新授权功能
+    # ================================
+    
+    def handle_reauthorize_start(self, query):
+        """处理重新授权开始"""
+        query.answer()
+        user_id = query.from_user.id
+        
+        # 检查会员权限
+        is_member, level, expiry = self.db.check_membership(user_id)
+        if not is_member and not self.db.is_admin(user_id):
+            self.safe_edit_message(
+                query,
+                t(user_id, 'reauth_need_member'),
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton(t(user_id, 'btn_vip_menu'), callback_data="vip_menu"),
+                    InlineKeyboardButton(t(user_id, 'btn_back'), callback_data="back_to_main")
+                ]])
+            )
+            return
+        
+        text = f"""
+{t(user_id, 'reauth_title')}
+
+<b>{t(user_id, 'reauth_desc_title')}</b>
+{t(user_id, 'reauth_desc1')}
+{t(user_id, 'reauth_desc2')}
+{t(user_id, 'reauth_desc3')}
+{t(user_id, 'reauth_desc4')}
+{t(user_id, 'reauth_desc5')}
+{t(user_id, 'reauth_desc6')}
+
+<b>{t(user_id, 'reauth_workflow_title')}</b>
+{t(user_id, 'reauth_workflow1')}
+{t(user_id, 'reauth_workflow2')}
+{t(user_id, 'reauth_workflow3')}
+{t(user_id, 'reauth_workflow4')}
+{t(user_id, 'reauth_workflow5')}
+
+<b>{t(user_id, 'reauth_fail_title')}</b>
+{t(user_id, 'reauth_fail_frozen')}
+{t(user_id, 'reauth_fail_banned')}
+{t(user_id, 'reauth_fail_wrong_pwd')}
+{t(user_id, 'reauth_fail_network')}
+
+<b>{t(user_id, 'reauth_notes_title')}</b>
+{t(user_id, 'reauth_note1')}
+{t(user_id, 'reauth_note2')}
+{t(user_id, 'reauth_note3')}
+
+<b>{t(user_id, 'reauth_upload_prompt')}</b>
+{t(user_id, 'reauth_supported_formats')}
+"""
+        
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton(t(user_id, 'reauth_btn_back'), callback_data="back_to_main")
+        ]])
+        
+        self.safe_edit_message(query, text, parse_mode='HTML', reply_markup=keyboard)
+        
+        # 设置用户状态
+        self.db.save_user(user_id, "", "", "reauthorize_upload")
+    
+    def handle_reauthorize_callbacks(self, update: Update, context: CallbackContext, query, data: str):
+        """处理重新授权回调"""
+        user_id = query.from_user.id
+        
+        if data == "reauthorize_cancel":
+            query.answer()
+            if user_id in self.pending_reauthorize:
+                self.cleanup_reauthorize_task(user_id)
+            self.show_main_menu(update, user_id)
+        elif data == "reauthorize_confirm":
+            self.handle_reauthorize_execute(update, context, query, user_id)
+        elif data == "reauth_auto_detect":
+            self.handle_reauthorize_auto_detect(update, context, query, user_id)
+        elif data == "reauth_manual_input":
+            self.handle_reauthorize_manual_input(update, context, query, user_id)
+    
+    def cleanup_reauthorize_task(self, user_id: int):
+        """清理重新授权任务"""
+        if user_id in self.pending_reauthorize:
+            task = self.pending_reauthorize[user_id]
+            if task.get('temp_dir') and os.path.exists(task['temp_dir']):
+                shutil.rmtree(task['temp_dir'], ignore_errors=True)
+            del self.pending_reauthorize[user_id]
+        
+        # 清除用户状态
+        self.db.save_user(user_id, "", "", "")
+    
+    async def process_reauthorize_upload(self, update: Update, context: CallbackContext, document):
+        """处理重新授权文件上传"""
+        user_id = update.effective_user.id
+        
+        progress_msg = self.safe_send_message(update, f"📥 <b>{t(user_id, 'reauth_processing_file')}...</b>", 'HTML')
+        if not progress_msg:
+            return
+        
+        temp_zip = None
+        try:
+            # 清理旧的临时文件
+            self._cleanup_user_temp_sessions(user_id)
+            
+            # 创建唯一任务ID
+            unique_task_id = f"{user_id}_reauth_{int(time.time() * 1000)}"
+            
+            # 下载文件
+            temp_dir = tempfile.mkdtemp(prefix="reauthorize_")
+            temp_zip = os.path.join(temp_dir, document.file_name)
+            document.get_file().download(temp_zip)
+            
+            # 扫描文件
+            files, extract_dir, file_type = self.processor.scan_zip_file(temp_zip, user_id, unique_task_id)
+            
+            if not files:
+                self.safe_edit_message_text(progress_msg, f"❌ <b>{t(user_id, 'reauth_no_valid_files')}</b>\n\n{t(user_id, 'reauth_ensure_format')}", parse_mode='HTML')
+                return
+            
+            # 保存任务信息
+            self.pending_reauthorize[user_id] = {
+                'files': files,
+                'file_type': file_type,
+                'temp_dir': temp_dir,
+                'extract_dir': extract_dir,
+                'total_files': len(files)
+            }
+            
+            # 显示选择密码输入方式的按钮
+            text = f"""{t(user_id, 'reauth_found_accounts').format(count=len(files))}
+
+<b>{t(user_id, 'reauth_file_type').format(type=file_type.upper())}</b>
+
+<b>{t(user_id, 'reauth_pwd_method_title')}</b>
+{t(user_id, 'reauth_pwd_auto')}
+{t(user_id, 'reauth_pwd_manual')}
+
+{t(user_id, 'reauth_pwd_auto_support')}
+{t(user_id, 'reauth_pwd_auto_session')}
+{t(user_id, 'reauth_pwd_auto_tdata')}
+  {t(user_id, 'reauth_pwd_auto_example')}
+"""
+            
+            keyboard = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton(t(user_id, 'reauth_btn_auto_2fa'), callback_data="reauth_auto_detect"),
+                    InlineKeyboardButton(t(user_id, 'reauth_btn_manual_2fa'), callback_data="reauth_manual_input")
+                ],
+                [InlineKeyboardButton(t(user_id, 'reauth_btn_cancel'), callback_data="reauthorize_cancel")]
+            ])
+            
+            self.safe_edit_message_text(
+                progress_msg,
+                text,
+                parse_mode='HTML',
+                reply_markup=keyboard
+            )
+            
+        except Exception as e:
+            logger.error(f"Reauthorize upload failed: {e}")
+            import traceback
+            traceback.print_exc()
+            
+            self.safe_edit_message_text(
+                progress_msg,
+                f"❌ <b>{t(user_id, 'reauth_failed')}</b>\n\n{t(user_id, 'reauth_error').format(error=str(e))}",
+                parse_mode='HTML'
+            )
+            
+            # 清理
+            if temp_zip and os.path.exists(os.path.dirname(temp_zip)):
+                shutil.rmtree(os.path.dirname(temp_zip), ignore_errors=True)
+    
+    def handle_reauthorize_auto_detect(self, update: Update, context: CallbackContext, query, user_id: int):
+        """处理自动识别2FA"""
+        query.answer()
+        
+        if user_id not in self.pending_reauthorize:
+            self.safe_edit_message(query, t(user_id, 'reauth_session_expired'))
+            return
+        
+        task = self.pending_reauthorize[user_id]
+        files = task['files']
+        file_type = task['file_type']
+        
+        # 自动检测每个文件的密码
+        progress_text = f"🔍 <b>{t(user_id, 'reauth_processing_file')}...</b>\n\n{t(user_id, 'status_processing')}"
+        self.safe_edit_message(query, progress_text, parse_mode='HTML')
+        
+        detected_count = 0
+        password_map = {}  # {file_path: password}
+        
+        for file_path, file_name in files:
+            try:
+                detected_password = self.two_factor_manager.password_detector.detect_password(file_path, file_type)
+                if detected_password:
+                    password_map[file_path] = detected_password
+                    detected_count += 1
+            except Exception as e:
+                logger.warning(f"Failed to detect password for {file_name}: {e}")
+        
+        # 保存检测结果
+        task['password_map'] = password_map
+        task['password_mode'] = 'auto'
+        
+        # 显示检测结果
+        result_text = f"""{t(user_id, 'reauth_pwd_detect_complete')}
+
+<b>{t(user_id, 'reauth_pwd_stats')}</b>
+{t(user_id, 'reauth_pwd_total').format(count=len(files))}
+{t(user_id, 'reauth_pwd_detected').format(count=detected_count)}
+{t(user_id, 'reauth_pwd_not_detected').format(count=len(files) - detected_count)}
+
+{t(user_id, 'reauth_pwd_empty_note')}
+
+<b>{t(user_id, 'reauth_new_pwd_prompt')}</b>
+
+{t(user_id, 'reauth_new_pwd_tip')}
+"""
+        
+        self.safe_edit_message(query, result_text, parse_mode='HTML')
+        
+        # 设置用户状态为等待输入新密码
+        self.db.save_user(user_id, "", "", "reauthorize_new_password")
+    
+    def handle_reauthorize_manual_input(self, update: Update, context: CallbackContext, query, user_id: int):
+        """处理手动输入2FA"""
+        query.answer()
+        
+        if user_id not in self.pending_reauthorize:
+            self.safe_edit_message(query, t(user_id, 'reauth_session_expired'))
+            return
+        
+        task = self.pending_reauthorize[user_id]
+        task['password_mode'] = 'manual'
+        
+        text = f"""<b>{t(user_id, 'reauth_manual_old_pwd_title')}</b>
+
+{t(user_id, 'reauth_manual_old_pwd_prompt')}
+
+{t(user_id, 'reauth_manual_old_pwd_tip')}
+"""
+        
+        self.safe_edit_message(query, text, parse_mode='HTML')
+        
+        # 设置用户状态为等待输入旧密码
+        self.db.save_user(user_id, "", "", "reauthorize_old_password")
+    
+    def handle_reauthorize_old_password_input(self, update: Update, context: CallbackContext, user_id: int, text: str):
+        """处理旧密码输入（手动模式）"""
+        if user_id not in self.pending_reauthorize:
+            self.safe_send_message(update, t(user_id, 'reauth_session_expired_restart'))
+            return
+        
+        task = self.pending_reauthorize[user_id]
+        
+        # 保存旧密码
+        text = text.strip()
+        if text.lower() in ['无', 'skip', 'none', '']:
+            task['old_password'] = ""
+        else:
+            task['old_password'] = text
+        
+        # 询问新密码
+        msg = self.safe_send_message(
+            update,
+            f"{t(user_id, 'reauth_old_pwd_saved')}\n\n{t(user_id, 'reauth_new_pwd_prompt')}\n\n{t(user_id, 'reauth_new_pwd_tip')}",
+            parse_mode='HTML'
+        )
+        
+        # 设置用户状态为等待输入新密码
+        self.db.save_user(user_id, "", "", "reauthorize_new_password")
+    
+    def handle_reauthorize_new_password_input(self, update: Update, context: CallbackContext, user_id: int, text: str):
+        """处理新密码输入"""
+        if user_id not in self.pending_reauthorize:
+            self.safe_send_message(update, t(user_id, 'reauth_session_expired_restart'))
+            return
+        
+        task = self.pending_reauthorize[user_id]
+        
+        # 保存新密码
+        text = text.strip()
+        if text.lower() in ['无', 'skip', 'none', '']:
+            task['new_password'] = ""
+        else:
+            task['new_password'] = text
+        
+        # 显示确认信息
+        old_pwd_display = t(user_id, 'reauth_pwd_none') if not task.get('old_password') else t(user_id, 'reauth_pwd_masked')
+        new_pwd_display = t(user_id, 'reauth_pwd_none') if not task.get('new_password') else t(user_id, 'reauth_pwd_masked')
+        
+        text = f"""
+<b>{t(user_id, 'reauth_final_confirm')}</b>
+
+<b>{t(user_id, 'reauth_account_info')}</b>
+{t(user_id, 'reauth_account_count').format(count=task['total_files'])}
+{t(user_id, 'reauth_file_type').format(type=task['file_type'].upper())}
+
+<b>{t(user_id, 'reauth_pwd_settings')}</b>
+{t(user_id, 'reauth_old_pwd').format(value=old_pwd_display)}
+{t(user_id, 'reauth_new_pwd').format(value=new_pwd_display)}
+
+<b>{t(user_id, 'reauth_process_flow')}</b>
+{t(user_id, 'reauth_flow1')}
+{t(user_id, 'reauth_flow2')}
+{t(user_id, 'reauth_flow3')}
+{t(user_id, 'reauth_flow4')}
+{t(user_id, 'reauth_flow5')}
+{t(user_id, 'reauth_flow6')}
+
+<b>{t(user_id, 'reauth_important')}</b>
+{t(user_id, 'reauth_important1')}
+{t(user_id, 'reauth_important2')}
+{t(user_id, 'reauth_important3')}
+
+<b>{t(user_id, 'reauth_confirm_question')}</b>
+"""
+        
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton(t(user_id, 'reauth_btn_confirm'), callback_data="reauthorize_confirm")],
+            [InlineKeyboardButton(t(user_id, 'reauth_btn_cancel'), callback_data="reauthorize_cancel")]
+        ])
+        
+        self.safe_send_message(update, text, parse_mode='HTML', reply_markup=keyboard)
+    
+    def handle_reauthorize_execute(self, update: Update, context: CallbackContext, query, user_id: int):
+        """执行重新授权"""
+        query.answer(t(user_id, 'reauth_starting'))
+        
+        if user_id not in self.pending_reauthorize:
+            self.safe_edit_message(query, t(user_id, 'reauth_session_expired'))
+            return
+        
+        task = self.pending_reauthorize[user_id]
+        
+        # 在新线程中执行
+        def execute():
+            try:
+                self._execute_reauthorize(update, context, user_id, task)
+            except Exception as e:
+                logger.error(f"Reauthorize execution failed: {e}")
+                import traceback
+                traceback.print_exc()
+                context.bot.send_message(
+                    chat_id=user_id,
+                    text=f"❌ <b>{t(user_id, 'reauth_failed')}</b>\n\n{t(user_id, 'reauth_error').format(error=str(e))}",
+                    parse_mode='HTML'
+                )
+            finally:
+                if user_id in self.pending_reauthorize:
+                    self.cleanup_reauthorize_task(user_id)
+        
+        thread = threading.Thread(target=execute, daemon=True)
+        thread.start()
+        
+        self.safe_edit_message(
+            query,
+            f"<b>{t(user_id, 'reauth_in_progress')}</b>\n\n{t(user_id, 'reauth_please_wait')}",
+            parse_mode='HTML'
+        )
+    
+    def _create_reauth_progress_keyboard(self, user_id: int, total: int, success: int, frozen: int, wrong_pwd: int, banned: int, network_error: int) -> InlineKeyboardMarkup:
+        """创建重新授权进度按钮 - 6行2列布局"""
+        return InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton(t(user_id, 'reauth_stat_account_count'), callback_data="reauthorize_noop"),
+                InlineKeyboardButton(f"{total}", callback_data="reauthorize_noop")
+            ],
+            [
+                InlineKeyboardButton(t(user_id, 'reauth_stat_success'), callback_data="reauthorize_noop"),
+                InlineKeyboardButton(f"{success}", callback_data="reauthorize_noop")
+            ],
+            [
+                InlineKeyboardButton(t(user_id, 'reauth_stat_frozen'), callback_data="reauthorize_noop"),
+                InlineKeyboardButton(f"{frozen}", callback_data="reauthorize_noop")
+            ],
+            [
+                InlineKeyboardButton(t(user_id, 'reauth_stat_banned'), callback_data="reauthorize_noop"),
+                InlineKeyboardButton(f"{banned}", callback_data="reauthorize_noop")
+            ],
+            [
+                InlineKeyboardButton(t(user_id, 'reauth_stat_2fa_error'), callback_data="reauthorize_noop"),
+                InlineKeyboardButton(f"{wrong_pwd}", callback_data="reauthorize_noop")
+            ],
+            [
+                InlineKeyboardButton(t(user_id, 'reauth_stat_network_error'), callback_data="reauthorize_noop"),
+                InlineKeyboardButton(f"{network_error}", callback_data="reauthorize_noop")
+            ]
+        ])
+    
+    def _execute_reauthorize(self, update: Update, context: CallbackContext, user_id: int, task: Dict):
+        """实际执行重新授权"""
+        import asyncio
+        
+        files = task['files']
+        file_type = task['file_type']
+        password_mode = task.get('password_mode', 'manual')
+        password_map = task.get('password_map', {})  # For auto mode
+        old_password = task.get('old_password', '')  # For manual mode
+        new_password = task.get('new_password', '')
+        
+        # 创建进度消息
+        total_files = len(files)
+        
+        # 创建初始按钮布局
+        keyboard = self._create_reauth_progress_keyboard(user_id, total_files, 0, 0, 0, 0, 0)
+        
+        progress_msg = context.bot.send_message(
+            chat_id=user_id,
+            text=f"🚀 <b>{t(user_id, 'reauth_start')}</b>\n\n{t(user_id, 'reauth_progress').format(current=0, total=total_files, percent=0)}",
+            parse_mode='HTML',
+            reply_markup=keyboard
+        )
+        
+        # 执行重新授权
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
+        # 结果分类
+        results = {
+            'success': [],
+            'frozen': [],
+            'banned': [],
+            'wrong_password': [],
+            'network_error': [],
+            'other_error': []
+        }
+        
+        last_update_count = 0
+        
+        def progress_callback(current, total, message):
+            nonlocal last_update_count
+            # 每10个更新一次，或者是最后一个
+            if current - last_update_count >= 10 or current == total:
+                try:
+                    progress = int(current / total * 100)
+                    
+                    # 统计当前结果
+                    success_count = len(results['success'])
+                    frozen_count = len(results['frozen'])
+                    banned_count = len(results['banned'])
+                    wrong_pwd_count = len(results['wrong_password'])
+                    network_error_count = len(results['network_error'])
+                    other_error_count = len(results['other_error'])
+                    
+                    # 创建实时统计按钮
+                    keyboard = self._create_reauth_progress_keyboard(
+                        user_id, total, success_count, frozen_count, wrong_pwd_count, banned_count, network_error_count
+                    )
+                    
+                    logger.info(f"📊 重新授权进度: {current}/{total} ({progress}%) - 成功:{success_count} 冻结:{frozen_count} 封禁:{banned_count} 密码错误:{wrong_pwd_count} 网络:{network_error_count}")
+                    print(f"📊 重新授权进度: {current}/{total} ({progress}%) - 成功:{success_count} 冻结:{frozen_count} 封禁:{banned_count} 密码错误:{wrong_pwd_count} 网络:{network_error_count}", flush=True)
+                    
+                    context.bot.edit_message_text(
+                        chat_id=user_id,
+                        message_id=progress_msg.message_id,
+                        text=f"🚀 <b>{t(user_id, 'reauth_start')}</b>\n\n{t(user_id, 'reauth_progress').format(current=current, total=total, percent=progress)}",
+                        parse_mode='HTML',
+                        reply_markup=keyboard
+                    )
+                    last_update_count = current
+                except Exception as e:
+                    logger.warning(f"⚠️ 更新进度消息失败: {e}")
+        
+        try:
+            logger.info(f"📊 开始重新授权 - 用户ID: {user_id}, 账号数: {total_files}")
+            print(f"📊 开始重新授权 - 用户ID: {user_id}, 账号数: {total_files}, 并发数: {config.REAUTH_CONCURRENT}", flush=True)
+            
+            # 使用并发处理账号
+            completed_count = 0
+            
+            async def process_account_wrapper(idx, file_path, file_name):
+                """处理单个账号的包装器 - 确保永不卡死"""
+                nonlocal completed_count
+                try:
+                    # 根据模式决定使用哪个密码
+                    if password_mode == 'auto':
+                        account_old_password = password_map.get(file_path, '')
+                    else:
+                        account_old_password = old_password
+                    
+                    result = await self._reauthorize_single_account(
+                        file_path, file_name, account_old_password, new_password, user_id, file_type
+                    )
+                    
+                    # 根据结果分类
+                    if result['status'] == 'success':
+                        results['success'].append((file_path, file_name, result))
+                    elif result['status'] == 'frozen':
+                        results['frozen'].append((file_path, file_name, result))
+                    elif result['status'] == 'banned':
+                        results['banned'].append((file_path, file_name, result))
+                    elif result['status'] == 'wrong_password':
+                        results['wrong_password'].append((file_path, file_name, result))
+                    elif result['status'] == 'network_error':
+                        results['network_error'].append((file_path, file_name, result))
+                    else:
+                        results['other_error'].append((file_path, file_name, result))
+                    
+                    completed_count += 1
+                    progress_callback(completed_count, total_files, f"已完成 {completed_count}/{total_files}")
+                    
+                except Exception as e:
+                    # 确保任何异常都不会阻止进度
+                    logger.error(f"❌ 处理账号失败 {file_name}: {e}")
+                    print(f"❌ 处理账号失败 {file_name}: {e}", flush=True)
+                    results['other_error'].append((file_path, file_name, {'status': 'error', 'error': str(e)}))
+                    completed_count += 1
+                    progress_callback(completed_count, total_files, f"已完成 {completed_count}/{total_files}")
+            
+            async def process_batch():
+                """批量并发处理账号 - 确保永不卡死"""
+                # 创建信号量控制并发数
+                semaphore = asyncio.Semaphore(config.REAUTH_CONCURRENT)
+                
+                async def process_with_semaphore(idx, file_path, file_name):
+                    async with semaphore:
+                        await process_account_wrapper(idx, file_path, file_name)
+                
+                # 创建所有任务
+                tasks = [
+                    process_with_semaphore(idx, file_path, file_name)
+                    for idx, (file_path, file_name) in enumerate(files)
+                ]
+                
+                # 并发执行所有任务 - 添加总超时保护（每个账号最多3分钟，总共不超过账号数*3分钟）
+                # 但至少30分钟
+                MINIMUM_TOTAL_TIMEOUT = 1800  # 30分钟最小超时
+                PER_ACCOUNT_TIMEOUT = 180  # 每个账号3分钟
+                total_timeout = max(total_files * PER_ACCOUNT_TIMEOUT, MINIMUM_TOTAL_TIMEOUT)
+                logger.info(f"⏰ 设置总超时: {total_timeout}秒 ({total_timeout/60:.1f}分钟)")
+                print(f"⏰ 设置总超时: {total_timeout}秒 ({total_timeout/60:.1f}分钟)", flush=True)
+                
+                try:
+                    # 使用return_exceptions=True允许部分失败不影响其他任务
+                    # 异常已在process_account_wrapper中处理
+                    await asyncio.wait_for(
+                        asyncio.gather(*tasks, return_exceptions=True),
+                        timeout=total_timeout
+                    )
+                except asyncio.TimeoutError:
+                    logger.error(f"⏰ 批量处理超时（{total_timeout}秒），强制结束")
+                    print(f"⏰ 批量处理超时（{total_timeout}秒），强制结束", flush=True)
+            
+            # 执行批量处理
+            loop.run_until_complete(process_batch())
+            
+            # 生成报告和打包结果 - 确保总是执行
+            logger.info("📊 开始生成报告...")
+            print("📊 开始生成报告...", flush=True)
+            try:
+                self._generate_reauthorize_report(context, user_id, results, progress_msg)
+            except Exception as e:
+                logger.error(f"❌ 生成报告失败，但继续尝试发送已有数据: {e}")
+                print(f"❌ 生成报告失败，但继续尝试发送已有数据: {e}", flush=True)
+                # 即使报告生成失败，也要尝试发送基本统计信息
+                try:
+                    total = sum(len(v) for v in results.values())
+                    success_count = len(results['success'])
+                    context.bot.send_message(
+                        chat_id=user_id,
+                        text=f"⚠️ 报告生成出现问题，但处理完成\n\n总数: {total}\n成功: {success_count}",
+                        parse_mode='HTML'
+                    )
+                except:
+                    pass
+            
+        except Exception as e:
+            logger.error(f"❌ 重新授权执行失败: {e}")
+            print(f"❌ 重新授权执行失败: {e}", flush=True)
+            # 即使整体失败，也尝试发送错误消息
+            try:
+                context.bot.send_message(
+                    chat_id=user_id,
+                    text=f"❌ 重新授权出现严重错误: {str(e)}\n\n已处理账号可能未完全保存",
+                    parse_mode='HTML'
+                )
+            except:
+                pass
+            
+        finally:
+            loop.close()
+            # 清理临时文件
+            if task.get('temp_dir') and os.path.exists(task['temp_dir']):
+                shutil.rmtree(task['temp_dir'], ignore_errors=True)
+    
+    async def _reauthorize_single_account(self, file_path: str, file_name: str, old_password: str, new_password: str, user_id: int, file_type: str = 'session') -> Dict:
+        """重新授权单个账号（支持Session和TData格式）- 带超时保护"""
+        logger.info(f"🔄 开始处理账号: {file_name} (格式: {file_type.upper()})")
+        print(f"🔄 开始处理账号: {file_name} (格式: {file_type.upper()})", flush=True)
+        
+        # 为每个账号设置最大处理时间（180秒 = 3分钟）
+        # 这确保即使账号出现问题也不会永久卡住
+        timeout_seconds = 180
+        
+        try:
+            return await asyncio.wait_for(
+                self._reauthorize_single_account_impl(file_path, file_name, old_password, new_password, user_id, file_type),
+                timeout=timeout_seconds
+            )
+        except asyncio.TimeoutError:
+            logger.error(f"⏰ [{file_name}] 处理超时（{timeout_seconds}秒），自动跳过")
+            print(f"⏰ [{file_name}] 处理超时（{timeout_seconds}秒），自动跳过", flush=True)
+            return {'status': 'other_error', 'error': f'处理超时（{timeout_seconds}秒）'}
+        except Exception as e:
+            logger.error(f"❌ [{file_name}] 处理时发生未预期错误: {e}")
+            print(f"❌ [{file_name}] 处理时发生未预期错误: {e}", flush=True)
+            return {'status': 'other_error', 'error': f'未预期错误: {str(e)}'}
+    
+    async def _reauthorize_single_account_impl(self, file_path: str, file_name: str, old_password: str, new_password: str, user_id: int, file_type: str = 'session') -> Dict:
+        """重新授权单个账号的实际实现"""
+        client = None
+        new_client = None
+        temp_session_path = None
+        original_tdata_path = None
+        
+        try:
+            # 如果是TData格式，先转换为Session
+            if file_type == 'tdata':
+                if not OPENTELE_AVAILABLE:
+                    return {'status': 'other_error', 'error': 'opentele库未安装，无法处理TData格式'}
+                
+                logger.info(f"📂 [{file_name}] TData格式 - 转换为Session进行处理...")
+                print(f"📂 [{file_name}] TData格式 - 转换为Session进行处理...", flush=True)
+                
+                try:
+                    # 保存原始TData路径
+                    original_tdata_path = file_path
+                    
+                    # 加载TData - 添加超时保护（30秒）
+                    try:
+                        tdesk = await asyncio.wait_for(
+                            asyncio.to_thread(TDesktop, file_path),
+                            timeout=30
+                        )
+                        if not tdesk.isLoaded():
+                            return {'status': 'frozen', 'error': 'TData未授权或无效'}
+                    except asyncio.TimeoutError:
+                        logger.error(f"⏰ [{file_name}] TData加载超时（30秒）")
+                        print(f"⏰ [{file_name}] TData加载超时（30秒）", flush=True)
+                        return {'status': 'other_error', 'error': 'TData加载超时'}
+                    
+                    # 创建临时Session文件
+                    os.makedirs(config.SESSIONS_BAK_DIR, exist_ok=True)
+                    temp_session_name = f"reauth_tdata_{time.time_ns()}"
+                    temp_session_path = os.path.join(config.SESSIONS_BAK_DIR, temp_session_name)
+                    
+                    # 转换TData为Session - 添加超时保护（60秒）
+                    try:
+                        temp_client = await asyncio.wait_for(
+                            tdesk.ToTelethon(
+                                session=temp_session_path,
+                                flag=UseCurrentSession,
+                                api=API.TelegramDesktop
+                            ),
+                            timeout=60
+                        )
+                    except asyncio.TimeoutError:
+                        logger.error(f"⏰ [{file_name}] TData转Session超时（60秒）")
+                        print(f"⏰ [{file_name}] TData转Session超时（60秒）", flush=True)
+                        return {'status': 'other_error', 'error': 'TData转Session超时'}
+                    
+                    # 断开临时客户端
+                    if temp_client:
+                        try:
+                            await asyncio.wait_for(temp_client.disconnect(), timeout=10)
+                        except Exception:
+                            pass
+                    
+                    # 使用转换后的Session路径
+                    file_path = temp_session_path
+                    
+                    logger.info(f"✅ [{file_name}] TData转Session完成")
+                    print(f"✅ [{file_name}] TData转Session完成", flush=True)
+                    
+                except asyncio.TimeoutError:
+                    logger.error(f"⏰ [{file_name}] TData转换操作超时")
+                    print(f"⏰ [{file_name}] TData转换操作超时", flush=True)
+                    return {'status': 'other_error', 'error': 'TData转换操作超时'}
+                except Exception as e:
+                    logger.error(f"❌ [{file_name}] TData转换失败: {e}")
+                    print(f"❌ [{file_name}] TData转换失败: {e}", flush=True)
+                    return {'status': 'other_error', 'error': f'TData转换失败: {str(e)}'}
+            
+            # 使用配置中的API凭据（不能使用随机设备的API凭据，因为现有session是用特定API凭据创建的）
+            # Telegram会验证API凭据与手机号的匹配关系
+            old_api_id = config.API_ID
+            old_api_hash = config.API_HASH
+            
+            # 获取随机设备参数（用于新会话）
+            # 注意：API凭据必须使用配置的有效凭据，不能随机化
+            # 只随机化设备指纹参数（device_model, system_version等）
+            random_device_params = None
+            new_api_id = old_api_id  # 使用相同的API凭据
+            new_api_hash = old_api_hash  # 使用相同的API凭据
+            
+            if config.REAUTH_USE_RANDOM_DEVICE:
+                try:
+                    random_device_params = self.device_params_manager.get_random_device_params()
+                    logger.info(f"📱 [{file_name}] 新会话将使用随机设备指纹")
+                    print(f"📱 [{file_name}] 新会话将使用随机设备指纹", flush=True)
+                except Exception as e:
+                    logger.warning(f"⚠️ [{file_name}] 获取随机设备参数失败: {e}")
+                    print(f"⚠️ [{file_name}] 获取随机设备参数失败: {e}", flush=True)
+            
+            logger.info(f"📱 [{file_name}] 旧会话使用配置的API凭据: API_ID={old_api_id}")
+            print(f"📱 [{file_name}] 旧会话使用配置的API凭据: API_ID={old_api_id}", flush=True)
+            
+            # 获取代理（强制使用代理优先）
+            proxy_dict = None
+            proxy_info = None
+            use_proxy = config.REAUTH_FORCE_PROXY or self.proxy_manager.is_proxy_mode_active(self.db)
+            
+            if use_proxy and self.proxy_manager.proxies:
+                proxy_info = self.proxy_manager.get_next_proxy()
+                if proxy_info:
+                    proxy_dict = self.checker.create_proxy_dict(proxy_info)
+                    proxy_type = "住宅代理" if proxy_info.get('is_residential', False) else "代理"
+                    logger.info(f"🌐 [{file_name}] 强制使用{proxy_type}（配置: REAUTH_FORCE_PROXY={config.REAUTH_FORCE_PROXY}）")
+                    print(f"🌐 [{file_name}] 强制使用{proxy_type}（配置: REAUTH_FORCE_PROXY={config.REAUTH_FORCE_PROXY}）", flush=True)
+                else:
+                    logger.warning(f"⚠️ [{file_name}] 代理模式启用但无可用代理")
+                    print(f"⚠️ [{file_name}] 代理模式启用但无可用代理", flush=True)
+            else:
+                logger.info(f"ℹ️ [{file_name}] 代理模式未启用，使用本地连接")
+                print(f"ℹ️ [{file_name}] 代理模式未启用，使用本地连接", flush=True)
+            
+            # 步骤1: 创建旧客户端连接
+            session_base = file_path.replace('.session', '') if file_path.endswith('.session') else file_path
+            
+            client = TelegramClient(
+                session_base,
+                int(old_api_id),
+                str(old_api_hash),
+                timeout=config.CONNECTION_TIMEOUT,
+                connection_retries=3,
+                retry_delay=1,
+                proxy=proxy_dict
+            )
+            
+            logger.info(f"⏳ [{file_name}] 连接到Telegram服务器（旧会话）...")
+            print(f"⏳ [{file_name}] 连接到Telegram服务器（旧会话）...", flush=True)
+            
+            # 强制代理优先逻辑：只有代理超时才回退到本地
+            connect_success = False
+            try:
+                await asyncio.wait_for(client.connect(), timeout=config.CONNECTION_TIMEOUT)
+                logger.info(f"✅ [{file_name}] 旧会话连接成功（使用{'代理' if proxy_dict else '本地'}）")
+                print(f"✅ [{file_name}] 旧会话连接成功（使用{'代理' if proxy_dict else '本地'}）", flush=True)
+                connect_success = True
+            except asyncio.TimeoutError:
+                if proxy_dict and config.REAUTH_FORCE_PROXY:
+                    # 只有在使用代理且超时的情况下才回退
+                    logger.warning(f"⚠️ [{file_name}] 代理连接超时，回退到本地连接")
+                    print(f"⚠️ [{file_name}] 代理连接超时，回退到本地连接", flush=True)
+                    try:
+                        await client.disconnect()
+                    except Exception as e:
+                        logger.warning(f"⚠️ [{file_name}] 断开旧客户端失败: {e}")
+                    # 重新创建不带代理的客户端
+                    client = TelegramClient(
+                        session_base,
+                        int(old_api_id),
+                        str(old_api_hash),
+                        timeout=30
+                    )
+                    await client.connect()
+                    logger.info(f"✅ [{file_name}] 本地连接成功")
+                    print(f"✅ [{file_name}] 本地连接成功", flush=True)
+                    connect_success = True
+                else:
+                    # 如果不是代理超时，或者没有配置强制代理，则抛出异常
+                    logger.error(f"❌ [{file_name}] 连接超时且无法回退")
+                    print(f"❌ [{file_name}] 连接超时且无法回退", flush=True)
+                    return {'status': 'network_error', 'error': '连接超时'}
+            
+            # 检查授权状态
+            if not await client.is_user_authorized():
+                return {'status': 'frozen', 'error': '账号未授权或已失效'}
+            
+            # 获取账号信息
+            me = await client.get_me()
+            phone = me.phone if me.phone else "unknown"
+            logger.info(f"📱 [{file_name}] 账号手机号: {phone}")
+            print(f"📱 [{file_name}] 账号手机号: {phone}", flush=True)
+            
+            # 步骤2: 重置所有会话（踢掉其他设备）
+            logger.info(f"🔄 [{file_name}] 步骤1: 重置所有会话...")
+            print(f"🔄 [{file_name}] 步骤1: 重置所有会话...", flush=True)
+            
+            try:
+                sessions = await client(GetAuthorizationsRequest())
+                if len(sessions.authorizations) > 1:
+                    await client(ResetAuthorizationsRequest())
+                    logger.info(f"✅ [{file_name}] 已踢掉其他设备登录")
+                    print(f"✅ [{file_name}] 已踢掉其他设备登录", flush=True)
+                else:
+                    logger.info(f"ℹ️ [{file_name}] 只有一个会话，无需重置")
+                    print(f"ℹ️ [{file_name}] 只有一个会话，无需重置", flush=True)
+            except Exception as e:
+                logger.warning(f"⚠️ [{file_name}] 重置会话失败: {e}")
+                print(f"⚠️ [{file_name}] 重置会话失败: {e}", flush=True)
+            
+            # 步骤3: 检查密码状态（如果提供了旧密码）
+            # TODO: 实际的密码验证需要在登录时进行
+            # Telethon不提供独立的密码验证API，只能在sign_in时验证
+            if old_password:
+                logger.info(f"🔐 [{file_name}] 步骤2: 检查2FA状态...")
+                print(f"🔐 [{file_name}] 步骤2: 检查2FA状态...", flush=True)
+                
+                try:
+                    password_data = await client(GetPasswordRequest())
+                    if password_data.has_password:
+                        logger.info(f"ℹ️ [{file_name}] 账号有2FA，将在重新登录时验证密码")
+                        print(f"ℹ️ [{file_name}] 账号有2FA，将在重新登录时验证密码", flush=True)
+                    else:
+                        logger.info(f"ℹ️ [{file_name}] 账号没有2FA")
+                        print(f"ℹ️ [{file_name}] 账号没有2FA", flush=True)
+                except Exception as e:
+                    logger.warning(f"⚠️ [{file_name}] 检查2FA状态失败: {e}")
+                    print(f"⚠️ [{file_name}] 检查2FA状态失败: {e}", flush=True)
+            
+            # 步骤4: 创建新会话（使用随机设备参数）
+            logger.info(f"🔑 [{file_name}] 步骤3: 创建新会话（使用随机设备参数）...")
+            print(f"🔑 [{file_name}] 步骤3: 创建新会话（使用随机设备参数）...", flush=True)
+            
+            # 为新会话创建新路径
+            new_session_path = f"{session_base}_new"
+            
+            # 创建新客户端（使用随机设备参数的API凭据）
+            new_client = TelegramClient(
+                new_session_path,
+                int(new_api_id),
+                str(new_api_hash),
+                timeout=config.CONNECTION_TIMEOUT,
+                proxy=proxy_dict,
+                # 添加随机设备参数（如果有）
+                device_model=random_device_params.get('device_model', 'Desktop') if random_device_params else 'Desktop',
+                system_version=random_device_params.get('system_version', 'Windows 10') if random_device_params else 'Windows 10',
+                app_version=random_device_params.get('app_version', '3.2.8 x64') if random_device_params else '3.2.8 x64',
+                lang_code=random_device_params.get('lang_code', 'en') if random_device_params else 'en',
+                system_lang_code=random_device_params.get('system_lang_code', 'en-US') if random_device_params else 'en-US'
+            )
+            
+            logger.info(f"📱 [{file_name}] 新会话设备信息: {random_device_params.get('device_model', 'Desktop') if random_device_params else 'Desktop'}, {random_device_params.get('system_version', 'Windows 10') if random_device_params else 'Windows 10'}")
+            print(f"📱 [{file_name}] 新会话设备信息: {random_device_params.get('device_model', 'Desktop') if random_device_params else 'Desktop'}, {random_device_params.get('system_version', 'Windows 10') if random_device_params else 'Windows 10'}", flush=True)
+            
+            # 连接新客户端（强制代理优先）
+            try:
+                await asyncio.wait_for(new_client.connect(), timeout=config.CONNECTION_TIMEOUT)
+                logger.info(f"✅ [{file_name}] 新会话连接成功（使用{'代理' if proxy_dict else '本地'}）")
+                print(f"✅ [{file_name}] 新会话连接成功（使用{'代理' if proxy_dict else '本地'}）", flush=True)
+            except asyncio.TimeoutError:
+                if proxy_dict and config.REAUTH_FORCE_PROXY:
+                    logger.warning(f"⚠️ [{file_name}] 新会话代理连接超时，回退到本地连接")
+                    print(f"⚠️ [{file_name}] 新会话代理连接超时，回退到本地连接", flush=True)
+                    try:
+                        await new_client.disconnect()
+                    except Exception as e:
+                        logger.warning(f"⚠️ [{file_name}] 断开新客户端失败: {e}")
+                    # 重新创建不带代理的客户端
+                    new_client = TelegramClient(
+                        new_session_path,
+                        int(new_api_id),
+                        str(new_api_hash),
+                        timeout=config.CONNECTION_TIMEOUT,
+                        device_model=random_device_params.get('device_model', 'Desktop') if random_device_params else 'Desktop',
+                        system_version=random_device_params.get('system_version', 'Windows 10') if random_device_params else 'Windows 10',
+                        app_version=random_device_params.get('app_version', '3.2.8 x64') if random_device_params else '3.2.8 x64',
+                        lang_code=random_device_params.get('lang_code', 'en') if random_device_params else 'en',
+                        system_lang_code=random_device_params.get('system_lang_code', 'en-US') if random_device_params else 'en-US'
+                    )
+                    await new_client.connect()
+                    logger.info(f"✅ [{file_name}] 新会话本地连接成功")
+                    print(f"✅ [{file_name}] 新会话本地连接成功", flush=True)
+                else:
+                    raise
+            
+            # 步骤5: 请求验证码
+            logger.info(f"📲 [{file_name}] 步骤4: 请求验证码...")
+            print(f"📲 [{file_name}] 步骤4: 请求验证码...", flush=True)
+            
+            sent_code = await new_client(SendCodeRequest(
+                phone,
+                int(new_api_id),
+                str(new_api_hash),
+                CodeSettings()
+            ))
+            
+            logger.info(f"✅ [{file_name}] 验证码已发送")
+            print(f"✅ [{file_name}] 验证码已发送", flush=True)
+            
+            # 步骤6: 从旧会话获取验证码
+            logger.info(f"📥 [{file_name}] 步骤5: 获取验证码...")
+            print(f"📥 [{file_name}] 步骤5: 获取验证码...", flush=True)
+            
+            await asyncio.sleep(3)  # 等待验证码到达
+            
+            entity = await client.get_entity(777000)
+            messages = await client.get_messages(entity, limit=1)
+            
+            if not messages:
+                return {'status': 'other_error', 'error': '未收到验证码'}
+            
+            # Support both 5 and 6 digit verification codes
+            # Use a pattern that works for digit-only codes without word boundaries
+            code_match = re.search(r"(\d{5,6})", messages[0].message)
+            if not code_match:
+                return {'status': 'other_error', 'error': '验证码格式不正确'}
+            
+            code = code_match.group(1)
+            logger.info(f"✅ [{file_name}] 获取到验证码: {code}")
+            print(f"✅ [{file_name}] 获取到验证码: {code}", flush=True)
+            
+            # 步骤7: 新客户端登录
+            logger.info(f"🔐 [{file_name}] 步骤6: 新会话登录...")
+            print(f"🔐 [{file_name}] 步骤6: 新会话登录...", flush=True)
+            
+            try:
+                await new_client.sign_in(
+                    phone=phone,
+                    phone_code_hash=sent_code.phone_code_hash,
+                    code=code
+                )
+                logger.info(f"✅ [{file_name}] 新会话登录成功")
+                print(f"✅ [{file_name}] 新会话登录成功", flush=True)
+            except SessionPasswordNeededError:
+                # 需要2FA密码 - 优先使用旧密码，如果没有则使用新密码
+                password_to_use = old_password if old_password else new_password
+                if not password_to_use:
+                    return {'status': 'wrong_password', 'error': '需要2FA密码但未提供'}
+                
+                try:
+                    await new_client.sign_in(phone=phone, password=password_to_use)
+                    logger.info(f"✅ [{file_name}] 使用2FA密码登录成功")
+                    print(f"✅ [{file_name}] 使用2FA密码登录成功", flush=True)
+                except PasswordHashInvalidError:
+                    return {'status': 'wrong_password', 'error': '2FA密码错误'}
+            
+            # 初始化密码设置状态标志
+            password_set_success = False
+            
+            # 步骤8: 设置新密码（如果提供）
+            if new_password and new_password != old_password:
+                logger.info(f"🔑 [{file_name}] 步骤7: 设置新密码...")
+                print(f"🔑 [{file_name}] 步骤7: 设置新密码...", flush=True)
+                
+                try:
+                    # 使用edit_2fa方法来设置新密码
+                    # 这是Telethon推荐的方式
+                    await new_client.edit_2fa(
+                        current_password=old_password if old_password else None,
+                        new_password=new_password,
+                        hint=f"Modified {datetime.now(timezone.utc).strftime('%Y-%m-%d')}",  # 使用UTC时间
+                        email=None  # 可选的恢复邮箱
+                    )
+                    
+                    password_set_success = True
+                    logger.info(f"✅ [{file_name}] 新密码设置成功")
+                    print(f"✅ [{file_name}] 新密码设置成功", flush=True)
+                    
+                except PasswordHashInvalidError:
+                    # 专门处理密码错误异常
+                    logger.warning(f"⚠️ [{file_name}] 旧密码不正确，无法设置新密码")
+                    print(f"⚠️ [{file_name}] 旧密码不正确，无法设置新密码", flush=True)
+                    # 不阻止整个流程，继续执行
+                    
+                except (RPCError, FloodWaitError, NetworkError) as e:
+                    # 处理Telegram API相关错误
+                    error_type = type(e).__name__
+                    logger.warning(f"⚠️ [{file_name}] 设置新密码失败（Telegram错误）: {error_type}")
+                    print(f"⚠️ [{file_name}] 设置新密码失败（Telegram错误）: {error_type}", flush=True)
+                    # 不阻止整个流程，继续执行
+                    
+                except Exception as e:
+                    # 捕获其他未预期的错误
+                    error_type = type(e).__name__
+                    logger.warning(f"⚠️ [{file_name}] 设置新密码时出现未预期错误: {error_type}")
+                    print(f"⚠️ [{file_name}] 设置新密码时出现未预期错误: {error_type}", flush=True)
+                    # 不阻止整个流程，继续执行
+                
+                # 如果密码设置失败，记录到结果中
+                if not password_set_success:
+                    logger.info(f"ℹ️ [{file_name}] 注意: 新密码未成功设置，账号当前密码保持不变")
+                    print(f"ℹ️ [{file_name}] 注意: 新密码未成功设置，账号当前密码保持不变", flush=True)
+                    
+            elif new_password and new_password == old_password:
+                logger.info(f"ℹ️ [{file_name}] 新密码与旧密码相同，跳过密码设置")
+                print(f"ℹ️ [{file_name}] 新密码与旧密码相同，跳过密码设置", flush=True)
+            else:
+                logger.info(f"ℹ️ [{file_name}] 未提供新密码，跳过密码设置")
+                print(f"ℹ️ [{file_name}] 未提供新密码，跳过密码设置", flush=True)
+            
+            # 步骤9: 登出旧会话
+            logger.info(f"🚪 [{file_name}] 步骤8: 登出旧会话...")
+            print(f"🚪 [{file_name}] 步骤8: 登出旧会话...", flush=True)
+            
+            try:
+                await client.log_out()
+                logger.info(f"✅ [{file_name}] 旧会话已登出")
+                print(f"✅ [{file_name}] 旧会话已登出", flush=True)
+            except Exception as e:
+                logger.warning(f"⚠️ [{file_name}] 登出旧会话失败: {e}")
+                print(f"⚠️ [{file_name}] 登出旧会话失败: {e}", flush=True)
+            
+            # 步骤10: 验证旧会话失效
+            logger.info(f"✔️ [{file_name}] 步骤9: 验证旧会话失效...")
+            print(f"✔️ [{file_name}] 步骤9: 验证旧会话失效...", flush=True)
+            
+            # 断开新客户端
+            await new_client.disconnect()
+            
+            # 替换旧会话文件
+            old_session_file = f"{session_base}.session"
+            new_session_file = f"{new_session_path}.session"
+            
+            if os.path.exists(new_session_file):
+                if os.path.exists(old_session_file):
+                    os.remove(old_session_file)
+                shutil.move(new_session_file, old_session_file)
+                
+                # 处理journal文件
+                new_journal = f"{new_session_path}.session-journal"
+                old_journal = f"{session_base}.session-journal"
+                if os.path.exists(new_journal):
+                    if os.path.exists(old_journal):
+                        os.remove(old_journal)
+                    shutil.move(new_journal, old_journal)
+                
+                logger.info(f"✅ [{file_name}] 新会话文件已替换旧会话")
+                print(f"✅ [{file_name}] 新会话文件已替换旧会话", flush=True)
+            
+            # 步骤10: 如果原始格式是TData，转换回TData
+            if file_type == 'tdata' and original_tdata_path:
+                logger.info(f"📂 [{file_name}] 步骤10: 转换Session回TData格式...")
+                print(f"📂 [{file_name}] 步骤10: 转换Session回TData格式...", flush=True)
+                
+                convert_client = None
+                try:
+                    # 使用新Session创建TData - 添加总超时保护（90秒）
+                    try:
+                        new_tdata_path = f"{original_tdata_path}_new"
+                        os.makedirs(new_tdata_path, exist_ok=True)
+                        
+                        # 连接新Session - 使用OpenTele的TelegramClient
+                        from opentele.tl import TelegramClient as OpenTeleClient
+                        convert_client = OpenTeleClient(
+                            session_base,
+                            int(new_api_id),
+                            str(new_api_hash)
+                        )
+                        
+                        # 连接超时保护（15秒）
+                        await asyncio.wait_for(convert_client.connect(), timeout=15)
+                        
+                        if not await convert_client.is_user_authorized():
+                            logger.error(f"❌ [{file_name}] 新Session未授权，无法转换回TData")
+                            print(f"❌ [{file_name}] 新Session未授权，无法转换回TData", flush=True)
+                            # 清理临时目录
+                            if os.path.exists(new_tdata_path):
+                                shutil.rmtree(new_tdata_path, ignore_errors=True)
+                            return {'status': 'other_error', 'error': '新Session未授权，无法转换回TData'}
+                        
+                        # 转换Session为TData
+                        logger.info(f"🔄 [{file_name}] 开始转换Session为TData...")
+                        print(f"🔄 [{file_name}] 开始转换Session为TData...", flush=True)
+                        
+                        # 转换Session为TData - 添加超时保护（60秒）
+                        try:
+                            tdesk_new = await asyncio.wait_for(
+                                convert_client.ToTDesktop(flag=UseCurrentSession),
+                                timeout=60
+                            )
+                        except asyncio.TimeoutError:
+                            logger.error(f"⏰ [{file_name}] Session转TData超时（60秒）")
+                            print(f"⏰ [{file_name}] Session转TData超时（60秒）", flush=True)
+                            if os.path.exists(new_tdata_path):
+                                shutil.rmtree(new_tdata_path, ignore_errors=True)
+                            return {'status': 'other_error', 'error': 'Session转TData超时'}
+                        
+                        # 保存TData - 添加超时保护（使用线程，15秒）
+                        logger.info(f"💾 [{file_name}] 保存TData到: {new_tdata_path}")
+                        print(f"💾 [{file_name}] 保存TData到: {new_tdata_path}", flush=True)
+                        
+                        try:
+                            await asyncio.wait_for(
+                                asyncio.to_thread(tdesk_new.SaveTData, new_tdata_path),
+                                timeout=15
+                            )
+                        except asyncio.TimeoutError:
+                            logger.error(f"⏰ [{file_name}] 保存TData超时（15秒）")
+                            print(f"⏰ [{file_name}] 保存TData超时（15秒）", flush=True)
+                            if os.path.exists(new_tdata_path):
+                                shutil.rmtree(new_tdata_path, ignore_errors=True)
+                            return {'status': 'other_error', 'error': '保存TData超时'}
+                        
+                    except asyncio.TimeoutError:
+                        logger.error(f"⏰ [{file_name}] TData转换整体超时")
+                        print(f"⏰ [{file_name}] TData转换整体超时", flush=True)
+                        if os.path.exists(new_tdata_path):
+                            shutil.rmtree(new_tdata_path, ignore_errors=True)
+                        return {'status': 'other_error', 'error': 'TData转换整体超时'}
+                    
+                    # 验证TData目录是否创建成功
+                    if not os.path.exists(new_tdata_path):
+                        logger.error(f"❌ [{file_name}] TData转换失败：目录不存在")
+                        print(f"❌ [{file_name}] TData转换失败：目录不存在", flush=True)
+                        return {'status': 'other_error', 'error': 'TData转换失败：目录不存在'}
+                    
+                    tdata_dirs = [d for d in os.listdir(new_tdata_path) if os.path.isdir(os.path.join(new_tdata_path, d))]
+                    if not tdata_dirs:
+                        logger.error(f"❌ [{file_name}] TData转换失败：未生成TData目录")
+                        print(f"❌ [{file_name}] TData转换失败：未生成TData目录", flush=True)
+                        if os.path.exists(new_tdata_path):
+                            shutil.rmtree(new_tdata_path, ignore_errors=True)
+                        return {'status': 'other_error', 'error': 'TData转换失败：未生成TData目录'}
+                    
+                    logger.info(f"✅ [{file_name}] TData目录已生成: {tdata_dirs}")
+                    print(f"✅ [{file_name}] TData目录已生成: {tdata_dirs}", flush=True)
+                    
+                    # 创建2fa.txt文件（只在密码设置成功时）
+                    if new_password and password_set_success:
+                        password_file = os.path.join(new_tdata_path, "2fa.txt")
+                        with open(password_file, 'w', encoding='utf-8') as f:
+                            f.write(new_password)
+                        logger.info(f"✅ [{file_name}] 已创建2fa.txt密码文件")
+                        print(f"✅ [{file_name}] 已创建2fa.txt密码文件", flush=True)
+                    
+                    # 删除旧TData，替换为新TData
+                    logger.info(f"🔄 [{file_name}] 替换旧TData...")
+                    print(f"🔄 [{file_name}] 替换旧TData...", flush=True)
+                    if os.path.exists(original_tdata_path):
+                        shutil.rmtree(original_tdata_path, ignore_errors=True)
+                    shutil.move(new_tdata_path, original_tdata_path)
+                    
+                    logger.info(f"✅ [{file_name}] Session已成功转换回TData格式")
+                    print(f"✅ [{file_name}] Session已成功转换回TData格式", flush=True)
+                    
+                    # 断开客户端
+                    if convert_client:
+                        await convert_client.disconnect()
+                    
+                except Exception as e:
+                    logger.error(f"❌ [{file_name}] 转换回TData失败: {e}")
+                    print(f"❌ [{file_name}] 转换回TData失败: {e}", flush=True)
+                    import traceback
+                    traceback.print_exc()
+                    
+                    # 清理临时目录
+                    if os.path.exists(f"{original_tdata_path}_new"):
+                        shutil.rmtree(f"{original_tdata_path}_new", ignore_errors=True)
+                    
+                    # 断开客户端
+                    if convert_client:
+                        try:
+                            await convert_client.disconnect()
+                        except Exception as e:
+                            logger.warning(f"⚠️ [{file_name}] 断开客户端失败: {e}")
+                    
+                    # TData转换失败应该返回错误，不应该标记为成功
+                    return {'status': 'other_error', 'error': f'TData转换失败: {str(e)}'}
+            
+            logger.info(f"🎉 [{file_name}] 重新授权完成！")
+            print(f"🎉 [{file_name}] 重新授权完成！", flush=True)
+            
+            # 准备返回数据
+            result = {
+                'status': 'success',
+                'phone': phone,
+                'message': '重新授权成功',
+                'file_type': file_type,
+                'new_password': new_password if new_password else '无',  # 新密码
+                'password_set_success': password_set_success,  # 密码设置状态：True=成功，False=失败/未尝试
+                'device_model': random_device_params.get('device_model', '默认设备') if random_device_params else '默认设备',
+                'system_version': random_device_params.get('system_version', '默认系统') if random_device_params else '默认系统',
+                'app_version': random_device_params.get('app_version', '默认版本') if random_device_params else '默认版本',
+                'proxy_used': '使用代理' if proxy_dict else '本地连接',
+                'proxy_type': proxy_info.get('type', 'N/A') if proxy_info else 'N/A'
+            }
+            
+            # 更新JSON文件（包括新设备参数和twoFA）
+            if file_type == 'session':
+                json_path = os.path.splitext(f"{session_base}.session")[0] + '.json'
+                try:
+                    current_time = datetime.now(BEIJING_TZ)
+                    
+                    # 读取或创建JSON数据
+                    if os.path.exists(json_path):
+                        with open(json_path, 'r', encoding='utf-8') as f:
+                            json_data = json.load(f)
+                        logger.info(f"📄 [{file_name}] 读取现有JSON文件")
+                        print(f"📄 [{file_name}] 读取现有JSON文件", flush=True)
+                    else:
+                        # 创建新的JSON文件结构
+                        json_data = {
+                            "phone": phone,
+                            "session_file": os.path.splitext(file_name)[0],
+                            "last_connect_date": current_time.strftime('%Y-%m-%dT%H:%M:%S+0000'),
+                            "session_created_date": current_time.strftime('%Y-%m-%dT%H:%M:%S+0000'),
+                            "last_check_time": int(current_time.timestamp())
+                        }
+                        logger.info(f"📄 [{file_name}] 创建新JSON文件")
+                        print(f"📄 [{file_name}] 创建新JSON文件", flush=True)
+                    
+                    # 更新设备参数（如果使用了随机设备）
+                    if random_device_params:
+                        json_data['app_id'] = new_api_id
+                        json_data['app_hash'] = new_api_hash
+                        json_data['device_model'] = random_device_params.get('device_model', 'Desktop')
+                        json_data['system_version'] = random_device_params.get('system_version', 'Windows 10')
+                        json_data['app_version'] = random_device_params.get('app_version', '3.2.8 x64')
+                        json_data['lang_pack'] = random_device_params.get('lang_code', 'en')
+                        json_data['system_lang_pack'] = random_device_params.get('system_lang_code', 'en-US')
+                        
+                        # 兼容旧字段名
+                        json_data['device'] = random_device_params.get('device', 'Desktop')
+                        json_data['sdk'] = random_device_params.get('sdk', 'Windows 10 x64')
+                        
+                        logger.info(f"✅ [{file_name}] 已更新JSON文件中的设备参数")
+                        print(f"✅ [{file_name}] 已更新JSON文件中的设备参数", flush=True)
+                    
+                    # 更新2FA密码（只在密码设置成功时更新）
+                    if new_password and password_set_success:
+                        # 删除所有旧的密码字段
+                        old_fields_to_remove = ['twoFA', '2fa', 'password', 'two_fa']
+                        for field in old_fields_to_remove:
+                            if field in json_data:
+                                del json_data[field]
+                        
+                        # 设置标准的 twofa 字段
+                        json_data['twoFA'] = new_password
+                        json_data['has_password'] = True
+                        logger.info(f"✅ [{file_name}] 已更新JSON文件中的twofa字段")
+                        print(f"✅ [{file_name}] 已更新JSON文件中的twofa字段", flush=True)
+                    elif new_password and not password_set_success:
+                        logger.info(f"ℹ️ [{file_name}] 密码设置失败，保持JSON文件中的旧密码")
+                        print(f"ℹ️ [{file_name}] 密码设置失败，保持JSON文件中的旧密码", flush=True)
+                    
+                    # 保存JSON文件
+                    with open(json_path, 'w', encoding='utf-8') as f:
+                        json.dump(json_data, f, ensure_ascii=False, indent=2)
+                    
+                    logger.info(f"💾 [{file_name}] JSON文件已保存")
+                    print(f"💾 [{file_name}] JSON文件已保存", flush=True)
+                    
+                except Exception as e:
+                    logger.warning(f"⚠️ [{file_name}] 更新JSON文件失败: {e}")
+                    print(f"⚠️ [{file_name}] 更新JSON文件失败: {e}", flush=True)
+            
+            # 更新TData格式的密码文件（只在密码设置成功时更新）
+            if new_password and password_set_success and file_type == 'tdata' and original_tdata_path:
+                try:
+                    # 尝试常见的密码文件名
+                    password_files = ['2fa.txt', 'twofa.txt', 'password.txt']
+                    password_file_path = None
+                    
+                    # 检查是否已存在密码文件
+                    for pf in password_files:
+                        test_path = os.path.join(original_tdata_path, pf)
+                        if os.path.exists(test_path):
+                            password_file_path = test_path
+                            break
+                    
+                    # 如果不存在，创建2fa.txt
+                    if not password_file_path:
+                        password_file_path = os.path.join(original_tdata_path, '2fa.txt')
+                    
+                    # 写入新密码
+                    with open(password_file_path, 'w', encoding='utf-8') as f:
+                        f.write(new_password)
+                    
+                    logger.info(f"✅ [{file_name}] 已更新TData密码文件: {os.path.basename(password_file_path)}")
+                    print(f"✅ [{file_name}] 已更新TData密码文件: {os.path.basename(password_file_path)}", flush=True)
+                except Exception as e:
+                    logger.warning(f"⚠️ [{file_name}] 更新TData密码文件失败: {e}")
+                    print(f"⚠️ [{file_name}] 更新TData密码文件失败: {e}", flush=True)
+            elif new_password and not password_set_success and file_type == 'tdata' and original_tdata_path:
+                logger.info(f"ℹ️ [{file_name}] 密码设置失败，保持TData原始密码文件")
+                print(f"ℹ️ [{file_name}] 密码设置失败，保持TData原始密码文件", flush=True)
+            
+            # 添加文件路径信息
+            if file_type == 'session':
+                # Session格式：返回session文件路径
+                result['session_path'] = f"{session_base}.session"
+                result['tdata_path'] = None
+            else:
+                # TData格式：返回TData目录路径和session文件路径
+                result['session_path'] = f"{session_base}.session" if os.path.exists(f"{session_base}.session") else None
+                result['tdata_path'] = original_tdata_path
+            
+            return result
+            
+        except UserDeactivatedError:
+            return {'status': 'frozen', 'error': '账号已被冻结'}
+        except PhoneNumberBannedError:
+            return {'status': 'banned', 'error': '账号已被封禁'}
+        except PasswordHashInvalidError:
+            return {'status': 'wrong_password', 'error': '密码错误'}
+        except asyncio.TimeoutError:
+            return {'status': 'network_error', 'error': '连接超时'}
+        except Exception as e:
+            logger.error(f"❌ [{file_name}] 重新授权失败: {e}")
+            print(f"❌ [{file_name}] 重新授权失败: {e}", flush=True)
+            return {'status': 'other_error', 'error': str(e)}
+        
+        finally:
+            # 清理客户端
+            if client:
+                try:
+                    await client.disconnect()
+                except:
+                    pass
+            if new_client:
+                try:
+                    await new_client.disconnect()
+                except:
+                    pass
+            
+            # 清理临时Session文件（如果是从TData转换的）
+            if temp_session_path and os.path.exists(f"{temp_session_path}.session"):
+                try:
+                    os.remove(f"{temp_session_path}.session")
+                    journal_file = f"{temp_session_path}.session-journal"
+                    if os.path.exists(journal_file):
+                        os.remove(journal_file)
+                    logger.info(f"🧹 [{file_name}] 已清理临时Session文件")
+                except Exception as e:
+                    logger.warning(f"⚠️ [{file_name}] 清理临时Session失败: {e}")
+    
+    def _generate_reauthorize_report(self, context: CallbackContext, user_id: int, results: Dict, progress_msg):
+        """生成重新授权报告和打包结果 - 确保永不卡死"""
+        logger.info("📊 开始生成报告和打包结果...")
+        print("📊 开始生成报告和打包结果...", flush=True)
+        
+        timestamp = datetime.now(BEIJING_TZ).strftime("%Y%m%d_%H%M%S")
+        
+        # 统计
+        total = sum(len(v) for v in results.values())
+        success_count = len(results['success'])
+        frozen_count = len(results['frozen'])
+        banned_count = len(results['banned'])
+        wrong_pwd_count = len(results['wrong_password'])
+        network_error_count = len(results['network_error'])
+        other_error_count = len(results['other_error'])
+        
+        # 生成文本报告 - 添加异常保护
+        report_filename = f"reauthorize_report_{timestamp}.txt"
+        report_path = os.path.join(config.RESULTS_DIR, report_filename)
+        
+        try:
+            with open(report_path, 'w', encoding='utf-8') as f:
+                f.write("=" * 80 + "\n")
+                f.write(f"{t(user_id, 'reauth_report_title')}\n")
+                f.write("=" * 80 + "\n")
+                f.write(f"{t(user_id, 'reauth_report_time')} {datetime.now(BEIJING_TZ).strftime('%Y-%m-%d %H:%M:%S CST')}\n")
+                f.write(f"{t(user_id, 'reauth_report_total')} {total}\n")
+                f.write(f"{t(user_id, 'reauth_report_success')} {success_count}\n")
+                f.write(f"{t(user_id, 'reauth_report_frozen')} {frozen_count}\n")
+                f.write(f"{t(user_id, 'reauth_report_banned')} {banned_count}\n")
+                f.write(f"{t(user_id, 'reauth_report_pwd_error')} {wrong_pwd_count}\n")
+                f.write(f"{t(user_id, 'reauth_report_network')} {network_error_count}\n")
+                f.write(f"{t(user_id, 'reauth_report_other')} {other_error_count}\n")
+                f.write("=" * 80 + "\n\n")
+                
+                # 详细结果
+                for category, items in results.items():
+                    if items:
+                        # 翻译分类标题
+                        category_key = f'reauth_report_category_{category}'
+                        category_title = t(user_id, category_key)
+                        f.write(f"\n{category_title} ({len(items)})\n")
+                        f.write("-" * 80 + "\n")
+                        for file_path, file_name, result in items:
+                            f.write(f"{t(user_id, 'reauth_report_file')} {file_name}\n")
+                            if 'phone' in result:
+                                f.write(f"{t(user_id, 'reauth_report_phone')} {result['phone']}\n")
+                            
+                            # 成功的账户显示详细信息
+                            if category == 'success':
+                                if 'device_model' in result:
+                                    f.write(f"{t(user_id, 'reauth_report_device_model')} {result['device_model']}\n")
+                                if 'system_version' in result:
+                                    f.write(f"{t(user_id, 'reauth_report_system_version')} {result['system_version']}\n")
+                                if 'app_version' in result:
+                                    f.write(f"{t(user_id, 'reauth_report_app_version')} {result['app_version']}\n")
+                                if 'proxy_used' in result:
+                                    # 翻译连接方式
+                                    proxy_value = result['proxy_used']
+                                    if '使用代理' in proxy_value:
+                                        proxy_value_translated = t(user_id, 'reauth_connection_proxy')
+                                    elif '本地连接 (代理失败后回退)' in proxy_value:
+                                        proxy_value_translated = t(user_id, 'reauth_connection_local_fallback')
+                                    elif '本地连接' in proxy_value:
+                                        proxy_value_translated = t(user_id, 'reauth_connection_local')
+                                    else:
+                                        proxy_value_translated = proxy_value
+                                    
+                                    f.write(f"{t(user_id, 'reauth_report_connection')} {proxy_value_translated}")
+                                    if result.get('proxy_type') and result['proxy_type'] != 'N/A':
+                                        f.write(f" ({result['proxy_type'].upper()})")
+                                    f.write("\n")
+                                if 'new_password' in result:
+                                    f.write(f"{t(user_id, 'reauth_report_new_password')} {result['new_password']}\n")
+                            
+                            if 'error' in result:
+                                f.write(f"{t(user_id, 'reauth_report_error')} {result['error']}\n")
+                            f.write("\n")
+            logger.info(f"✅ 报告文件已生成: {report_path}")
+            print(f"✅ 报告文件已生成: {report_path}", flush=True)
+        except Exception as e:
+            logger.error(f"❌ 生成报告文件失败: {e}")
+            print(f"❌ 生成报告文件失败: {e}", flush=True)
+            # 创建一个简化的报告
+            try:
+                with open(report_path, 'w', encoding='utf-8') as f:
+                    f.write(f"{t(user_id, 'reauth_report_gen_failed')} {e}\n\n")
+                    f.write(f"{t(user_id, 'reauth_report_total_success').format(total=total, success=success_count)}\n")
+            except:
+                pass
+        
+        # 打包成功的账号（支持TData和Session格式）- 添加异常保护
+        zip_files = []
+        
+        # 打包成功的账号
+        if results['success']:
+            logger.info("📦 开始打包成功的账号...")
+            print("📦 开始打包成功的账号...", flush=True)
+            try:
+                success_zip = os.path.join(config.RESULTS_DIR, f"reauthorize_success_{timestamp}.zip")
+                with zipfile.ZipFile(success_zip, 'w', zipfile.ZIP_DEFLATED) as zipf:
+                    for file_path, file_name, result in results['success']:
+                        result_file_type = result.get('file_type', 'session')
+                        phone = result.get('phone', 'unknown')
+                        
+                        if result_file_type == 'tdata':
+                            # TData格式：创建 手机号/tdata/D877... 结构
+                            tdata_path = result.get('tdata_path')
+                            if tdata_path and os.path.exists(tdata_path):
+                                # SaveTData会在指定路径下创建tdata子目录
+                                # 需要找到包含D877...目录的实际tdata目录
+                                actual_tdata_dir = os.path.join(tdata_path, 'tdata')
+                                
+                                if os.path.exists(actual_tdata_dir) and os.path.isdir(actual_tdata_dir):
+                                    # 有tdata子目录，使用它
+                                    source_dir = actual_tdata_dir
+                                else:
+                                    # 没有tdata子目录，tdata_path本身就是tdata目录
+                                    source_dir = tdata_path
+                                
+                                # 添加source_dir下的所有文件，路径为：手机号/tdata/D877.../
+                                for root, dirs, files in os.walk(source_dir):
+                                    for file in files:
+                                        file_full_path = os.path.join(root, file)
+                                        # 计算相对于source_dir的相对路径
+                                        rel_path = os.path.relpath(file_full_path, source_dir)
+                                        # 构建完整的归档路径：手机号/tdata/D877.../file
+                                        arc_path = os.path.join(phone, 'tdata', rel_path)
+                                        zipf.write(file_full_path, arc_path)
+                                
+                                # 如果密码设置成功，创建2fa.txt文件
+                                password_set_success = result.get('password_set_success', False)
+                                new_password = result.get('new_password', '')
+                                if password_set_success and new_password and new_password != '无':
+                                    # 在zip中创建 手机号/2fa.txt 文件（与tdata同级）
+                                    password_content = new_password.encode('utf-8')
+                                    password_arcname = os.path.join(phone, '2fa.txt')
+                                    zipf.writestr(password_arcname, password_content)
+                                
+                                # 添加Session文件（如果有）到手机号根目录
+                                session_path = result.get('session_path')
+                                if session_path and os.path.exists(session_path):
+                                    session_base = os.path.splitext(session_path)[0]
+                                    # Session文件
+                                    zipf.write(session_path, f"{phone}/{phone}.session")
+                                    # Journal文件
+                                    journal_path = f"{session_base}.session-journal"
+                                    if os.path.exists(journal_path):
+                                        zipf.write(journal_path, f"{phone}/{phone}.session-journal")
+                                    # JSON文件
+                                    json_path = f"{session_base}.json"
+                                    if os.path.exists(json_path):
+                                        zipf.write(json_path, f"{phone}/{phone}.json")
+                        else:
+                            # Session格式：直接打包
+                            if os.path.exists(file_path):
+                                zipf.write(file_path, file_name)
+                            # 添加journal文件
+                            journal_path = file_path + '-journal'
+                            if os.path.exists(journal_path):
+                                zipf.write(journal_path, file_name + '-journal')
+                            # 添加JSON文件
+                            json_path = os.path.splitext(file_path)[0] + '.json'
+                            if os.path.exists(json_path):
+                                zipf.write(json_path, os.path.splitext(file_name)[0] + '.json')
+                zip_files.append(('success', success_zip, success_count))
+                logger.info(f"✅ 成功账号已打包: {success_zip}")
+                print(f"✅ 成功账号已打包: {success_zip}", flush=True)
+            except Exception as e:
+                logger.error(f"❌ 打包成功账号失败: {e}")
+                print(f"❌ 打包成功账号失败: {e}", flush=True)
+        
+        # 打包失败的账号（分类）- 添加异常保护
+        failed_categories = {
+            'frozen': ('冻结', results['frozen']),
+            'banned': ('封禁', results['banned']),
+            'wrong_password': ('密码错误', results['wrong_password']),
+            'network_error': ('网络错误', results['network_error']),
+            'other_error': ('其他错误', results['other_error'])
+        }
+        
+        for category_key, (category_name, items) in failed_categories.items():
+            if items:
+                logger.info(f"📦 开始打包{category_name}账号...")
+                print(f"📦 开始打包{category_name}账号...", flush=True)
+                try:
+                    failed_zip = os.path.join(config.RESULTS_DIR, f"reauthorize_{category_key}_{timestamp}.zip")
+                    with zipfile.ZipFile(failed_zip, 'w', zipfile.ZIP_DEFLATED) as zipf:
+                        for file_path, file_name, result in items:
+                            # 失败的账号直接返回原始上传的完整文件结构
+                            # 不做任何修改，保持原样
+                            if os.path.isdir(file_path):
+                                # TData目录 - 找到并打包包含手机号的完整文件夹
+                                # file_path通常指向D877...或tdata目录
+                                # 需要找到最顶层的手机号文件夹并完整打包
+                                
+                                # 向上查找，找到手机号文件夹（通常是数字命名的文件夹）
+                                current_path = file_path
+                                phone_folder = None
+                                
+                                # 最多向上查找3层
+                                for _ in range(3):
+                                    parent = os.path.dirname(current_path)
+                                    folder_name = os.path.basename(current_path)
+                                    
+                                    # 如果文件夹名是数字（手机号），就是我们要找的
+                                    if folder_name.isdigit() and len(folder_name) > 10:
+                                        phone_folder = current_path
+                                        break
+                                    current_path = parent
+                                
+                                # 如果没找到手机号文件夹，就用file_path的父目录
+                                if not phone_folder:
+                                    phone_folder = os.path.dirname(file_path)
+                                
+                                # 打包整个手机号文件夹及其所有内容
+                                base_dir = os.path.dirname(phone_folder)
+                                for root, dirs, files in os.walk(phone_folder):
+                                    for file in files:
+                                        file_full_path = os.path.join(root, file)
+                                        # 保持从base_dir开始的相对路径
+                                        rel_path = os.path.relpath(file_full_path, base_dir)
+                                        zipf.write(file_full_path, rel_path)
+                            else:
+                                # Session文件 - 直接使用原始文件名
+                                if os.path.exists(file_path):
+                                    zipf.write(file_path, file_name)
+                                # 添加journal文件（如果存在）
+                                journal_path = file_path + '-journal'
+                                if os.path.exists(journal_path):
+                                    zipf.write(journal_path, file_name + '-journal')
+                                # 添加json文件（如果存在）
+                                json_path = os.path.splitext(file_path)[0] + '.json'
+                                if os.path.exists(json_path):
+                                    zipf.write(json_path, os.path.splitext(file_name)[0] + '.json')
+                    zip_files.append((category_key, failed_zip, len(items)))
+                    logger.info(f"✅ {category_name}账号已打包: {failed_zip}")
+                    print(f"✅ {category_name}账号已打包: {failed_zip}", flush=True)
+                except Exception as e:
+                    logger.error(f"❌ 打包{category_name}账号失败: {e}")
+                    print(f"❌ 打包{category_name}账号失败: {e}", flush=True)
+        
+        # 发送统计信息 - 添加异常保护
+        summary = f"""
+{t(user_id, 'reauth_complete')}
+
+<b>{t(user_id, 'reauth_result_stats')}</b>
+{t(user_id, 'reauth_result_total').format(count=total)}
+{t(user_id, 'reauth_result_success').format(count=success_count)}
+{t(user_id, 'reauth_result_frozen').format(count=frozen_count)}
+{t(user_id, 'reauth_result_banned').format(count=banned_count)}
+{t(user_id, 'reauth_result_pwd_error').format(count=wrong_pwd_count)}
+{t(user_id, 'reauth_result_network').format(count=network_error_count)}
+{t(user_id, 'reauth_result_other').format(count=other_error_count)}
+
+<b>{t(user_id, 'reauth_success_rate').format(percent=int(success_count/total*100) if total > 0 else 0)}</b>
+
+{t(user_id, 'reauth_see_report')}
+"""
+        
+        try:
+            context.bot.edit_message_text(
+                chat_id=user_id,
+                message_id=progress_msg.message_id,
+                text=summary,
+                parse_mode='HTML'
+            )
+            logger.info("✅ 统计信息已更新")
+            print("✅ 统计信息已更新", flush=True)
+        except Exception as e:
+            logger.error(f"❌ 更新统计信息失败: {e}")
+            print(f"❌ 更新统计信息失败: {e}", flush=True)
+        
+        # 发送报告文件 - 添加超时和重试机制
+        if os.path.exists(report_path):
+            logger.info("📤 开始发送报告文件...")
+            print("📤 开始发送报告文件...", flush=True)
+            try:
+                with open(report_path, 'rb') as f:
+                    context.bot.send_document(
+                        chat_id=user_id,
+                        document=f,
+                        filename=report_filename,
+                        caption=t(user_id, 'reauth_file_report'),
+                        timeout=60  # 60秒超时
+                    )
+                logger.info("✅ 报告文件已发送")
+                print("✅ 报告文件已发送", flush=True)
+            except Exception as e:
+                logger.error(f"❌ 发送报告文件失败: {e}")
+                print(f"❌ 发送报告文件失败: {e}", flush=True)
+        
+        # 发送ZIP文件 - 添加超时和重试机制，确保每个文件都尝试发送
+        logger.info(f"📤 准备发送 {len(zip_files)} 个ZIP文件...")
+        print(f"📤 准备发送 {len(zip_files)} 个ZIP文件...", flush=True)
+        
+        sent_count = 0
+        for zip_type, zip_path, count in zip_files:
+            if not os.path.exists(zip_path):
+                logger.warning(f"⚠️ ZIP文件不存在: {zip_path}")
+                print(f"⚠️ ZIP文件不存在: {zip_path}", flush=True)
+                continue
+            
+            logger.info(f"📤 发送ZIP文件 {sent_count + 1}/{len(zip_files)}: {os.path.basename(zip_path)}")
+            print(f"📤 发送ZIP文件 {sent_count + 1}/{len(zip_files)}: {os.path.basename(zip_path)}", flush=True)
+            
+            try:
+                type_names = {
+                    'success': t(user_id, 'reauth_file_success').format(count=count),
+                    'frozen': t(user_id, 'reauth_file_frozen').format(count=count),
+                    'banned': t(user_id, 'reauth_file_banned').format(count=count),
+                    'wrong_password': t(user_id, 'reauth_file_wrong_pwd').format(count=count),
+                    'network_error': t(user_id, 'reauth_file_network').format(count=count),
+                    'other_error': t(user_id, 'reauth_file_other').format(count=count)
+                }
+                caption = type_names.get(zip_type, f"{zip_type} ({count})")
+                
+                # 尝试发送，带重试机制
+                max_retries = 3
+                for attempt in range(max_retries):
+                    try:
+                        with open(zip_path, 'rb') as f:
+                            context.bot.send_document(
+                                chat_id=user_id,
+                                document=f,
+                                caption=caption,
+                                filename=os.path.basename(zip_path),
+                                timeout=120  # 120秒超时（针对大文件）
+                            )
+                        sent_count += 1
+                        logger.info(f"✅ ZIP文件已发送: {os.path.basename(zip_path)}")
+                        print(f"✅ ZIP文件已发送: {os.path.basename(zip_path)}", flush=True)
+                        break  # 成功发送，跳出重试循环
+                    except RetryAfter as e:
+                        # 被Telegram限流，等待后重试
+                        wait_time = e.retry_after + 1
+                        logger.warning(f"⚠️ 被限流，等待 {wait_time} 秒后重试...")
+                        print(f"⚠️ 被限流，等待 {wait_time} 秒后重试...", flush=True)
+                        time.sleep(wait_time)
+                    except Exception as e:
+                        if attempt < max_retries - 1:
+                            logger.warning(f"⚠️ 发送失败，重试 {attempt + 1}/{max_retries}: {e}")
+                            print(f"⚠️ 发送失败，重试 {attempt + 1}/{max_retries}: {e}", flush=True)
+                            time.sleep(2)  # 等待2秒后重试
+                        else:
+                            logger.error(f"❌ 发送ZIP失败（已重试{max_retries}次）: {zip_type} - {e}")
+                            print(f"❌ 发送ZIP失败（已重试{max_retries}次）: {zip_type} - {e}", flush=True)
+                            # 即使这个失败，也继续发送下一个
+                
+                # 在文件之间添加延迟，避免被限流
+                if sent_count < len(zip_files):
+                    time.sleep(1)
+                    
+            except Exception as e:
+                logger.error(f"❌ 处理ZIP文件失败 {zip_type}: {e}")
+                print(f"❌ 处理ZIP文件失败 {zip_type}: {e}", flush=True)
+                # 继续处理下一个文件，不要因为一个失败就停止
+        
+        logger.info(f"✅ 报告生成完成！成功发送 {sent_count}/{len(zip_files)} 个ZIP文件")
+        print(f"✅ 报告生成完成！成功发送 {sent_count}/{len(zip_files)} 个ZIP文件", flush=True)
+        
+        # 如果没有成功发送任何文件，发送警告消息
+        if sent_count == 0 and len(zip_files) > 0:
+            try:
+                context.bot.send_message(
+                    chat_id=user_id,
+                    text="⚠️ 所有结果文件发送失败，请联系管理员检查日志",
+                    parse_mode='HTML'
+                )
+            except:
+                pass
+    
+    # ================================
+    # 查询注册时间功能
+    # ================================
+    
+    def handle_check_registration_start(self, query):
+        """处理查询注册时间开始"""
+        query.answer()
+        user_id = query.from_user.id
+        
+        # 检查会员权限
+        if not self.db.is_admin(user_id):
+            is_member, level, expiry = self.db.check_membership(user_id)
+            if not is_member:
+                query.edit_message_text(
+                    text=t(user_id, 'regtime_need_member'),
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton(t(user_id, 'btn_vip_menu'), callback_data="vip_menu"),
+                        InlineKeyboardButton(t(user_id, 'btn_back_to_menu'), callback_data="back_to_main")
+                    ]]),
+                    parse_mode='HTML'
+                )
+                return
+        
+        text = f"""
+<b>{t(user_id, 'regtime_title')}</b>
+
+{t(user_id, 'regtime_intro')}
+{t(user_id, 'regtime_feature1')}
+{t(user_id, 'regtime_feature2')}
+
+<b>{t(user_id, 'regtime_methods_title')}</b>
+{t(user_id, 'regtime_method1')}
+{t(user_id, 'regtime_method2')}
+{t(user_id, 'regtime_method3')}
+
+<b>{t(user_id, 'regtime_notes_title')}</b>
+{t(user_id, 'regtime_note1')}
+{t(user_id, 'regtime_note2')}
+{t(user_id, 'regtime_note3')}
+{t(user_id, 'regtime_note4')}
+{t(user_id, 'regtime_note5')}
+
+<b>{t(user_id, 'regtime_upload_title')}</b>
+{t(user_id, 'regtime_upload_session')}
+{t(user_id, 'regtime_upload_tdata')}
+        """
+        
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton(t(user_id, 'btn_back_to_menu'), callback_data="back_to_main")]
+        ])
+        
+        query.edit_message_text(
+            text=text,
+            reply_markup=keyboard,
+            parse_mode='HTML'
+        )
+        
+        # 设置数据库状态
+        self.db.save_user(user_id, "", "", "registration_check_upload")
+        
+        # 设置pending状态
+        self.pending_registration_check[user_id] = {
+            'status': 'waiting_file',
+            'files': [],
+            'file_type': None
+        }
+    
+    def handle_check_registration_callbacks(self, update: Update, context: CallbackContext, query, data: str):
+        """处理查询注册时间相关回调"""
+        user_id = query.from_user.id
+        
+        if data == "check_reg_cancel":
+            query.answer()
+            if user_id in self.pending_registration_check:
+                self.cleanup_registration_check_task(user_id)
+            self.show_main_menu(update, user_id)
+        elif data == "check_reg_execute":
+            query.answer()
+            self.handle_registration_check_execute(update, context, query, user_id)
+    
+    def cleanup_registration_check_task(self, user_id: int):
+        """清理查询注册时间任务"""
+        if user_id in self.pending_registration_check:
+            task = self.pending_registration_check[user_id]
+            if task.get('temp_dir') and os.path.exists(task['temp_dir']):
+                shutil.rmtree(task['temp_dir'], ignore_errors=True)
+            del self.pending_registration_check[user_id]
+        
+        # 清除用户状态
+        self.db.save_user(user_id, "", "", "")
+    
+    async def process_registration_check_upload(self, update: Update, context: CallbackContext, document):
+        """处理查询注册时间文件上传"""
+        user_id = update.effective_user.id
+        
+        progress_msg = self.safe_send_message(update, f"📥 <b>{t(user_id, 'regtime_processing_file')}...</b>", 'HTML')
+        if not progress_msg:
+            return
+        
+        temp_zip = None
+        try:
+            # 清理旧的临时文件
+            self._cleanup_user_temp_sessions(user_id)
+            
+            # 创建唯一任务ID
+            unique_task_id = f"{user_id}_regcheck_{int(time.time() * 1000)}"
+            
+            # 下载文件
+            temp_dir = tempfile.mkdtemp(prefix="registration_check_")
+            temp_zip = os.path.join(temp_dir, document.file_name)
+            document.get_file().download(temp_zip)
+            
+            # 扫描文件
+            files, extract_dir, file_type = self.processor.scan_zip_file(temp_zip, user_id, unique_task_id)
+            
+            if not files:
+                self.safe_edit_message_text(progress_msg, t(user_id, 'regtime_no_valid_files'), parse_mode='HTML')
+                return
+            
+            # 保存任务信息
+            self.pending_registration_check[user_id] = {
+                'files': files,
+                'file_type': file_type,
+                'temp_dir': temp_dir,
+                'extract_dir': extract_dir,
+                'total_files': len(files),
+                'progress_msg': progress_msg
+            }
+            
+            # 显示确认按钮
+            file_type_str = t(user_id, 'regtime_file_type_session') if file_type == 'session' else t(user_id, 'regtime_file_type_tdata')
+            text = f"""{t(user_id, 'regtime_found_accounts').format(count=len(files))}
+
+<b>{file_type_str}</b>
+
+<b>{t(user_id, 'regtime_process_title')}</b>
+{t(user_id, 'regtime_process1')}
+{t(user_id, 'regtime_process2')}
+{t(user_id, 'regtime_process3')}
+{t(user_id, 'regtime_process4')}
+
+<b>{t(user_id, 'regtime_accuracy_title')}</b>
+{t(user_id, 'regtime_accuracy_intro')}
+{t(user_id, 'regtime_accuracy1')}
+{t(user_id, 'regtime_accuracy2')}
+{t(user_id, 'regtime_accuracy3')}
+
+{t(user_id, 'regtime_ready_question')}
+"""
+            
+            keyboard = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton(t(user_id, 'regtime_btn_start'), callback_data="check_reg_execute"),
+                    InlineKeyboardButton(t(user_id, 'regtime_btn_cancel'), callback_data="check_reg_cancel")
+                ]
+            ])
+            
+            self.safe_edit_message_text(
+                progress_msg,
+                text,
+                parse_mode='HTML',
+                reply_markup=keyboard
+            )
+            
+        except Exception as e:
+            logger.error(f"Registration check upload failed: {e}")
+            import traceback
+            traceback.print_exc()
+            
+            self.safe_edit_message_text(
+                progress_msg,
+                f"{t(user_id, 'regtime_processing_failed')}\n\n{t(user_id, 'regtime_processing_error').format(error=str(e))}",
+                parse_mode='HTML'
+            )
+            
+            # 清理
+            if temp_zip and os.path.exists(os.path.dirname(temp_zip)):
+                shutil.rmtree(os.path.dirname(temp_zip), ignore_errors=True)
+    
+    async def process_profile_update(self, update: Update, context: CallbackContext, document):
+        """处理资料修改文件上传"""
+        user_id = update.effective_user.id
+        
+        progress_msg = self.safe_send_message(update, f"📥 <b>{t(user_id, 'profile_processing_file')}...</b>", 'HTML')
+        if not progress_msg:
+            return
+        
+        temp_zip = None
+        try:
+            # 检查是否有配置任务
+            if user_id not in self.pending_profile_update:
+                self.safe_edit_message_text(progress_msg, f"<b>{t(user_id, 'profile_session_expired')}</b>\n\n请重新配置", parse_mode='HTML')
+                return
+            
+            task = self.pending_profile_update[user_id]
+            config = task['config']
+            
+            # 清理旧的临时文件
+            self._cleanup_user_temp_sessions(user_id)
+            
+            # 创建唯一任务ID
+            unique_task_id = f"{user_id}_profile_{int(time.time() * 1000)}"
+            
+            # 下载文件
+            temp_dir = tempfile.mkdtemp(prefix="profile_update_")
+            temp_zip = os.path.join(temp_dir, document.file_name)
+            document.get_file().download(temp_zip)
+            
+            # 扫描文件
+            files, extract_dir, file_type = self.processor.scan_zip_file(temp_zip, user_id, unique_task_id)
+            
+            if not files:
+                self.safe_edit_message_text(progress_msg, "❌ <b>未找到有效文件</b>\n\n请确保ZIP包含Session或TData格式的文件", parse_mode='HTML')
+                return
+            
+            # 更新任务信息
+            task['files'] = files
+            task['file_type'] = file_type
+            task['temp_dir'] = temp_dir
+            task['extract_dir'] = extract_dir
+            task['progress_msg'] = progress_msg
+            
+            # 显示确认信息
+            config_text = ""
+            
+            # 姓名配置
+            if config.mode == 'random':
+                config_text += f"{t(user_id, 'profile_config_name_label')} {t(user_id, 'profile_display_random_by_country')}\n"
+            elif config.update_name and config.custom_names:
+                config_text += f"{t(user_id, 'profile_config_name_label')} {t(user_id, 'profile_custom_status_configured').format(count=len(config.custom_names))}\n"
+            elif config.update_name:
+                config_text += f"{t(user_id, 'profile_config_name_label')} {t(user_id, 'profile_custom_status_pending')}\n"
+            else:
+                config_text += f"{t(user_id, 'profile_config_name_label')} {t(user_id, 'profile_display_no_modify')}\n"
+            
+            # 头像配置
+            if config.update_photo:
+                if config.photo_action == 'delete_all':
+                    config_text += f"{t(user_id, 'profile_config_avatar_label')} {t(user_id, 'profile_display_delete_history')}\n"
+                elif config.photo_action == 'custom' and config.custom_photos:
+                    config_text += f"{t(user_id, 'profile_config_avatar_label')} {t(user_id, 'profile_custom_status_configured').format(count=len(config.custom_photos))}\n"
+                elif config.photo_action == 'custom':
+                    config_text += f"{t(user_id, 'profile_config_avatar_label')} {t(user_id, 'profile_custom_status_pending')}\n"
+            else:
+                config_text += f"{t(user_id, 'profile_config_avatar_label')} {t(user_id, 'profile_display_no_modify')}\n"
+            
+            # 简介配置
+            if config.update_bio:
+                if config.bio_action == 'clear':
+                    config_text += f"{t(user_id, 'profile_config_bio_label')} {t(user_id, 'profile_display_clear')}\n"
+                elif config.bio_action == 'random':
+                    config_text += f"{t(user_id, 'profile_config_bio_label')} {t(user_id, 'profile_display_random')}\n"
+                elif config.bio_action == 'custom' and config.custom_bios:
+                    config_text += f"{t(user_id, 'profile_config_bio_label')} {t(user_id, 'profile_custom_status_configured').format(count=len(config.custom_bios))}\n"
+                elif config.bio_action == 'custom':
+                    config_text += f"{t(user_id, 'profile_config_bio_label')} {t(user_id, 'profile_custom_status_pending')}\n"
+            else:
+                config_text += f"{t(user_id, 'profile_config_bio_label')} {t(user_id, 'profile_display_no_modify')}\n"
+            
+            # 用户名配置
+            if config.update_username:
+                if config.username_action == 'delete':
+                    config_text += f"{t(user_id, 'profile_config_username_label')} {t(user_id, 'profile_display_delete')}\n"
+                elif config.username_action == 'random':
+                    config_text += f"{t(user_id, 'profile_config_username_label')} {t(user_id, 'profile_display_random')}\n"
+                elif config.username_action == 'custom' and config.custom_usernames:
+                    config_text += f"{t(user_id, 'profile_config_username_label')} {t(user_id, 'profile_custom_status_configured').format(count=len(config.custom_usernames))}\n"
+                elif config.username_action == 'custom':
+                    config_text += f"{t(user_id, 'profile_config_username_label')} {t(user_id, 'profile_custom_status_pending')}\n"
+            else:
+                config_text += f"{t(user_id, 'profile_config_username_label')} {t(user_id, 'profile_display_no_modify')}\n"
+            
+            text = f"""<b>{t(user_id, 'profile_confirm_title')}</b>
+
+━━━━━━━━━━━━━━━━━━━━
+
+<b>{t(user_id, 'profile_file_info')}</b>
+{t(user_id, 'profile_file_type')} {file_type.upper()}
+{t(user_id, 'profile_file_count').format(count=len(files))}
+
+<b>{t(user_id, 'profile_modify_config')}</b>
+{config_text}
+
+━━━━━━━━━━━━━━━━━━━━
+
+<b>{t(user_id, 'profile_confirm_notes')}</b>
+{t(user_id, 'profile_confirm_note1')}
+{t(user_id, 'profile_confirm_note2')}
+{t(user_id, 'profile_confirm_note3')}
+
+━━━━━━━━━━━━━━━━━━━━
+
+{t(user_id, 'profile_confirm_question')}
+"""
+            
+            # 添加确认按钮
+            keyboard = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton(t(user_id, 'profile_btn_confirm'), callback_data="profile_confirm_execute"),
+                    InlineKeyboardButton(t(user_id, 'profile_btn_cancel'), callback_data="profile_cancel")
+                ]
+            ])
+            
+            self.safe_edit_message_text(
+                progress_msg,
+                text,
+                parse_mode='HTML',
+                reply_markup=keyboard
+            )
+            
+        except Exception as e:
+            logger.error(f"Profile update upload failed: {e}")
+            import traceback
+            traceback.print_exc()
+            
+            self.safe_edit_message_text(
+                progress_msg,
+                f"<b>{t(user_id, 'profile_processing_failed')}</b>\n\n{t(user_id, 'profile_error_msg').format(error=str(e))}",
+                parse_mode='HTML'
+            )
+            
+            # 清理
+            if temp_zip and os.path.exists(os.path.dirname(temp_zip)):
+                shutil.rmtree(os.path.dirname(temp_zip), ignore_errors=True)
+    
+    async def _execute_profile_update(self, user_id: int, files: List, file_type: str, config: ProfileUpdateConfig, context: CallbackContext, progress_msg):
+        """执行资料修改的核心逻辑"""
+        results = {
+            'success': [],
+            'failed': [],
+            'details': []
+        }
+        
+        total = len(files)
+        processed = 0
+        start_time = time.time()
+        last_update_time = 0
+        current_account_info = ""
+        
+        async def update_progress_display(force=False):
+            """更新进度显示"""
+            nonlocal last_update_time
+            
+            current_time = time.time()
+            
+            # 控制刷新频率（除非强制更新或已完成）
+            if not force and processed < total:
+                if current_time - last_update_time < self.PROGRESS_UPDATE_INTERVAL:
+                    return
+            
+            last_update_time = current_time
+            
+            # 计算统计信息
+            success_count = len(results['success'])
+            failed_count = len(results['failed'])
+            remaining = total - processed
+            elapsed = current_time - start_time
+            
+            # 计算速度和预估时间（添加除零保护）
+            speed = processed / elapsed if elapsed > 0 and processed > 0 else 0
+            eta = remaining / speed if speed > 0 else 0
+            
+            # 生成进度条
+            progress_bar = generate_progress_bar(processed, total)
+            
+            # 格式化时间
+            elapsed_str = format_time(elapsed)
+            eta_str = format_time(eta)
+            
+            # 构建进度显示文本
+            progress_text = f"""<b>{t(user_id, 'profile_progress_title')}</b>
+
+━━━━━━━━━━━━━━━━━━━━
+{progress_bar}
+━━━━━━━━━━━━━━━━━━━━
+
+<b>{t(user_id, 'profile_stats_title')}</b>
+{t(user_id, 'profile_stats_total')} {total}
+{t(user_id, 'profile_stats_success')} {success_count}
+{t(user_id, 'profile_stats_failed')} {failed_count}
+{t(user_id, 'profile_stats_processing')} {1 if processed < total else 0}
+{t(user_id, 'profile_stats_remaining')} {remaining}
+
+{t(user_id, 'profile_speed').format(speed=f'{speed:.1f}')}
+{t(user_id, 'profile_time_elapsed')} {elapsed_str}
+{t(user_id, 'profile_time_remaining')} {eta_str}
+
+{current_account_info}
+
+━━━━━━━━━━━━━━━━━━━━
+{t(user_id, 'profile_wait_tip')}
+"""
+            
+            try:
+                context.bot.edit_message_text(
+                    chat_id=user_id,
+                    message_id=progress_msg.message_id,
+                    text=progress_text,
+                    parse_mode='HTML'
+                )
+            except Exception as e:
+                logger.warning(f"Failed to update progress: {e}")
+        
+        # 使用信号量控制并发 - 优化为15个并发
+        semaphore = asyncio.Semaphore(MAX_CONCURRENT)  # 最多15个并发，大幅提升处理速度
+        
+        async def update_single_account(idx, file_path, file_name):
+            nonlocal processed, current_account_info
+            async with semaphore:
+                try:
+                    # 小延迟避免请求过快
+                    await asyncio.sleep(DELAY_BETWEEN)
+                    
+                    # 更新当前处理账号信息
+                    current_account_info = f"{t(user_id, 'profile_current_processing')} {file_name}"
+                    await update_progress_display()
+                    
+                    result = await self._update_single_profile(user_id, idx, file_path, file_name, file_type, config)
+                    
+                    if result['success']:
+                        results['success'].append((file_path, file_name, result))
+                        # 更新当前账号处理结果
+                        action_summary = result.get('actions', [t(user_id, 'profile_status_processing_complete')])[0]
+                        current_account_info = f"{t(user_id, 'profile_current_processing')} {file_name}\n   {action_summary}"
+                    else:
+                        results['failed'].append((file_path, file_name, result))
+                        error_msg = result.get('error', t(user_id, 'profile_error_unknown'))[:self.MAX_ERROR_DISPLAY_LENGTH]
+                        current_account_info = f"{t(user_id, 'profile_current_processing')} {file_name}\n   {t(user_id, 'profile_status_failed')} {error_msg}..."
+                    
+                    results['details'].append(result)
+                    processed += 1
+                    
+                    # 更新进度
+                    await update_progress_display()
+                    
+                except Exception as e:
+                    logger.error(f"Failed to update {file_name}: {e}")
+                    results['failed'].append((file_path, file_name, {'success': False, 'error': str(e)}))
+                    processed += 1
+                    await update_progress_display()
+        
+        # 初始显示
+        await update_progress_display(force=True)
+        
+        # 执行所有修改
+        tasks = [update_single_account(idx, file_path, file_name) for idx, (file_path, file_name) in enumerate(files)]
+        await asyncio.gather(*tasks, return_exceptions=True)
+        
+        # 生成报告
+        self._generate_profile_update_report(context, user_id, results, progress_msg)
+        
+        # 清理
+        self.cleanup_profile_update_task(user_id)
+    
+    async def _update_single_profile(self, user_id: int, idx: int, file_path: str, file_name: str, file_type: str, profile_config: ProfileUpdateConfig) -> Dict:
+        """更新单个账号资料"""
+        client = None
+        session_path = None
+        temp_session_path = None
+        temp_session_dir = None
+        used_proxy = None
+        
+        try:
+            # 获取API凭据
+            api_id, api_hash = self.device_params_manager.get_random_api_credentials()
+            
+            # 创建客户端
+            if file_type == 'tdata':
+                # TData转Session
+                from opentele.td import TDesktop
+                from opentele.api import UseCurrentSession
+                
+                print(f"📂 [{file_name}] 格式: TData - 正在转换为Session进行资料修改...")
+                logger.info(f"[{file_name}] 开始TData转Session转换")
+                
+                tdesk = TDesktop(file_path)
+                temp_session_path = f"/tmp/profile_{secrets.token_hex(8)}.session"
+                
+                # 先尝试使用代理连接
+                proxy_info = None
+                proxy_dict = None
+                if self.proxy_manager.is_proxy_mode_active(self.db):
+                    proxy_info = self.proxy_manager.get_random_proxy()
+                    if proxy_info:
+                        # 使用checker的create_proxy_dict转换代理信息
+                        proxy_dict = self.checker.create_proxy_dict(proxy_info)
+                        if proxy_dict:
+                            try:
+                                proxy_type = proxy_info.get('type', 'http').upper()
+                                print(f"🌐 [{file_name}] 使用{proxy_type}代理连接...")
+                                logger.info(f"[{file_name}] 使用代理连接: {proxy_type}://{proxy_info['host']}:{proxy_info['port']}")
+                                client = await asyncio.wait_for(
+                                    tdesk.ToTelethon(temp_session_path, flag=UseCurrentSession, proxy=proxy_dict),
+                                    timeout=config.CONNECTION_TIMEOUT
+                                )
+                                # 重要：TData转Session后必须显式连接
+                                if client and not client.is_connected():
+                                    await client.connect()
+                                used_proxy = proxy_info
+                                print(f"✅ [{file_name}] TData转Session成功，代理连接成功")
+                                logger.info(f"[{file_name}] TData转Session成功，代理连接成功")
+                            except asyncio.TimeoutError:
+                                print(f"⏱️ [{file_name}] 代理连接超时，退回本地连接")
+                                logger.warning(f"[{file_name}] 代理连接超时，退回本地连接")
+                                client = None
+                            except Exception as e:
+                                print(f"⚠️ [{file_name}] 代理连接失败: {e}，退回本地连接")
+                                logger.warning(f"[{file_name}] 代理连接失败: {e}，退回本地连接")
+                                client = None
+                
+                # 如果代理失败或未启用，使用本地连接
+                if not client:
+                    print(f"🏠 [{file_name}] 使用本地连接进行TData转Session...")
+                    logger.info(f"[{file_name}] 使用本地连接进行TData转Session")
+                    client = await tdesk.ToTelethon(temp_session_path, flag=UseCurrentSession)
+                    # 重要：TData转Session后必须显式连接
+                    if not client.is_connected():
+                        await client.connect()
+                    print(f"✅ [{file_name}] TData转Session成功，本地连接成功")
+                    logger.info(f"[{file_name}] TData转Session成功，本地连接成功")
+                
+                session_path = temp_session_path
+                
+            elif file_type in ['session', 'session-json']:
+                # 使用session临时副本避免database locked
+                print(f"📋 [{file_name}] 格式: Session - 正在复制到临时目录...")
+                logger.info(f"[{file_name}] 复制session到临时目录避免database locked")
+                
+                temp_session_path, temp_session_dir = copy_session_to_temp(file_path)
+                
+                print(f"✅ [{file_name}] Session已复制到临时目录")
+                logger.info(f"[{file_name}] Session已复制到临时目录: {temp_session_dir}")
+                
+                # 先尝试使用代理连接
+                proxy_info = None
+                proxy_dict = None
+                if self.proxy_manager.is_proxy_mode_active(self.db):
+                    proxy_info = self.proxy_manager.get_random_proxy()
+                    if proxy_info:
+                        # 使用checker的create_proxy_dict转换代理信息
+                        proxy_dict = self.checker.create_proxy_dict(proxy_info)
+                        if proxy_dict:
+                            try:
+                                proxy_type = proxy_info.get('type', 'http').upper()
+                                print(f"🌐 [{file_name}] 使用{proxy_type}代理连接...")
+                                logger.info(f"[{file_name}] 使用代理连接: {proxy_type}://{proxy_info['host']}:{proxy_info['port']}")
+                                client = TelegramClient(temp_session_path, api_id, api_hash, proxy=proxy_dict)
+                                await asyncio.wait_for(client.connect(), timeout=config.CONNECTION_TIMEOUT)
+                                used_proxy = proxy_info
+                                print(f"✅ [{file_name}] 代理连接成功")
+                                logger.info(f"[{file_name}] 代理连接成功")
+                            except asyncio.TimeoutError:
+                                print(f"⏱️ [{file_name}] 代理连接超时，退回本地连接")
+                                logger.warning(f"[{file_name}] 代理连接超时，退回本地连接")
+                                if client:
+                                    await client.disconnect()
+                                client = None
+                            except Exception as e:
+                                print(f"⚠️ [{file_name}] 代理连接失败: {e}，退回本地连接")
+                                logger.warning(f"[{file_name}] 代理连接失败: {e}，退回本地连接")
+                                if client:
+                                    try:
+                                        await client.disconnect()
+                                    except:
+                                        pass
+                                client = None
+                
+                # 如果代理失败或未启用，使用本地连接
+                if not client:
+                    print(f"🏠 [{file_name}] 使用本地连接...")
+                    logger.info(f"[{file_name}] 使用本地连接")
+                    client = TelegramClient(temp_session_path, api_id, api_hash)
+                    await client.connect()
+                    print(f"✅ [{file_name}] 本地连接成功")
+                    logger.info(f"[{file_name}] 本地连接成功")
+                
+                session_path = temp_session_path
+            
+            if not client or not await client.is_user_authorized():
+                error_type = 'AuthKeyUnregisteredError'
+                error_message = get_profile_error_message(user_id, error_type, t(user_id, 'profile_error_unauthorized'))
+                return {
+                    'success': False,
+                    'account': file_name,
+                    'file_name': file_name,
+                    'file_path': file_path,
+                    'error': error_message,
+                    'error_type': error_type
+                }
+            
+            # 获取账号信息
+            me = await client.get_me()
+            phone = me.phone if hasattr(me, 'phone') else None
+            country = self.profile_manager.get_country_from_phone(phone) if phone else 'US'
+            
+            # 构建代理信息字符串
+            proxy_str = t(user_id, 'local_connection')
+            if used_proxy:
+                proxy_type = used_proxy.get('type', 'http').upper()
+                proxy_str = f"{proxy_type}://{used_proxy['host']}:{used_proxy['port']}"
+            
+            detail = {
+                'success': True,
+                'account': file_name,
+                'phone': phone,
+                'file_name': file_name,
+                'file_path': file_path,
+                'country': country,
+                'proxy': proxy_str,
+                'changes': {},
+                'actions': []
+            }
+            
+            # 随机延迟避免限流
+            await asyncio.sleep(random.uniform(2, 5))
+            
+            # 1. 更新姓名
+            if profile_config.update_name:
+                first_name = None
+                last_name = ''
+                
+                if profile_config.mode == 'random':
+                    first_name, last_name = self.profile_manager.generate_random_name(country)
+                elif profile_config.custom_names:
+                    # 循环使用自定义姓名列表
+                    full_name = profile_config.custom_names[idx % len(profile_config.custom_names)]
+                    parts = full_name.split(' ', 1)
+                    first_name = parts[0]
+                    last_name = parts[1] if len(parts) > 1 else ''
+                
+                if first_name:
+                    try:
+                        if await self.profile_manager.update_profile_name(client, first_name, last_name):
+                            name_display = f"{first_name} {last_name}".strip()
+                            detail['actions'].append(t(user_id, 'profile_action_name_success').format(name=name_display))
+                            detail['changes']['name'] = {
+                                'old': f"{me.first_name or ''} {me.last_name or ''}".strip(),
+                                'new': name_display,
+                                'success': True
+                            }
+                        else:
+                            detail['actions'].append(t(user_id, 'profile_action_name_failed'))
+                            detail['changes']['name'] = {'success': False}
+                    except Exception as e:
+                        detail['actions'].append(t(user_id, 'profile_action_name_failed_error').format(error=str(e)))
+                        detail['changes']['name'] = {'success': False, 'error': str(e)}
+                    await asyncio.sleep(1)
+            
+            # 2. 处理头像
+            if profile_config.update_photo:
+                if profile_config.photo_action == 'delete_all':
+                    try:
+                        if await self.profile_manager.delete_profile_photos(client):
+                            detail['actions'].append(t(user_id, 'profile_action_avatar_deleted'))
+                            detail['changes']['photo'] = {'action': 'deleted', 'success': True}
+                        else:
+                            detail['actions'].append(t(user_id, 'profile_action_avatar_delete_failed'))
+                            detail['changes']['photo'] = {'action': 'deleted', 'success': False}
+                    except Exception as e:
+                        detail['actions'].append(t(user_id, 'profile_action_avatar_delete_failed_error').format(error=str(e)))
+                        detail['changes']['photo'] = {'action': 'deleted', 'success': False, 'error': str(e)}
+                    await asyncio.sleep(1)
+                elif profile_config.photo_action == 'custom' and profile_config.custom_photos:
+                    # 循环使用自定义头像列表
+                    photo_path = profile_config.custom_photos[idx % len(profile_config.custom_photos)]
+                    try:
+                        if await self.profile_manager.update_profile_photo(client, photo_path):
+                            detail['actions'].append(t(user_id, 'profile_action_avatar_uploaded'))
+                            detail['changes']['photo'] = {'action': 'uploaded', 'success': True}
+                        else:
+                            detail['actions'].append(t(user_id, 'profile_action_avatar_upload_failed'))
+                            detail['changes']['photo'] = {'action': 'uploaded', 'success': False}
+                    except Exception as e:
+                        detail['actions'].append(t(user_id, 'profile_action_avatar_upload_failed_error').format(error=str(e)))
+                        detail['changes']['photo'] = {'action': 'uploaded', 'success': False, 'error': str(e)}
+                    await asyncio.sleep(1)
+            
+            # 3. 更新简介
+            if profile_config.update_bio:
+                bio = ''
+                if profile_config.bio_action == 'clear':
+                    bio = ''
+                elif profile_config.bio_action == 'random':
+                    bio = self.profile_manager.generate_random_bio(country)
+                elif profile_config.bio_action == 'custom' and profile_config.custom_bios:
+                    # 循环使用自定义简介列表
+                    bio = profile_config.custom_bios[idx % len(profile_config.custom_bios)]
+                
+                try:
+                    # 获取当前简介
+                    old_bio = ''
+                    try:
+                        full = await client(GetFullUserRequest(me.id))
+                        old_bio = full.full_user.about if hasattr(full.full_user, 'about') else ''
+                    except:
+                        pass
+                    
+                    if await self.profile_manager.update_profile_bio(client, bio):
+                        bio_display = bio[:20] + '...' if len(bio) > 20 else bio if bio else t(user_id, 'profile_bio_empty')
+                        detail['actions'].append(t(user_id, 'profile_action_bio_success').format(bio=bio_display))
+                        detail['changes']['bio'] = {
+                            'old': old_bio or '',
+                            'new': bio,
+                            'success': True
+                        }
+                    else:
+                        detail['actions'].append(t(user_id, 'profile_action_bio_failed'))
+                        detail['changes']['bio'] = {'success': False}
+                except Exception as e:
+                    detail['actions'].append(t(user_id, 'profile_action_bio_failed_error').format(error=str(e)))
+                    detail['changes']['bio'] = {'success': False, 'error': str(e)}
+                await asyncio.sleep(1)
+            
+            # 4. 更新用户名
+            if profile_config.update_username:
+                old_username = me.username if hasattr(me, 'username') else None
+                if profile_config.username_action == 'random':
+                    # 尝试3次生成不重复的用户名
+                    success_flag = False
+                    new_username = ''
+                    for _ in range(3):
+                        username = self.profile_manager.generate_random_username()
+                        try:
+                            if await self.profile_manager.update_profile_username(client, username):
+                                detail['actions'].append(t(user_id, 'profile_action_username_success').format(username=username))
+                                detail['changes']['username'] = {
+                                    'old': f"@{old_username}" if old_username else '无',
+                                    'new': f"@{username}",
+                                    'success': True
+                                }
+                                success_flag = True
+                                break
+                        except UsernameOccupiedError:
+                            continue
+                        except Exception as e:
+                            detail['actions'].append(t(user_id, 'profile_action_username_failed_error').format(error=str(e)))
+                            detail['changes']['username'] = {'success': False, 'error': str(e), 'error_type': 'UsernameOccupiedError'}
+                            success_flag = False
+                            break
+                    
+                    if not success_flag and 'username' not in detail['changes']:
+                        detail['actions'].append(t(user_id, 'profile_action_username_failed_occupied'))
+                        detail['changes']['username'] = {'success': False, 'error': t(user_id, 'profile_error_username_taken'), 'error_type': 'UsernameOccupiedError'}
+                elif profile_config.username_action == 'delete':
+                    try:
+                        if await self.profile_manager.update_profile_username(client, ''):
+                            detail['actions'].append(t(user_id, 'profile_action_username_deleted'))
+                            detail['changes']['username'] = {
+                                'old': f"@{old_username}" if old_username else t(user_id, 'report_no_username'),
+                                'new': t(user_id, 'profile_display_delete'),
+                                'success': True
+                            }
+                        else:
+                            detail['actions'].append(t(user_id, 'profile_action_username_delete_failed'))
+                            detail['changes']['username'] = {'success': False}
+                    except Exception as e:
+                        detail['actions'].append(t(user_id, 'profile_action_username_delete_failed_error').format(error=str(e)))
+                        detail['changes']['username'] = {'success': False, 'error': str(e)}
+                elif profile_config.username_action == 'custom' and profile_config.custom_usernames:
+                    # 循环使用自定义用户名列表
+                    username = profile_config.custom_usernames[idx % len(profile_config.custom_usernames)]
+                    try:
+                        if await self.profile_manager.update_profile_username(client, username):
+                            detail['actions'].append(t(user_id, 'profile_action_username_success').format(username=username))
+                            detail['changes']['username'] = {
+                                'old': f"@{old_username}" if old_username else '无',
+                                'new': f"@{username}",
+                                'success': True
+                            }
+                        else:
+                            detail['actions'].append(t(user_id, 'profile_action_username_failed'))
+                            detail['changes']['username'] = {'success': False}
+                    except UsernameOccupiedError:
+                        detail['actions'].append(t(user_id, 'profile_action_username_occupied').format(username=username))
+                        detail['changes']['username'] = {'success': False, 'error': t(user_id, 'profile_error_username_taken'), 'error_type': 'UsernameOccupiedError'}
+                    except Exception as e:
+                        detail['actions'].append(t(user_id, 'profile_action_username_failed_error').format(error=str(e)))
+                        detail['changes']['username'] = {'success': False, 'error': str(e)}
+                await asyncio.sleep(1)
+            
+            return detail
+            
+        except UserDeactivatedBanError as e:
+            error_type = 'UserDeactivatedBanError'
+            error_message = get_profile_error_message(user_id, error_type, str(e))
+            logger.error(f"Update profile failed for {file_name}: {error_type}")
+            return {
+                'success': False,
+                'account': file_name,
+                'file_name': file_name,
+                'file_path': file_path,
+                'error': error_message,
+                'error_type': error_type
+            }
+        except AuthKeyUnregisteredError as e:
+            error_type = 'AuthKeyUnregisteredError'
+            error_message = get_profile_error_message(user_id, error_type, str(e))
+            logger.error(f"Update profile failed for {file_name}: {error_type}")
+            return {
+                'success': False,
+                'account': file_name,
+                'file_name': file_name,
+                'file_path': file_path,
+                'error': error_message,
+                'error_type': error_type
+            }
+        except FloodWaitError as e:
+            error_type = 'FloodWaitError'
+            wait_seconds = e.seconds if hasattr(e, 'seconds') else 0
+            error_message = t(user_id, 'profile_error_flood_wait').format(seconds=wait_seconds)
+            logger.error(f"Update profile failed for {file_name}: {error_type}")
+            return {
+                'success': False,
+                'account': file_name,
+                'file_name': file_name,
+                'file_path': file_path,
+                'error': error_message,
+                'error_type': error_type
+            }
+        except (UsernameOccupiedError, UsernameInvalidError) as e:
+            error_type = type(e).__name__
+            error_message = get_profile_error_message(user_id, error_type, str(e))
+            logger.error(f"Update profile failed for {file_name}: {error_type}")
+            return {
+                'success': False,
+                'account': file_name,
+                'file_name': file_name,
+                'file_path': file_path,
+                'error': error_message,
+                'error_type': error_type
+            }
+        except asyncio.TimeoutError as e:
+            error_type = 'TimeoutError'
+            error_message = get_profile_error_message(user_id, error_type, t(user_id, 'profile_error_timeout'))
+            logger.error(f"Update profile failed for {file_name}: {error_type}")
+            return {
+                'success': False,
+                'account': file_name,
+                'file_name': file_name,
+                'file_path': file_path,
+                'error': error_message,
+                'error_type': error_type
+            }
+        except Exception as e:
+            # 尝试获取错误类型
+            error_type = type(e).__name__
+            error_message = get_profile_error_message(user_id, error_type, str(e))
+            logger.error(f"Update profile failed for {file_name}: {error_type} - {str(e)}")
+            return {
+                'success': False,
+                'account': file_name,
+                'file_name': file_name,
+                'file_path': file_path,
+                'error': error_message,
+                'error_type': error_type
+            }
+        finally:
+            if client:
+                try:
+                    await client.disconnect()
+                except:
+                    pass
+            
+            # 清理临时session目录（避免database locked）
+            if temp_session_dir:
+                cleanup_temp_session(temp_session_dir)
+            
+            # 清理临时session文件（TData转换的）
+            if temp_session_path and os.path.exists(temp_session_path):
+                try:
+                    os.remove(temp_session_path)
+                    # 清理.journal文件
+                    journal_file = temp_session_path + '.journal'
+                    if os.path.exists(journal_file):
+                        os.remove(journal_file)
+                except:
+                    pass
+    
+    def _generate_profile_update_report(self, context: CallbackContext, user_id: int, results: Dict, progress_msg):
+        """生成资料修改详细报告和打包结果文件"""
+        logger.info("📊 开始生成详细报告和打包文件...")
+        
+        timestamp = datetime.now(BEIJING_TZ).strftime("%Y%m%d_%H%M%S")
+        total = len(results['success']) + len(results['failed'])
+        success_count = len(results['success'])
+        failed_count = len(results['failed'])
+        
+        # 统计错误类型
+        error_stats = {}
+        for file_path, file_name, detail in results['failed']:
+            error_type = detail.get('error_type', 'Unknown')
+            # 获取友好的错误名称
+            if error_type in ERROR_TYPE_TO_TRANSLATION_KEY:
+                error_name = get_profile_error_message(user_id, error_type)
+            else:
+                error_name = error_type
+            
+            if error_name not in error_stats:
+                error_stats[error_name] = 0
+            error_stats[error_name] += 1
+        
+        # ========================================
+        # 1. 生成详细的TXT报告
+        # ========================================
+        report_lines = []
+        
+        report_lines.append("=" * 80)
+        report_lines.append(t(user_id, 'profile_report_title'))
+        report_lines.append("=" * 80)
+        report_lines.append(f"{t(user_id, 'profile_report_time')} {datetime.now(BEIJING_TZ).strftime('%Y-%m-%d %H:%M:%S')}")
+        report_lines.append(t(user_id, 'profile_report_summary').format(total=total, success=success_count, failed=failed_count))
+        report_lines.append("")
+        
+        # 成功的账号详情
+        if results['success']:
+            report_lines.append("=" * 80)
+            report_lines.append(t(user_id, 'profile_report_success_title').format(count=success_count))
+            report_lines.append("=" * 80)
+            for idx, (file_path, file_name, detail) in enumerate(results['success'], 1):
+                report_lines.append(f"\n{idx}. {detail.get('phone', file_name)}")
+                report_lines.append(f"   {t(user_id, 'profile_report_file')} {file_name}")
+                
+                # 显示变更详情 - 使用"修改前xxx 修改后xxx"格式
+                changes = detail.get('changes', {})
+                
+                # 姓名修改
+                if 'name' in changes and changes['name'].get('success'):
+                    old_name = changes['name'].get('old', '').strip()
+                    new_name = changes['name'].get('new', '').strip()
+                    if old_name and new_name:
+                        report_lines.append(f"   {t(user_id, 'profile_report_name_change').format(before=old_name, after=new_name)}")
+                    elif new_name:
+                        report_lines.append(f"   - {t(user_id, 'profile_config_name')} {t(user_id, 'profile_report_name_change').format(before='', after=new_name)}")
+                
+                # 头像修改
+                if 'photo' in changes and changes['photo'].get('success'):
+                    action = changes['photo'].get('action', 'deleted')
+                    if action == 'deleted':
+                        report_lines.append(f"   {t(user_id, 'profile_report_avatar_deleted')}")
+                    elif action == 'uploaded':
+                        report_lines.append(f"   {t(user_id, 'profile_report_avatar_uploaded')}")
+                
+                # 简介修改
+                if 'bio' in changes and changes['bio'].get('success'):
+                    old_bio = changes['bio'].get('old', '').strip()
+                    new_bio = changes['bio'].get('new', '').strip()
+                    if old_bio and new_bio:
+                        # 限制显示长度，避免报告太长
+                        old_bio_display = old_bio[:30] + '...' if len(old_bio) > 30 else old_bio
+                        new_bio_display = new_bio[:30] + '...' if len(new_bio) > 30 else new_bio
+                        report_lines.append(f"   {t(user_id, 'profile_report_bio_change').format(before=old_bio_display, after=new_bio_display)}")
+                    elif new_bio:
+                        new_bio_display = new_bio[:30] + '...' if len(new_bio) > 30 else new_bio
+                        report_lines.append(f"   {t(user_id, 'profile_report_bio_change').format(before=t(user_id, 'profile_none'), after=new_bio_display)}")
+                    elif old_bio:
+                        old_bio_display = old_bio[:30] + '...' if len(old_bio) > 30 else old_bio
+                        report_lines.append(f"   {t(user_id, 'profile_report_bio_change').format(before=old_bio_display, after=t(user_id, 'profile_bio_cleared_inline'))}")
+                    else:
+                        report_lines.append(f"   {t(user_id, 'profile_report_bio_cleared')}")
+                
+                # 用户名修改
+                if 'username' in changes and changes['username'].get('success'):
+                    old_username = changes['username'].get('old', '').strip()
+                    new_username = changes['username'].get('new', '').strip()
+                    
+                    # 格式化用户名显示
+                    if old_username and old_username != '无':
+                        old_display = old_username if old_username.startswith('@') else f"@{old_username}"
+                    else:
+                        old_display = "(无)"
+                    
+                    if new_username and new_username != '已删除':
+                        new_display = new_username if new_username.startswith('@') else f"@{new_username}"
+                    else:
+                        new_display = "(已删除)"
+                    
+                    report_lines.append(f"   {t(user_id, 'profile_report_username_change').format(before=old_display, after=new_display)}")
+            
+            report_lines.append("")
+        
+        # 失败的账号详情
+        if results['failed']:
+            report_lines.append("=" * 80)
+            report_lines.append(t(user_id, 'profile_report_failed_title').format(count=failed_count))
+            report_lines.append("=" * 80)
+            for idx, (file_path, file_name, detail) in enumerate(results['failed'], 1):
+                report_lines.append(f"\n{idx}. {detail.get('phone', file_name) if detail.get('phone') else file_name}")
+                report_lines.append(f"   {t(user_id, 'profile_report_file')} {file_name}")
+                error_type = detail.get('error_type', 'Unknown')
+                error_message = detail.get('error', t(user_id, 'profile_error_unknown'))
+                report_lines.append(f"   {t(user_id, 'profile_report_error_type')} {error_type}")
+                report_lines.append(f"   {t(user_id, 'profile_report_error_reason')} {error_message}")
+            
+            report_lines.append("")
+        
+        # 错误统计
+        if error_stats:
+            report_lines.append("=" * 80)
+            report_lines.append(t(user_id, 'profile_report_error_stats'))
+            report_lines.append("=" * 80)
+            for error_name, count in sorted(error_stats.items(), key=lambda x: x[1], reverse=True):
+                report_lines.append(f"• {error_name}: {count}")
+            report_lines.append("")
+        
+        # 保存报告文件
+        report_content = "\n".join(report_lines)
+        report_path = os.path.join(config.RESULTS_DIR, f"profile_report_{timestamp}.txt")
+        
+        try:
+            with open(report_path, 'w', encoding='utf-8') as f:
+                f.write(report_content)
+            logger.info(f"✅ 报告文件已生成: {report_path}")
+        except Exception as e:
+            logger.error(f"❌ 生成报告文件失败: {e}")
+        
+        # ========================================
+        # 2. 打包成功的账号文件
+        # ========================================
+        success_zip_path = None
+        if results['success']:
+            logger.info(f"📦 开始打包成功的账号文件...")
+            success_zip_path = os.path.join(config.RESULTS_DIR, f"profile_success_{success_count}_{timestamp}.zip")
+            
+            try:
+                with zipfile.ZipFile(success_zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+                    added_paths = set()  # 追踪已添加的文件路径，避免重复
+                    
+                    for file_path, file_name, detail in results['success']:
+                        original_file_path = detail.get('file_path', file_path)
+                        # 提取手机号作为前缀
+                        phone = extract_phone_from_path(original_file_path) or extract_phone_from_path(file_name) or file_name.replace('.session', '').replace('.json', '')
+                        
+                        try:
+                            # 判断文件类型
+                            if os.path.isdir(original_file_path):
+                                # TData格式：打包整个目录，使用手机号作为前缀
+                                # 获取目录名（通常是tdata）
+                                tdata_dirname = os.path.basename(original_file_path)
+                                
+                                for root, dirs, files in os.walk(original_file_path):
+                                    for file in files:
+                                        file_full_path = os.path.join(root, file)
+                                        rel_path = os.path.relpath(file_full_path, original_file_path)
+                                        # 包含tdata目录名在路径中: 手机号/tdata/D877F783D5D3EF8C/...
+                                        arc_name = f"{phone}/{tdata_dirname}/{rel_path}"
+                                        
+                                        if arc_name not in added_paths:
+                                            added_paths.add(arc_name)
+                                            zipf.write(file_full_path, arc_name)
+                            else:
+                                # Session格式：直接打包到ZIP根目录，使用手机号作为文件名
+                                # 格式：手机号.session 和 手机号.json（不要手机号文件夹）
+                                if os.path.exists(original_file_path):
+                                    arc_name = f"{phone}.session"
+                                    if arc_name not in added_paths:
+                                        added_paths.add(arc_name)
+                                        zipf.write(original_file_path, arc_name)
+                                
+                                # Journal文件
+                                journal_path = original_file_path + '-journal'
+                                if os.path.exists(journal_path):
+                                    arc_name = f"{phone}.session-journal"
+                                    if arc_name not in added_paths:
+                                        added_paths.add(arc_name)
+                                        zipf.write(journal_path, arc_name)
+                                
+                                # JSON文件
+                                json_path = os.path.splitext(original_file_path)[0] + '.json'
+                                if os.path.exists(json_path):
+                                    arc_name = f"{phone}.json"
+                                    if arc_name not in added_paths:
+                                        added_paths.add(arc_name)
+                                        zipf.write(json_path, arc_name)
+                        except Exception as e:
+                            logger.warning(f"⚠️ 打包文件失败 {file_name}: {e}")
+                
+                logger.info(f"✅ 成功账号已打包: {success_zip_path}")
+            except Exception as e:
+                logger.error(f"❌ 打包成功账号失败: {e}")
+                success_zip_path = None
+        
+        # ========================================
+        # 3. 打包失败的账号文件
+        # ========================================
+        failed_zip_path = None
+        if results['failed']:
+            logger.info(f"📦 开始打包失败的账号文件...")
+            failed_zip_path = os.path.join(config.RESULTS_DIR, f"profile_failed_{failed_count}_{timestamp}.zip")
+            
+            try:
+                with zipfile.ZipFile(failed_zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+                    added_paths = set()  # 追踪已添加的文件路径，避免重复
+                    
+                    for file_path, file_name, detail in results['failed']:
+                        original_file_path = detail.get('file_path', file_path)
+                        # 提取手机号作为前缀
+                        phone = extract_phone_from_path(original_file_path) or extract_phone_from_path(file_name) or file_name.replace('.session', '').replace('.json', '')
+                        
+                        try:
+                            # 判断文件类型
+                            if os.path.isdir(original_file_path):
+                                # TData格式：打包整个目录，使用手机号作为前缀
+                                # 获取目录名（通常是tdata）
+                                tdata_dirname = os.path.basename(original_file_path)
+                                
+                                for root, dirs, files in os.walk(original_file_path):
+                                    for file in files:
+                                        file_full_path = os.path.join(root, file)
+                                        rel_path = os.path.relpath(file_full_path, original_file_path)
+                                        # 包含tdata目录名在路径中: 手机号/tdata/D877F783D5D3EF8C/...
+                                        arc_name = f"{phone}/{tdata_dirname}/{rel_path}"
+                                        
+                                        if arc_name not in added_paths:
+                                            added_paths.add(arc_name)
+                                            zipf.write(file_full_path, arc_name)
+                            else:
+                                # Session格式：直接打包到ZIP根目录，使用手机号作为文件名
+                                # 格式：手机号.session 和 手机号.json（不要手机号文件夹）
+                                if os.path.exists(original_file_path):
+                                    arc_name = f"{phone}.session"
+                                    if arc_name not in added_paths:
+                                        added_paths.add(arc_name)
+                                        zipf.write(original_file_path, arc_name)
+                                
+                                # Journal文件
+                                journal_path = original_file_path + '-journal'
+                                if os.path.exists(journal_path):
+                                    arc_name = f"{phone}.session-journal"
+                                    if arc_name not in added_paths:
+                                        added_paths.add(arc_name)
+                                        zipf.write(journal_path, arc_name)
+                                
+                                # JSON文件
+                                json_path = os.path.splitext(original_file_path)[0] + '.json'
+                                if os.path.exists(json_path):
+                                    arc_name = f"{phone}.json"
+                                    if arc_name not in added_paths:
+                                        added_paths.add(arc_name)
+                                        zipf.write(json_path, arc_name)
+                        except Exception as e:
+                            logger.warning(f"⚠️ 打包文件失败 {file_name}: {e}")
+                
+                logger.info(f"✅ 失败账号已打包: {failed_zip_path}")
+            except Exception as e:
+                logger.error(f"❌ 打包失败账号失败: {e}")
+                failed_zip_path = None
+        
+        # ========================================
+        # 4. 发送报告文件
+        # ========================================
+        try:
+            if os.path.exists(report_path):
+                with open(report_path, 'rb') as f:
+                    context.bot.send_document(
+                        chat_id=user_id,
+                        document=f,
+                        filename=f"profile_report_{timestamp}.txt",
+                        caption=t(user_id, 'profile_output_report'),
+                        parse_mode='HTML'
+                    )
+                logger.info("✅ 报告文件已发送")
+        except Exception as e:
+            logger.error(f"❌ 发送报告文件失败: {e}")
+        
+        # ========================================
+        # 5. 发送成功账号ZIP
+        # ========================================
+        if success_zip_path and os.path.exists(success_zip_path):
+            try:
+                with open(success_zip_path, 'rb') as f:
+                    context.bot.send_document(
+                        chat_id=user_id,
+                        document=f,
+                        filename=f"profile_success_{success_count}.zip",
+                        caption=t(user_id, 'profile_output_success').format(count=success_count),
+                        parse_mode='HTML',
+                        timeout=120
+                    )
+                logger.info("✅ 成功账号ZIP已发送")
+            except Exception as e:
+                logger.error(f"❌ 发送成功账号ZIP失败: {e}")
+        
+        # ========================================
+        # 6. 发送失败账号ZIP
+        # ========================================
+        if failed_zip_path and os.path.exists(failed_zip_path):
+            try:
+                with open(failed_zip_path, 'rb') as f:
+                    context.bot.send_document(
+                        chat_id=user_id,
+                        document=f,
+                        filename=f"profile_failed_{failed_count}.zip",
+                        caption=t(user_id, 'profile_output_failed').format(count=failed_count),
+                        parse_mode='HTML',
+                        timeout=120
+                    )
+                logger.info("✅ 失败账号ZIP已发送")
+            except Exception as e:
+                logger.error(f"❌ 发送失败账号ZIP失败: {e}")
+        
+        # ========================================
+        # 7. 更新最终消息
+        # ========================================
+        error_stats_text = ""
+        if error_stats:
+            error_stats_text = f"\n\n<b>{t(user_id, 'profile_error_stats')}</b>\n"
+            for error_name, count in sorted(error_stats.items(), key=lambda x: x[1], reverse=True):
+                error_stats_text += f"• {error_name}: {count}\n"
+        
+        files_sent_text = f"\n\n<b>{t(user_id, 'profile_files_sent')}</b>\n{t(user_id, 'profile_file_report')} profile_report.txt"
+        if success_zip_path:
+            files_sent_text += f"\n{t(user_id, 'profile_file_success')} profile_success_{success_count}.zip"
+        if failed_zip_path:
+            files_sent_text += f"\n{t(user_id, 'profile_file_failed')} profile_failed_{failed_count}.zip"
+        
+        final_text = f"""<b>{t(user_id, 'profile_complete')}</b>
+
+<b>{t(user_id, 'profile_result_stats')}</b>
+{t(user_id, 'profile_result_total')} {total}
+{t(user_id, 'profile_result_success').format(count=success_count)}
+{t(user_id, 'profile_result_failed').format(count=failed_count)}{error_stats_text}{files_sent_text}
+"""
+        
+        try:
+            self.safe_edit_message_text(
+                progress_msg,
+                final_text,
+                parse_mode='HTML'
+            )
+        except Exception as e:
+            logger.error(f"❌ 更新最终消息失败: {e}")
+        
+        # ========================================
+        # 8. 清理临时文件
+        # ========================================
+        try:
+            if os.path.exists(report_path):
+                os.remove(report_path)
+        except:
+            pass
+        
+        try:
+            if success_zip_path and os.path.exists(success_zip_path):
+                os.remove(success_zip_path)
+        except:
+            pass
+        
+        try:
+            if failed_zip_path and os.path.exists(failed_zip_path):
+                os.remove(failed_zip_path)
+        except:
+            pass
+        
+        logger.info("📊 报告生成和文件发送完成！")
+    
+    def handle_registration_check_execute(self, update: Update, context: CallbackContext, query, user_id: int):
+        """执行注册时间查询"""
+        query.answer()
+        
+        if user_id not in self.pending_registration_check:
+            self.safe_edit_message(query, t(user_id, 'regtime_session_expired'))
+            return
+        
+        task = self.pending_registration_check[user_id]
+        files = task['files']
+        file_type = task['file_type']
+        progress_msg = task.get('progress_msg')
+        
+        # 启动异步任务
+        def run_registration_check():
+            try:
+                asyncio.run(self._execute_registration_check(user_id, files, file_type, context, progress_msg))
+            except Exception as e:
+                logger.error(f"Registration check execution failed: {e}")
+                import traceback
+                traceback.print_exc()
+        
+        thread = threading.Thread(target=run_registration_check, daemon=True)
+        thread.start()
+        
+        # 更新消息
+        self.safe_edit_message(
+            query,
+            f"🔄 <b>{t(user_id, 'regtime_querying')} {len(files)} {t(user_id, 'accounts_unit')}...</b>\n\n{t(user_id, 'regtime_may_take_minutes')}",
+            parse_mode='HTML'
+        )
+    
+    async def _execute_registration_check(self, user_id: int, files: List, file_type: str, context: CallbackContext, progress_msg):
+        """执行注册时间查询的核心逻辑"""
+        results = {
+            'success': [],
+            'error': [],
+            'frozen': [],
+            'banned': []
+        }
+        
+        total = len(files)
+        processed = 0
+        
+        # 并发查询（使用信号量控制并发数）
+        semaphore = asyncio.Semaphore(10)  # 最多10个并发
+        
+        async def check_single_account(file_path, file_name):
+            nonlocal processed
+            async with semaphore:
+                try:
+                    result = await self.check_account_registration_time(file_path, file_name, file_type, user_id)
+                    
+                    if result['status'] == 'success':
+                        results['success'].append((file_path, file_name, result))
+                    elif result['status'] == 'frozen':
+                        results['frozen'].append((file_path, file_name, result))
+                    elif result['status'] == 'banned':
+                        results['banned'].append((file_path, file_name, result))
+                    else:
+                        results['error'].append((file_path, file_name, result))
+                    
+                    processed += 1
+                    
+                    # 每处理10个更新一次进度
+                    if processed % 10 == 0 or processed == total:
+                        try:
+                            progress_text = f"""{t(user_id, 'regtime_progress_title')}
+
+{t(user_id, 'regtime_progress_total').format(count=total)}
+{t(user_id, 'regtime_progress_processed').format(count=processed)}
+{t(user_id, 'regtime_progress_success').format(count=len(results['success']))}
+{t(user_id, 'regtime_progress_failed').format(count=len(results['error']) + len(results['frozen']) + len(results['banned']))}
+
+{t(user_id, 'regtime_please_wait')}
+"""
+                            context.bot.edit_message_text(
+                                chat_id=user_id,
+                                message_id=progress_msg.message_id,
+                                text=progress_text,
+                                parse_mode='HTML'
+                            )
+                        except Exception as e:
+                            logger.warning(f"Failed to update progress: {e}")
+                    
+                except Exception as e:
+                    logger.error(f"Failed to check {file_name}: {e}")
+                    results['error'].append((file_path, file_name, {'status': 'error', 'error': str(e)}))
+                    processed += 1
+        
+        # 执行所有查询
+        tasks = [check_single_account(file_path, file_name) for file_path, file_name in files]
+        await asyncio.gather(*tasks, return_exceptions=True)
+        
+        # 生成报告
+        self._generate_registration_report(context, user_id, results, progress_msg)
+        
+        # 清理
+        self.cleanup_registration_check_task(user_id)
+    
+    async def get_registration_date_from_api(self, client, user, file_name: str) -> Optional[Dict]:
+        """
+        从Telegram官方API获取用户注册时间
+        
+        优先级：
+        1. GetPeerSettingsRequest - 最准确的官方API (2024年新增)
+        2. GetFullUserRequest - 备选方案
+        
+        Args:
+            client: Telethon客户端
+            user: 用户实体
+            file_name: 文件名（用于日志）
+            
+        Returns:
+            包含注册日期和来源的字典，失败返回None
+            {
+                'date': 'YYYY-MM' or 'YYYY-MM-DD',
+                'source': 'telegram_api' or 'full_user_api',
+                'accurate': True
+            }
+        """
+        # 方法1: 使用官方 GetPeerSettingsRequest API (最准确)
+        try:
+            logger.info(f"[{file_name}]   → 尝试GetPeerSettingsRequest API...")
+            result = await client(GetPeerSettingsRequest(peer=user))
+            
+            # 检查是否有 registration_month 字段
+            registration_month = None
+            
+            if hasattr(result, 'settings'):
+                settings = result.settings
+                if hasattr(settings, 'registration_month') and settings.registration_month:
+                    registration_month = settings.registration_month
+            
+            if registration_month:
+                logger.info(f"[{file_name}]   ✅ GetPeerSettingsRequest成功: {registration_month} (官方数据)")
+                return {
+                    'date': registration_month,  # 格式如 "2021-09"
+                    'source': 'telegram_api',
+                    'accurate': True
+                }
+            else:
+                logger.info(f"[{file_name}]   ⚠️ GetPeerSettingsRequest返回但无registration_month字段")
+                
+        except Exception as e:
+            logger.warning(f"[{file_name}]   ⚠️ GetPeerSettingsRequest失败: {e}")
+        
+        # 方法2: 尝试获取用户的 GetFullUser 信息
+        try:
+            logger.info(f"[{file_name}]   → 尝试GetFullUserRequest API...")
+            full_user = await client(GetFullUserRequest(user))
+            
+            # 检查是否有注册相关字段
+            if hasattr(full_user, 'full_user'):
+                fu = full_user.full_user
+                # 检查各种可能的字段名
+                for field in ['registration_month', 'registered', 'join_date']:
+                    if hasattr(fu, field) and getattr(fu, field):
+                        reg_value = str(getattr(fu, field))
+                        logger.info(f"[{file_name}]   ✅ GetFullUserRequest成功: {reg_value} (官方数据)")
+                        return {
+                            'date': reg_value,
+                            'source': 'full_user_api',
+                            'accurate': True
+                        }
+                
+                logger.info(f"[{file_name}]   ⚠️ GetFullUserRequest返回但无注册时间字段")
+        except Exception as e:
+            logger.warning(f"[{file_name}]   ⚠️ GetFullUserRequest失败: {e}")
+        
+        # 如果都失败，返回None
+        return None
+    
+    async def check_account_registration_time(self, file_path: str, file_name: str, file_type: str, user_id: int) -> Dict:
+        """
+        查询单个账号的注册时间
+        
+        使用多种方法获取最准确的注册时间（按优先级）：
+        0. 使用官方API获取注册时间（GetPeerSettingsRequest/GetFullUserRequest）- 最准确
+        1. 扫描所有对话找到最早消息时间
+        2. 查询与 @Telegram (777000) 的第一条消息时间
+        3. 查询 Saved Messages 的第一条消息时间
+        4. 基于用户ID估算（标注为不准确）
+        
+        Args:
+            file_path: 文件路径（session文件或tdata目录）
+            file_name: 文件名
+            file_type: 文件类型 ('session' 或 'tdata')
+        
+        Returns:
+            包含查询结果的字典
+        """
+        client = None
+        temp_session_path = None
+        original_file_path = file_path  # 保存原始文件路径用于打包
+        
+        # 开始详细日志
+        logger.info(f"")
+        logger.info(f"{'='*80}")
+        logger.info(f"[{file_name}] 🚀 开始查询注册时间")
+        logger.info(f"[{file_name}] 文件路径: {file_path}")
+        logger.info(f"[{file_name}] 文件类型: {file_type}")
+        logger.info(f"{'='*80}")
+        
+        try:
+            # 如果是TData格式，先转换为Session
+            if file_type == 'tdata':
+                logger.info(f"[{file_name}] ━━━ 步骤1: TData格式转换 ━━━")
+                if not OPENTELE_AVAILABLE:
+                    logger.error(f"[{file_name}] ❌ opentele未安装，无法处理TData格式")
+                    return {
+                        'status': 'error',
+                        'error': t(user_id, 'regtime_fail_opentele'),
+                        'file_name': file_name,
+                        'file_type': file_type,
+                        'original_file_path': original_file_path
+                    }
+                
+                try:
+                    # 加载TData - 使用正确的API
+                    logger.info(f"[{file_name}]   → 加载TData文件...")
+                    tdesk = await asyncio.wait_for(
+                        asyncio.to_thread(TDesktop, file_path),
+                        timeout=30
+                    )
+                    logger.info(f"[{file_name}]   ✅ TData加载成功")
+                    
+                    # 检查是否加载成功
+                    if not tdesk.isLoaded():
+                        logger.error(f"[{file_name}]   ❌ TData未授权或加载失败")
+                        return {
+                            'status': 'error',
+                            'error': t(user_id, 'regtime_fail_tdata_load'),
+                            'file_name': file_name,
+                            'file_type': file_type,
+                            'original_file_path': original_file_path
+                        }
+                except asyncio.TimeoutError:
+                    logger.error(f"[{file_name}]   ⏱️ TData加载超时(30秒)")
+                    return {
+                        'status': 'error',
+                        'error': t(user_id, 'regtime_fail_tdata_timeout'),
+                        'file_name': file_name,
+                        'file_type': file_type,
+                        'original_file_path': original_file_path
+                    }
+                
+                # 创建临时Session文件
+                logger.info(f"[{file_name}]   → 创建临时Session文件...")
+                os.makedirs(config.SESSIONS_BAK_DIR, exist_ok=True)
+                temp_session_name = f"check_reg_{time.time_ns()}"
+                temp_session_path = os.path.join(config.SESSIONS_BAK_DIR, temp_session_name)
+                logger.info(f"[{file_name}]   临时Session: {temp_session_path}")
+                
+                # 转换TData为Session
+                logger.info(f"[{file_name}]   → 转换TData为Session(60秒超时)...")
+                try:
+                    temp_client = await asyncio.wait_for(
+                        tdesk.ToTelethon(
+                            session=temp_session_path,
+                            flag=UseCurrentSession,
+                            api=API.TelegramDesktop
+                        ),
+                        timeout=60
+                    )
+                    logger.info(f"[{file_name}]   ✅ TData转Session成功")
+                except asyncio.TimeoutError:
+                    logger.error(f"[{file_name}]   ⏱️ TData转Session超时(60秒)")
+                    return {
+                        'status': 'error',
+                        'error': t(user_id, 'regtime_fail_conversion_timeout'),
+                        'file_name': file_name,
+                        'file_type': file_type,
+                        'original_file_path': original_file_path
+                    }
+                
+                # 断开临时客户端
+                if temp_client:
+                    try:
+                        logger.info(f"[{file_name}]   → 断开临时客户端...")
+                        await asyncio.wait_for(temp_client.disconnect(), timeout=10)
+                        logger.info(f"[{file_name}]   ✅ 临时客户端已断开")
+                    except Exception as e:
+                        logger.warning(f"[{file_name}]   ⚠️ 断开临时客户端失败: {e}")
+                        pass
+                
+                file_path = temp_session_path
+                logger.info(f"[{file_name}]   ✅ 步骤1完成: TData已转换为Session")
+            else:
+                logger.info(f"[{file_name}] ━━━ 步骤1: Session格式检查 ━━━")
+                logger.info(f"[{file_name}]   ✅ 直接使用Session文件，无需转换")
+            
+            # 使用配置中的API凭据
+            api_id = config.API_ID
+            api_hash = config.API_HASH
+            logger.info(f"[{file_name}]   API ID: {api_id}")
+            logger.info(f"[{file_name}]   API Hash: {'*' * 8}...{api_hash[-4:] if api_hash else 'None'}")
+            
+            # 获取代理（如果配置）
+            logger.info(f"[{file_name}] ━━━ 步骤1.5: 配置代理连接 ━━━")
+            proxy_dict = None
+            use_proxy = False
+            if self.proxy_manager.is_proxy_mode_active(self.db) and self.proxy_manager.proxies:
+                proxy_info = self.proxy_manager.get_next_proxy()
+                if proxy_info:
+                    proxy_dict = self.checker.create_proxy_dict(proxy_info)
+                    use_proxy = True
+                    logger.info(f"[{file_name}]   ✅ 代理已配置")
+                    logger.info(f"[{file_name}]   代理类型: {proxy_info.get('type', 'unknown')}")
+                    logger.info(f"[{file_name}]   代理地址: {proxy_info.get('host', 'unknown')}:{proxy_info.get('port', 'unknown')}")
+                    if proxy_info.get('is_residential'):
+                        logger.info(f"[{file_name}]   代理类别: 住宅代理 (超时30秒)")
+                else:
+                    logger.info(f"[{file_name}]   ⚠️ 代理模式启用但未获取到可用代理")
+            else:
+                logger.info(f"[{file_name}]   💡 代理未启用，将使用本地连接")
+            
+            # 创建客户端（先尝试代理连接）
+            logger.info(f"[{file_name}] ━━━ 步骤1.8: 创建Telegram客户端 ━━━")
+            session_base = file_path.replace('.session', '') if file_path.endswith('.session') else file_path
+            client = TelegramClient(
+                session_base,
+                int(api_id),
+                str(api_hash),
+                timeout=config.CONNECTION_TIMEOUT,
+                connection_retries=3,
+                retry_delay=1,
+                proxy=proxy_dict
+            )
+            logger.info(f"[{file_name}]   ✅ 客户端已创建")
+            logger.info(f"[{file_name}]   Session: {session_base}")
+            logger.info(f"[{file_name}]   超时设置: {config.CONNECTION_TIMEOUT}秒")
+            logger.info(f"[{file_name}]   重试次数: 3次")
+            
+            # 连接 - 先尝试代理，超时后回退到本地连接
+            logger.info(f"[{file_name}] ━━━ 步骤1.9: 建立Telegram连接 ━━━")
+            connection_method = "proxy" if use_proxy else "local"
+            try:
+                if use_proxy:
+                    logger.info(f"[{file_name}]   🔄 尝试使用代理连接({config.CONNECTION_TIMEOUT}秒超时)...")
+                else:
+                    logger.info(f"[{file_name}]   🔄 尝试本地连接({config.CONNECTION_TIMEOUT}秒超时)...")
+                
+                connection_start = time.time()
+                await asyncio.wait_for(client.connect(), timeout=config.CONNECTION_TIMEOUT)
+                connection_elapsed = time.time() - connection_start
+                logger.info(f"[{file_name}]   ✅ 连接成功（{connection_method}，耗时{connection_elapsed:.2f}秒）")
+            except asyncio.TimeoutError:
+                if use_proxy:
+                    # 代理超时，尝试回退到本地连接
+                    logger.warning(f"[{file_name}]   ⏱️ 代理连接超时({config.CONNECTION_TIMEOUT}秒)")
+                    logger.info(f"[{file_name}]   🔄 回退到本地连接...")
+                    try:
+                        # 断开之前的连接
+                        await client.disconnect()
+                        logger.info(f"[{file_name}]      已断开代理连接")
+                    except:
+                        pass
+                    
+                    # 重新创建客户端（不使用代理）
+                    logger.info(f"[{file_name}]   → 重新创建客户端（无代理）...")
+                    client = TelegramClient(
+                        session_base,
+                        int(api_id),
+                        str(api_hash),
+                        timeout=config.CONNECTION_TIMEOUT,
+                        connection_retries=3,
+                        retry_delay=1,
+                        proxy=None  # 不使用代理
+                    )
+                    logger.info(f"[{file_name}]   ✅ 客户端已重建")
+                    
+                    try:
+                        logger.info(f"[{file_name}]   🔄 尝试本地连接({config.CONNECTION_TIMEOUT}秒超时)...")
+                        connection_start = time.time()
+                        await asyncio.wait_for(client.connect(), timeout=config.CONNECTION_TIMEOUT)
+                        connection_elapsed = time.time() - connection_start
+                        connection_method = "local"
+                        logger.info(f"[{file_name}]   ✅ 本地连接成功（耗时{connection_elapsed:.2f}秒）")
+                    except asyncio.TimeoutError:
+                        logger.error(f"[{file_name}]   ❌ 本地连接也超时({config.CONNECTION_TIMEOUT}秒)")
+                        logger.error(f"[{file_name}]   💡 代理和本地连接均失败")
+                        return {
+                            'status': 'error',
+                            'error': t(user_id, 'regtime_fail_timeout_both'),
+                            'file_name': file_name,
+                            'file_type': file_type,
+                            'original_file_path': original_file_path
+                        }
+                else:
+                    # 本地连接超时
+                    logger.error(f"[{file_name}]   ❌ 本地连接超时(30秒)")
+                    return {
+                        'status': 'error',
+                        'error': t(user_id, 'regtime_fail_timeout'),
+                        'file_name': file_name,
+                        'file_type': file_type,
+                        'original_file_path': original_file_path
+                    }
+            
+            # 检查授权状态
+            logger.info(f"[{file_name}] ━━━ 步骤2: 检查账号授权状态 ━━━")
+            if not await client.is_user_authorized():
+                logger.error(f"[{file_name}] ❌ 账号未授权或已失效")
+                return {
+                    'status': 'error',
+                    'error': t(user_id, 'regtime_fail_unauthorized'),
+                    'file_name': file_name,
+                    'file_type': file_type,
+                    'original_file_path': original_file_path
+                }
+            logger.info(f"[{file_name}] ✅ 账号授权状态正常")
+            
+            # 获取账号信息
+            logger.info(f"[{file_name}] ━━━ 步骤3: 获取账号基本信息 ━━━")
+            me = await client.get_me()
+            phone = me.phone if me.phone else "unknown"
+            user_id_val = me.id
+            username = me.username if me.username else None
+            first_name = me.first_name if me.first_name else ""
+            last_name = me.last_name if me.last_name else ""
+            logger.info(f"[{file_name}] ✅ 账号信息: 手机={phone}, ID={user_id_val}, 用户名=@{username or 'None'}")
+            
+            # 获取完整用户信息 - 添加错误处理以应对受限账号
+            logger.info(f"[{file_name}] ━━━ 步骤4: 获取完整用户信息 ━━━")
+            full_user = None
+            try:
+                full = await client(GetFullUserRequest(user_id_val))
+                full_user = full.full_user
+                logger.info(f"[{file_name}] ✅ 完整用户信息获取成功")
+            except Exception as e:
+                # 如果账号受限制（无法发送消息等），GetFullUserRequest可能失败
+                # 这不影响我们获取注册时间，继续使用其他方法
+                logger.warning(f"[{file_name}] ⚠️ 无法获取完整用户信息（账号可能受限）: {e}")
+                full_user = None
+            
+            # 开始查询注册时间
+            logger.info(f"[{file_name}] ━━━ 步骤5: 开始查询注册时间 ━━━")
+            registration_date = None
+            registration_source = "estimated"  # telegram_api, full_user_api, all_chats, telegram_chat, saved_messages, estimated
+            
+            # 方法0：优先使用官方API获取注册时间（最准确）
+            logger.info(f"[{file_name}] 📊 方法0: 尝试从官方API获取注册时间...")
+            api_result = await self.get_registration_date_from_api(client, me, file_name)
+            if api_result:
+                registration_date = api_result['date']
+                registration_source = api_result['source']
+                logger.info(f"[{file_name}]   ✅ 方法0成功: 从官方API获取到注册时间")
+                logger.info(f"[{file_name}]   📅 注册时间: {registration_date} (来源: {registration_source})")
+                # 如果获取到官方数据，可以直接跳过其他方法
+                # 但为了保持完整性，我们继续执行以获取更多信息
+            else:
+                logger.info(f"[{file_name}]   ⚠️ 方法0失败: 官方API未返回注册时间，尝试方法1...")
+            
+            # 方法1：扫描所有对话，查找最早的消息（最全面的方法）
+            # 这个方法可以找到任何对话中的最早消息，即使Telegram官方对话被删除也能工作
+            # 只有在官方API失败时才使用此方法
+            if not registration_date:
+            
+                try:
+                    logger.info(f"[{file_name}] 📊 方法1: 扫描所有对话以查找最早消息...")
+                    
+                    # 获取所有对话（限制数量以提高速度，设置超时）
+                    logger.info(f"[{file_name}]   → 获取对话列表（最多100个，30秒超时）...")
+                    dialogs = await asyncio.wait_for(
+                        client.get_dialogs(limit=100),
+                        timeout=30  # 30秒超时
+                    )
+                    logger.info(f"[{file_name}]   ✅ 获取到 {len(dialogs)} 个对话")
+                    
+                    oldest_date = None
+                    oldest_dialog_name = None
+                    scanned_count = 0
+                    skipped_bots = 0
+                    
+                    # 遍历每个对话，找到最早的消息（最多检查100个对话）
+                    for idx, dialog in enumerate(dialogs, 1):
+                        try:
+                            # 跳过机器人对话（777000除外，因为它是官方账号）
+                            # Skip bot dialogs except 777000 (Telegram official)
+                            from telethon.tl.types import User
+                            entity = dialog.entity
+                            if isinstance(entity, User) and entity.bot and entity.id != 777000:
+                                skipped_bots += 1
+                                continue
+                            
+                            # 获取对话名称用于日志
+                            dialog_name = "Unknown"
+                            if hasattr(dialog, 'title'):
+                                dialog_name = dialog.title
+                            elif hasattr(dialog, 'name'):
+                                dialog_name = dialog.name
+                            
+                            # 每10个对话输出一次进度
+                            if idx % 10 == 0:
+                                logger.info(f"[{file_name}]   进度: {idx}/{len(dialogs)} 对话已扫描...")
+                            
+                            # 获取该对话的第一条消息（设置超时避免阻塞）
+                            messages = await asyncio.wait_for(
+                                client.get_messages(
+                                    dialog.entity,
+                                    limit=1,
+                                    offset_id=0,  # 从最开始获取
+                                    reverse=True   # 按时间正序
+                                ),
+                                timeout=5  # 每个对话5秒超时
+                            )
+                            
+                            scanned_count += 1
+                            
+                            if messages and len(messages) > 0 and messages[0].date:
+                                msg_date = messages[0].date
+                                # 如果这是目前找到的最早日期，记录下来
+                                if not oldest_date or msg_date < oldest_date:
+                                    oldest_date = msg_date
+                                    # 尝试获取对话名称，优先使用title，再尝试name
+                                    if hasattr(dialog, 'title'):
+                                        oldest_dialog_name = dialog.title
+                                    elif hasattr(dialog, 'name'):
+                                        oldest_dialog_name = dialog.name
+                                    else:
+                                        oldest_dialog_name = 'Unknown'
+                                    logger.info(f"[{file_name}]   🔍 发现更早消息: {msg_date.strftime('%Y-%m-%d %H:%M:%S')} (对话: {oldest_dialog_name[:30]})")
+                                    
+                        except asyncio.TimeoutError:
+                            # 单个对话超时，继续下一个
+                            logger.warning(f"[{file_name}]   ⏱️ 对话查询超时，跳过")
+                            continue
+                        except Exception as e:
+                            # 某些对话可能无法访问，跳过即可
+                            continue
+                    
+                    logger.info(f"[{file_name}]   📊 扫描统计: 总对话={len(dialogs)}, 已扫描={scanned_count}, 跳过机器人={skipped_bots}")
+                    
+                    if oldest_date:
+                        registration_date = oldest_date.strftime("%Y-%m-%d")
+                        registration_source = "all_chats"
+                        logger.info(f"[{file_name}]   ✅ 方法1成功: 从所有对话中找到最早消息")
+                        logger.info(f"[{file_name}]   📅 注册时间: {registration_date} (来源对话: {oldest_dialog_name[:50]})")
+                    else:
+                        logger.info(f"[{file_name}]   ⚠️ 方法1未找到消息，尝试方法2...")
+                        
+                except asyncio.TimeoutError:
+                    logger.warning(f"[{file_name}]   ⏱️ 方法1: 获取对话列表超时，跳过全对话扫描")
+                except Exception as e:
+                    logger.warning(f"[{file_name}]   ❌ 方法1失败: {e}")
+            
+            # 方法2：从与 @Telegram (777000) 的对话中获取第一条消息时间
+            # 只有在方法0和1都失败时才使用此方法作为备份
+            if not registration_date:
+                logger.info(f"[{file_name}] 📊 方法2: 检查Telegram官方对话(777000)...")
+                try:
+                    # 获取 Telegram 官方账号 (777000) 的对话
+                    logger.info(f"[{file_name}]   → 获取Telegram官方实体...")
+                    telegram_entity = await client.get_entity(777000)
+                    logger.info(f"[{file_name}]   ✅ Telegram官方实体获取成功")
+                
+                    # 获取最早的消息（从最旧的开始）
+                    # 注意：即使账号被限制发送消息，读取消息通常仍然可用
+                    # offset_id=0 确保从聊天历史的最开始获取消息
+                    logger.info(f"[{file_name}]   → 查询第一条消息（offset_id=0, reverse=True）...")
+                    messages = await client.get_messages(
+                        telegram_entity,
+                        limit=1,
+                        offset_id=0,  # 从聊天历史的最开始获取
+                        reverse=True  # 从最早的消息开始
+                    )
+                    
+                    if messages and len(messages) > 0:
+                        first_msg = messages[0]
+                        if first_msg.date:
+                            registration_date = first_msg.date.strftime("%Y-%m-%d")
+                            registration_source = "telegram_chat"
+                            logger.info(f"[{file_name}]   ✅ 方法2成功: 从Telegram对话获取到注册时间")
+                            logger.info(f"[{file_name}]   📅 注册时间: {registration_date} (消息时间: {first_msg.date.strftime('%Y-%m-%d %H:%M:%S')})")
+                    else:
+                        logger.info(f"[{file_name}]   ⚠️ Telegram对话无消息记录（可能已被删除），尝试方法3...")
+                except Exception as e:
+                    # 记录详细错误信息，帮助调试
+                    error_msg = str(e)
+                    if "CHAT_RESTRICTED" in error_msg or "USER_RESTRICTED" in error_msg:
+                        logger.warning(f"[{file_name}]   ❌ 方法2失败: 账号受限，无法从Telegram对话获取注册时间")
+                        logger.warning(f"[{file_name}]      错误详情: {error_msg}")
+                    else:
+                        logger.warning(f"[{file_name}]   ❌ 方法2失败: {error_msg}")
+            
+            # 方法3：如果方法0、1和2都失败，尝试从 Saved Messages 获取
+            # 收藏夹通常不受消息限制影响
+            if not registration_date:
+                logger.info(f"[{file_name}] 📊 方法3: 检查收藏夹(Saved Messages)...")
+                try:
+                    # 获取自己（Saved Messages）
+                    # offset_id=0 确保从聊天历史的最开始获取消息
+                    logger.info(f"[{file_name}]   → 查询收藏夹第一条消息...")
+                    saved_messages = await client.get_messages(
+                        'me',
+                        limit=1,
+                        offset_id=0,  # 从聊天历史的最开始获取
+                        reverse=True
+                    )
+                    
+                    if saved_messages and len(saved_messages) > 0:
+                        first_saved = saved_messages[0]
+                        if first_saved.date:
+                            registration_date = first_saved.date.strftime("%Y-%m-%d")
+                            registration_source = "saved_messages"
+                            logger.info(f"[{file_name}]   ✅ 方法3成功: 从Saved Messages获取到注册时间")
+                            logger.info(f"[{file_name}]   📅 注册时间: {registration_date} (消息时间: {first_saved.date.strftime('%Y-%m-%d %H:%M:%S')})")
+                    else:
+                        logger.info(f"[{file_name}]   ⚠️ 收藏夹无消息记录（可能已被删除），将使用方法4...")
+                except Exception as e:
+                    error_msg = str(e)
+                    if "CHAT_RESTRICTED" in error_msg or "USER_RESTRICTED" in error_msg:
+                        logger.warning(f"[{file_name}]   ❌ 方法3失败: 账号受限，无法从Saved Messages获取注册时间")
+                        logger.warning(f"[{file_name}]      错误详情: {error_msg}")
+                    else:
+                        logger.warning(f"[{file_name}]   ❌ 方法3失败: {error_msg}")
+            
+            # 方法4：如果以上所有方法都失败，使用用户ID估算（标注为不准确）
+            # 这个方法永远不会失败，确保总是能返回一个注册时间
+            # 即使用户删除了所有聊天记录，用户ID也不会改变，因此仍可进行估算
+            if not registration_date:
+                logger.info(f"[{file_name}] 📊 方法4: 使用用户ID估算...")
+                logger.info(f"[{file_name}]   → 用户ID: {user_id_val}")
+                registration_date = self._estimate_registration_date_from_user_id(user_id_val)
+                registration_source = "estimated"
+                logger.info(f"[{file_name}]   ✅ 方法4成功: 基于用户ID估算注册时间")
+                logger.info(f"[{file_name}]   ⚠️ 警告: 这是估算值，可能与实际注册时间相差数月甚至数年")
+                logger.info(f"[{file_name}]   📅 估算时间: {registration_date}")
+                logger.info(f"[{file_name}]   💡 说明: 所有官方API和聊天记录方法均失败，使用ID估算作为最后备选")
+            
+            logger.info(f"[{file_name}] ━━━ 步骤6: 生成查询结果 ━━━")
+            logger.info(f"[{file_name}] 📊 查询摘要:")
+            logger.info(f"[{file_name}]   手机号: {phone}")
+            logger.info(f"[{file_name}]   用户ID: {user_id_val}")
+            logger.info(f"[{file_name}]   用户名: @{username or 'None'}")
+            logger.info(f"[{file_name}]   注册时间: {registration_date}")
+            logger.info(f"[{file_name}]   数据来源: {registration_source}")
+            logger.info(f"[{file_name}]   连接方式: {connection_method}")
+            logger.info(f"[{file_name}] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+            
+            result = {
+                'status': 'success',
+                'phone': phone,
+                'user_id': user_id_val,
+                'username': username,
+                'first_name': first_name,
+                'last_name': last_name,
+                'registration_date': registration_date,  # 格式：YYYY-MM-DD
+                'registration_source': registration_source,  # 数据来源
+                'connection_method': connection_method,  # 连接方式：proxy 或 local
+                'common_chats': full_user.common_chats_count if full_user and hasattr(full_user, 'common_chats_count') else 0,
+                'about': full_user.about if full_user and hasattr(full_user, 'about') else None,
+                'file_name': file_name,
+                'file_type': file_type,
+                'original_file_path': original_file_path  # 保存原始文件路径用于打包
+            }
+            
+            return result
+            
+        except UserDeactivatedError:
+            return {
+                'status': 'frozen',
+                'error': t(user_id, 'regtime_fail_frozen_account'),
+                'file_name': file_name,
+                'file_type': file_type,
+                'original_file_path': original_file_path
+            }
+        except PhoneNumberBannedError:
+            return {
+                'status': 'banned',
+                'error': t(user_id, 'regtime_fail_banned_account'),
+                'file_name': file_name,
+                'file_type': file_type,
+                'original_file_path': original_file_path
+            }
+        except asyncio.TimeoutError:
+            return {
+                'status': 'error',
+                'error': t(user_id, 'regtime_fail_timeout'),
+                'file_name': file_name,
+                'file_type': file_type,
+                'original_file_path': original_file_path
+            }
+        except Exception as e:
+            logger.error(f"❌ [{file_name}] 查询注册时间失败: {e}")
+            return {
+                'status': 'error',
+                'error': str(e),
+                'file_name': file_name,
+                'file_type': file_type,
+                'original_file_path': original_file_path
+            }
+        
+        finally:
+            # 清理客户端
+            if client:
+                try:
+                    await client.disconnect()
+                except:
+                    pass
+            
+            # 清理临时Session文件
+            if temp_session_path and os.path.exists(f"{temp_session_path}.session"):
+                try:
+                    os.remove(f"{temp_session_path}.session")
+                    journal_file = f"{temp_session_path}.session-journal"
+                    if os.path.exists(journal_file):
+                        os.remove(journal_file)
+                except Exception as e:
+                    logger.warning(f"⚠️ [{file_name}] 清理临时Session失败: {e}")
+    
+    def _estimate_registration_date_from_user_id(self, user_id: int) -> str:
+        """
+        基于用户ID估算注册日期（年-月-日格式）
+        
+        ⚠️ 警告：这个方法非常不准确，可能相差数年！
+        Telegram用户ID不是严格按注册顺序递增的。
+        
+        仅当官方API和所有聊天记录方法都失败时使用此方法。
+        
+        返回格式: YYYY-MM-DD 或 YYYY-MM
+        """
+        # 基于历史数据的ID范围映射（这些是估算值，非精确值）
+        # 已知的参考点（需要定期更新）
+        reference_points = [
+            (1, "2013-08"),           # Telegram 创始人
+            (100000000, "2014-10"),   # 约1亿用户
+            (500000000, "2017-06"),   # 约5亿用户
+            (1000000000, "2020-01"),  # 约10亿用户
+            (2000000000, "2021-09"),  # 约20亿用户
+            (5000000000, "2023-01"),  # 约50亿用户
+            (7000000000, "2024-06"),  # 约70亿用户
+        ]
+        
+        user_id = int(user_id)
+        
+        # 找到最接近的参考点进行线性插值
+        for i in range(len(reference_points) - 1):
+            id1, date1 = reference_points[i]
+            id2, date2 = reference_points[i + 1]
+            
+            if id1 <= user_id <= id2:
+                # 线性插值
+                ratio = (user_id - id1) / (id2 - id1)
+                
+                # 解析日期
+                d1 = datetime.strptime(date1, "%Y-%m")
+                d2 = datetime.strptime(date2, "%Y-%m")
+                
+                # 计算估算日期
+                delta = d2 - d1
+                estimated = d1 + delta * ratio
+                
+                return estimated.strftime("%Y-%m")
+        
+        # 如果超出范围，返回最近的参考点
+        if user_id < reference_points[0][0]:
+            return reference_points[0][1]
+        else:
+            return reference_points[-1][1]
+    
+    # ================================
+    # 资料修改功能处理方法
+    # ================================
+    
+    def handle_profile_update_start(self, query):
+        """处理修改资料开始"""
+        query.answer()
+        user_id = query.from_user.id
+        
+        # 检查会员权限
+        if not self.db.is_admin(user_id):
+            is_member, level, expiry = self.db.check_membership(user_id)
+            if not is_member:
+                query.edit_message_text(
+                    text=t(user_id, 'profile_need_member'),
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton(t(user_id, 'btn_vip_menu'), callback_data="vip_menu"),
+                        InlineKeyboardButton(t(user_id, 'btn_back_to_menu'), callback_data="back_to_main")
+                    ]]),
+                    parse_mode='HTML'
+                )
+                return
+        
+        text = f"""
+<b>{t(user_id, 'profile_title')}</b>
+
+{t(user_id, 'profile_intro')}
+
+<b>{t(user_id, 'profile_random_mode_title')}</b>
+{t(user_id, 'profile_random_name')}
+{t(user_id, 'profile_random_name_us')}
+{t(user_id, 'profile_random_name_id')}
+{t(user_id, 'profile_random_name_ru')}
+{t(user_id, 'profile_random_name_support')}
+{t(user_id, 'profile_random_name_unique')}
+
+{t(user_id, 'profile_random_avatar')}
+{t(user_id, 'profile_random_bio')}
+{t(user_id, 'profile_random_username')}
+
+<b>{t(user_id, 'profile_custom_mode_title')}</b>
+{t(user_id, 'profile_custom_upload')}
+{t(user_id, 'profile_custom_manual')}
+{t(user_id, 'profile_custom_support')}
+
+<b>{t(user_id, 'profile_notes_title')}</b>
+{t(user_id, 'profile_note1')}
+{t(user_id, 'profile_note2')}
+{t(user_id, 'profile_note3')}
+{t(user_id, 'profile_note4')}
+
+<b>{t(user_id, 'profile_select_mode')}</b>
+        """
+        
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton(t(user_id, 'profile_btn_random'), callback_data="profile_mode_random"),
+                InlineKeyboardButton(t(user_id, 'profile_btn_custom'), callback_data="profile_mode_custom")
+            ],
+            [InlineKeyboardButton(t(user_id, 'btn_back_to_menu'), callback_data="back_to_main")]
+        ])
+        
+        query.edit_message_text(
+            text=text,
+            reply_markup=keyboard,
+            parse_mode='HTML'
+        )
+    
+    def handle_profile_update_callbacks(self, update: Update, context: CallbackContext, query, data: str):
+        """处理修改资料相关回调"""
+        user_id = query.from_user.id
+        
+        if data == "profile_mode_random":
+            self.handle_profile_random_mode(query, user_id)
+        elif data == "profile_mode_custom":
+            self.handle_profile_custom_mode(query, user_id)
+        elif data == "profile_custom_back":
+            # 返回自定义配置菜单
+            if user_id in self.pending_profile_update:
+                config = self.pending_profile_update[user_id]['config']
+                self._show_custom_config_menu(query, user_id, config)
+            else:
+                query.answer(t(user_id, 'profile_session_expired'))
+        elif data.startswith("profile_random_"):
+            self.handle_profile_random_config(update, context, query, data, user_id)
+        elif data.startswith("profile_custom_"):
+            self.handle_profile_custom_config(update, context, query, data, user_id)
+        elif data == "profile_execute":
+            self.handle_profile_update_execute(update, context, query, user_id)
+        elif data == "profile_confirm_execute":
+            self.handle_profile_confirm_execute(update, context, query, user_id)
+        elif data == "profile_cancel":
+            query.answer()
+            if user_id in self.pending_profile_update:
+                self.cleanup_profile_update_task(user_id)
+            self.show_main_menu(update, user_id)
+    
+    def handle_profile_random_mode(self, query, user_id: int):
+        """处理随机生成模式"""
+        query.answer()
+        
+        # 初始化配置
+        config = ProfileUpdateConfig(mode='random')
+        config.update_name = True
+        config.photo_action = 'keep'
+        config.bio_action = 'keep'
+        config.username_action = 'keep'
+        
+        self.pending_profile_update[user_id] = {
+            'config': config,
+            'status': 'configuring'
+        }
+        
+        self._show_random_config_menu(query, user_id, config)
+    
+    def _show_random_config_menu(self, query, user_id: int, config: ProfileUpdateConfig):
+        """显示随机模式配置菜单"""
+        # 头像选项显示
+        if config.photo_action == 'delete_all':
+            photo_status = t(user_id, 'profile_display_delete_all')
+        else:
+            photo_status = t(user_id, 'profile_display_keep')
+        
+        # 简介选项显示
+        if config.bio_action == 'clear':
+            bio_status = t(user_id, 'profile_display_clear')
+        elif config.bio_action == 'random':
+            bio_status = t(user_id, 'profile_display_random')
+        else:
+            bio_status = t(user_id, 'profile_display_no_modify')
+        
+        # 用户名选项显示
+        if config.username_action == 'delete':
+            username_status = t(user_id, 'profile_display_delete')
+        elif config.username_action == 'random':
+            username_status = t(user_id, 'profile_display_random')
+        else:
+            username_status = t(user_id, 'profile_display_no_modify')
+        
+        text = f"""
+<b>{t(user_id, 'profile_random_config_title')}</b>
+
+<b>{t(user_id, 'profile_current_config')}</b>
+
+{t(user_id, 'profile_config_name')} {t(user_id, 'profile_display_random_by_country')}
+{t(user_id, 'profile_config_avatar')} {photo_status}
+{t(user_id, 'profile_config_bio')} {bio_status}
+{t(user_id, 'profile_config_username')} {username_status}
+
+<b>{t(user_id, 'profile_random_tip_title')}</b>
+{t(user_id, 'profile_random_tip')}
+
+<b>{t(user_id, 'profile_config_prompt')}</b>
+        """
+        
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton(f"{t(user_id, 'profile_btn_avatar')} {photo_status}", callback_data="profile_random_photo"),
+            ],
+            [
+                InlineKeyboardButton(f"{t(user_id, 'profile_btn_bio')} {bio_status}", callback_data="profile_random_bio"),
+            ],
+            [
+                InlineKeyboardButton(f"{t(user_id, 'profile_btn_username')} {username_status}", callback_data="profile_random_username"),
+            ],
+            [
+                InlineKeyboardButton(t(user_id, 'profile_btn_upload'), callback_data="profile_execute")
+            ],
+            [
+                InlineKeyboardButton(t(user_id, 'profile_btn_return'), callback_data="profile_update_start"),
+                InlineKeyboardButton(t(user_id, 'profile_btn_cancel'), callback_data="profile_cancel")
+            ]
+        ])
+        
+        query.edit_message_text(
+            text=text,
+            reply_markup=keyboard,
+            parse_mode='HTML'
+        )
+        
+        # 设置用户状态
+        self.db.save_user(user_id, "", "", "profile_random_config")
+    
+    def handle_profile_random_config(self, update: Update, context: CallbackContext, query, data: str, user_id: int):
+        """处理随机模式配置选项"""
+        query.answer()
+        
+        if user_id not in self.pending_profile_update:
+            query.answer(t(user_id, 'profile_session_expired'))
+            return
+        
+        config = self.pending_profile_update[user_id]['config']
+        
+        if data == "profile_random_photo":
+            # 切换头像选项
+            if config.photo_action == 'keep':
+                config.photo_action = 'delete_all'
+                config.update_photo = True
+            else:
+                config.photo_action = 'keep'
+                config.update_photo = False
+        elif data == "profile_random_bio":
+            # 循环切换简介选项：keep -> clear -> random -> keep
+            if config.bio_action == 'keep':
+                config.bio_action = 'clear'
+                config.update_bio = True
+            elif config.bio_action == 'clear':
+                config.bio_action = 'random'
+                config.update_bio = True
+            else:
+                config.bio_action = 'keep'
+                config.update_bio = False
+        elif data == "profile_random_username":
+            # 循环切换用户名选项：keep -> delete -> random -> keep
+            if config.username_action == 'keep':
+                config.username_action = 'delete'
+                config.update_username = True
+            elif config.username_action == 'delete':
+                config.username_action = 'random'
+                config.update_username = True
+            else:
+                config.username_action = 'keep'
+                config.update_username = False
+        
+        # 刷新菜单
+        self._show_random_config_menu(query, user_id, config)
+    
+    def handle_profile_custom_mode(self, query, user_id: int):
+        """处理自定义生成模式"""
+        query.answer()
+        
+        # 初始化配置
+        config = ProfileUpdateConfig(mode='custom')
+        config.update_name = False
+        config.update_photo = False
+        config.update_bio = False
+        config.update_username = False
+        
+        self.pending_profile_update[user_id] = {
+            'config': config,
+            'status': 'configuring',
+            'custom_input_field': None  # 当前正在配置的字段
+        }
+        
+        self._show_custom_config_menu(query, user_id, config)
+    
+    def _show_custom_config_menu(self, query, user_id: int, config: ProfileUpdateConfig):
+        """显示自定义模式配置菜单"""
+        # 姓名状态显示
+        if config.update_name and config.custom_names:
+            name_status = t(user_id, 'profile_custom_status_configured').format(count=len(config.custom_names))
+        elif config.update_name:
+            name_status = t(user_id, 'profile_custom_status_pending')
+        else:
+            name_status = t(user_id, 'profile_custom_status_no_modify')
+        
+        # 头像状态显示
+        if config.update_photo:
+            if config.photo_action == 'delete_all':
+                photo_status = t(user_id, 'profile_display_delete_all')
+            elif config.photo_action == 'custom' and config.custom_photos:
+                photo_status = t(user_id, 'profile_custom_status_configured').format(count=len(config.custom_photos))
+            elif config.photo_action == 'custom':
+                photo_status = t(user_id, 'profile_custom_status_pending')
+            else:
+                photo_status = t(user_id, 'profile_custom_status_no_modify')
+        else:
+            photo_status = t(user_id, 'profile_custom_status_no_modify')
+        
+        # 简介状态显示
+        if config.update_bio:
+            if config.bio_action == 'clear':
+                bio_status = t(user_id, 'profile_display_clear')
+            elif config.bio_action == 'custom' and config.custom_bios:
+                bio_status = t(user_id, 'profile_custom_status_configured').format(count=len(config.custom_bios))
+            elif config.bio_action == 'custom':
+                bio_status = t(user_id, 'profile_custom_status_pending')
+            else:
+                bio_status = t(user_id, 'profile_custom_status_no_modify')
+        else:
+            bio_status = t(user_id, 'profile_custom_status_no_modify')
+        
+        # 用户名状态显示
+        if config.update_username:
+            if config.username_action == 'delete':
+                username_status = t(user_id, 'profile_display_delete')
+            elif config.username_action == 'custom' and config.custom_usernames:
+                username_status = t(user_id, 'profile_custom_status_configured').format(count=len(config.custom_usernames))
+            elif config.username_action == 'custom':
+                username_status = t(user_id, 'profile_custom_status_pending')
+            else:
+                username_status = t(user_id, 'profile_custom_status_no_modify')
+        else:
+            username_status = t(user_id, 'profile_custom_status_no_modify')
+        
+        text = f"""
+<b>{t(user_id, 'profile_custom_config_title')}</b>
+
+<b>{t(user_id, 'profile_current_config')}</b>
+
+{t(user_id, 'profile_config_name')} {name_status}
+{t(user_id, 'profile_config_avatar')} {photo_status}
+{t(user_id, 'profile_config_bio')} {bio_status}
+{t(user_id, 'profile_config_username')} {username_status}
+
+<b>{t(user_id, 'profile_custom_tip_title')}</b>
+{t(user_id, 'profile_custom_tip1')}
+{t(user_id, 'profile_custom_tip2')}
+{t(user_id, 'profile_custom_tip3')}
+
+<b>{t(user_id, 'profile_custom_rule_title')}</b>
+{t(user_id, 'profile_custom_rule1')}
+{t(user_id, 'profile_custom_rule2')}
+{t(user_id, 'profile_custom_rule3')}
+
+<b>{t(user_id, 'profile_custom_select')}</b>
+        """
+        
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton(f"{t(user_id, 'profile_btn_name')} {name_status}", callback_data="profile_custom_name"),
+            ],
+            [
+                InlineKeyboardButton(f"{t(user_id, 'profile_btn_avatar')} {photo_status}", callback_data="profile_custom_photo"),
+            ],
+            [
+                InlineKeyboardButton(f"{t(user_id, 'profile_btn_bio')} {bio_status}", callback_data="profile_custom_bio"),
+            ],
+            [
+                InlineKeyboardButton(f"{t(user_id, 'profile_btn_username')} {username_status}", callback_data="profile_custom_username"),
+            ],
+            [
+                InlineKeyboardButton(t(user_id, 'profile_btn_upload'), callback_data="profile_execute")
+            ],
+            [
+                InlineKeyboardButton(t(user_id, 'profile_btn_return'), callback_data="profile_update_start"),
+                InlineKeyboardButton(t(user_id, 'profile_btn_cancel'), callback_data="profile_cancel")
+            ]
+        ])
+        
+        query.edit_message_text(
+            text=text,
+            reply_markup=keyboard,
+            parse_mode='HTML'
+        )
+        
+        # 设置用户状态
+        self.db.save_user(user_id, "", "", "profile_custom_config")
+    
+    def handle_profile_custom_config(self, update: Update, context: CallbackContext, query, data: str, user_id: int):
+        """处理自定义模式配置选项"""
+        query.answer()
+        
+        if user_id not in self.pending_profile_update:
+            query.answer(t(user_id, 'profile_custom_session_expired'))
+            return
+        
+        config = self.pending_profile_update[user_id]['config']
+        task = self.pending_profile_update[user_id]
+        
+        if data == "profile_custom_name":
+            # 配置姓名
+            self._show_custom_field_config(query, user_id, 'name', t(user_id, 'profile_field_name'))
+        elif data == "profile_custom_photo":
+            # 配置头像
+            self._show_custom_field_config(query, user_id, 'photo', t(user_id, 'profile_field_avatar'))
+        elif data == "profile_custom_bio":
+            # 配置简介
+            self._show_custom_field_config(query, user_id, 'bio', t(user_id, 'profile_field_bio'))
+        elif data == "profile_custom_username":
+            # 配置用户名
+            self._show_custom_field_config(query, user_id, 'username', t(user_id, 'profile_field_username'))
+        elif data.startswith("profile_custom_field_"):
+            # 处理字段配置选项
+            self._handle_custom_field_action(update, context, query, data, user_id)
+    
+    def _show_custom_field_config(self, query, user_id: int, field: str, field_name: str):
+        """显示字段配置选项"""
+        if user_id not in self.pending_profile_update:
+            query.answer(t(user_id, 'profile_session_expired'))
+            return
+        
+        config = self.pending_profile_update[user_id]['config']
+        task = self.pending_profile_update[user_id]
+        
+        # 记录当前正在配置的字段
+        task['custom_input_field'] = field
+        
+        # 根据字段类型显示不同的选项
+        text = f"<b>{t(user_id, 'profile_custom_field_config').format(field=field_name)}</b>\n\n{t(user_id, 'profile_custom_field_select')}"
+        
+        keyboard_buttons = []
+        
+        if field == 'name':
+            keyboard_buttons = [
+                [InlineKeyboardButton(t(user_id, 'profile_custom_field_upload_txt'), callback_data=f"profile_custom_field_{field}_upload")],
+                [InlineKeyboardButton(t(user_id, 'profile_custom_field_manual_input'), callback_data=f"profile_custom_field_{field}_manual")],
+                [InlineKeyboardButton(t(user_id, 'profile_custom_field_no_modify'), callback_data=f"profile_custom_field_{field}_skip")],
+            ]
+            if config.custom_names:
+                keyboard_buttons.insert(0, [InlineKeyboardButton(t(user_id, 'profile_custom_field_view_configured').format(count=len(config.custom_names)), callback_data=f"profile_custom_field_{field}_view")])
+                keyboard_buttons.insert(1, [InlineKeyboardButton(t(user_id, 'profile_custom_field_clear_config'), callback_data=f"profile_custom_field_{field}_clear")])
+        
+        elif field == 'photo':
+            keyboard_buttons = [
+                [InlineKeyboardButton(t(user_id, 'profile_custom_field_upload_images'), callback_data=f"profile_custom_field_{field}_upload")],
+                [InlineKeyboardButton(t(user_id, 'profile_custom_field_delete_all_avatar'), callback_data=f"profile_custom_field_{field}_delete")],
+                [InlineKeyboardButton(t(user_id, 'profile_custom_field_no_modify'), callback_data=f"profile_custom_field_{field}_skip")],
+            ]
+            if config.custom_photos:
+                keyboard_buttons.insert(0, [InlineKeyboardButton(t(user_id, 'profile_custom_field_view_configured').format(count=len(config.custom_photos)), callback_data=f"profile_custom_field_{field}_view")])
+                keyboard_buttons.insert(1, [InlineKeyboardButton(t(user_id, 'profile_custom_field_clear_config'), callback_data=f"profile_custom_field_{field}_clear")])
+        
+        elif field == 'bio':
+            keyboard_buttons = [
+                [InlineKeyboardButton(t(user_id, 'profile_custom_field_upload_txt'), callback_data=f"profile_custom_field_{field}_upload")],
+                [InlineKeyboardButton(t(user_id, 'profile_custom_field_manual_input'), callback_data=f"profile_custom_field_{field}_manual")],
+                [InlineKeyboardButton(t(user_id, 'profile_custom_field_clear_bio'), callback_data=f"profile_custom_field_{field}_clear_bio")],
+                [InlineKeyboardButton(t(user_id, 'profile_custom_field_no_modify'), callback_data=f"profile_custom_field_{field}_skip")],
+            ]
+            if config.custom_bios:
+                keyboard_buttons.insert(0, [InlineKeyboardButton(t(user_id, 'profile_custom_field_view_configured').format(count=len(config.custom_bios)), callback_data=f"profile_custom_field_{field}_view")])
+                keyboard_buttons.insert(1, [InlineKeyboardButton(t(user_id, 'profile_custom_field_clear_config'), callback_data=f"profile_custom_field_{field}_clear")])
+        
+        elif field == 'username':
+            keyboard_buttons = [
+                [InlineKeyboardButton(t(user_id, 'profile_custom_field_upload_txt'), callback_data=f"profile_custom_field_{field}_upload")],
+                [InlineKeyboardButton(t(user_id, 'profile_custom_field_manual_input'), callback_data=f"profile_custom_field_{field}_manual")],
+                [InlineKeyboardButton(t(user_id, 'profile_custom_field_delete_username'), callback_data=f"profile_custom_field_{field}_delete_username")],
+                [InlineKeyboardButton(t(user_id, 'profile_custom_field_no_modify'), callback_data=f"profile_custom_field_{field}_skip")],
+            ]
+            if config.custom_usernames:
+                keyboard_buttons.insert(0, [InlineKeyboardButton(t(user_id, 'profile_custom_field_view_configured').format(count=len(config.custom_usernames)), callback_data=f"profile_custom_field_{field}_view")])
+                keyboard_buttons.insert(1, [InlineKeyboardButton(t(user_id, 'profile_custom_field_clear_config'), callback_data=f"profile_custom_field_{field}_clear")])
+        
+        keyboard_buttons.append([InlineKeyboardButton(t(user_id, 'profile_custom_field_back_to_menu'), callback_data="profile_custom_back")])
+        
+        keyboard = InlineKeyboardMarkup(keyboard_buttons)
+        
+        query.edit_message_text(
+            text=text,
+            reply_markup=keyboard,
+            parse_mode='HTML'
+        )
+    
+    def _handle_custom_field_action(self, update: Update, context: CallbackContext, query, data: str, user_id: int):
+        """处理字段配置动作"""
+        if user_id not in self.pending_profile_update:
+            query.answer(t(user_id, 'profile_session_expired'))
+            return
+        
+        config = self.pending_profile_update[user_id]['config']
+        task = self.pending_profile_update[user_id]
+        field = task.get('custom_input_field', '')
+        
+        # 解析动作
+        parts = data.replace("profile_custom_field_", "").split("_", 1)
+        
+        # 如果没有动作（即只有字段名），则显示字段配置菜单（返回上一步）
+        if len(parts) < 2 or parts[1] == "":
+            field_name = parts[0]
+            # 清除用户状态（从上传/输入状态返回）
+            self.db.save_user(user_id, "", "", "profile_custom_config")
+            # Helper function to get translated field display name
+            field_map = {
+                'name': 'profile_field_name',
+                'photo': 'profile_field_avatar',
+                'bio': 'profile_field_bio',
+                'username': 'profile_field_username'
+            }
+            field_display = t(user_id, field_map.get(field_name, 'profile_field_name'))
+            self._show_custom_field_config(query, user_id, field_name, field_display)
+            return
+        
+        field_name, action = parts[0], parts[1]
+        
+        # Helper function to get translated field display name
+        def get_field_display(field):
+            field_map = {
+                'name': 'profile_field_name',
+                'photo': 'profile_field_avatar',
+                'bio': 'profile_field_bio',
+                'username': 'profile_field_username'
+            }
+            return t(user_id, field_map.get(field, 'profile_field_name'))
+        
+        if action == "upload":
+            # 请求用户上传文件
+            field_display = get_field_display(field_name)
+            
+            if field_name == 'photo':
+                text = f"""
+<b>{t(user_id, 'profile_custom_upload_photo_title').format(field=field_display)}</b>
+
+<b>{t(user_id, 'profile_custom_upload_photo_format')}</b>
+{t(user_id, 'profile_custom_upload_photo_single')}
+{t(user_id, 'profile_custom_upload_photo_multi')}
+{t(user_id, 'profile_custom_upload_photo_assign')}
+
+<b>{t(user_id, 'profile_custom_upload_photo_notice')}</b>
+{t(user_id, 'profile_custom_upload_photo_size')}
+{t(user_id, 'profile_custom_upload_photo_limit')}
+
+{t(user_id, 'profile_upload_timeout')}
+"""
+            else:
+                text = f"""
+<b>{t(user_id, 'profile_custom_upload_txt_title').format(field=field_display)}</b>
+
+<b>{t(user_id, 'profile_custom_upload_txt_format')}</b>
+{t(user_id, 'profile_custom_upload_txt_line').format(field=field_display)}
+{t(user_id, 'profile_custom_upload_txt_encoding')}
+{t(user_id, 'profile_custom_upload_txt_skip')}
+
+<b>{t(user_id, 'profile_custom_upload_txt_example')}</b>
+<code>a8ppp
+session9haobot
+o5eth</code>
+
+{t(user_id, 'profile_upload_timeout')}
+"""
+            
+            # 添加返回按钮
+            keyboard = InlineKeyboardMarkup([[
+                InlineKeyboardButton(t(user_id, 'button_back_previous'), callback_data=f"profile_custom_field_{field_name}")
+            ]])
+            
+            query.edit_message_text(text=text, parse_mode='HTML', reply_markup=keyboard)
+            
+            # 设置用户状态为等待文件上传
+            self.db.save_user(user_id, "", "", f"profile_custom_upload_{field_name}")
+            task['status'] = 'waiting_file_upload'
+            task['upload_field'] = field_name
+        
+        elif action == "manual":
+            # 请求用户手动输入
+            field_display = get_field_display(field_name)
+            
+            text = f"""
+<b>{t(user_id, 'profile_custom_manual_input_title').format(field=field_display)}</b>
+
+<b>{t(user_id, 'profile_custom_manual_input_format')}</b>
+{t(user_id, 'profile_custom_manual_input_line').format(field=field_display)}
+{t(user_id, 'profile_custom_manual_input_multi')}
+{t(user_id, 'profile_custom_manual_input_skip')}
+
+<b>{t(user_id, 'profile_custom_manual_input_example')}</b>
+<code>a8ppp
+session9haobot
+o5eth</code>
+
+{t(user_id, 'profile_custom_input_timeout')}
+"""
+            
+            # 添加返回按钮
+            keyboard = InlineKeyboardMarkup([[
+                InlineKeyboardButton(t(user_id, 'button_back_previous'), callback_data=f"profile_custom_field_{field_name}")
+            ]])
+            
+            query.edit_message_text(text=text, parse_mode='HTML', reply_markup=keyboard)
+            
+            # 设置用户状态为等待文本输入
+            self.db.save_user(user_id, "", "", f"profile_custom_input_{field_name}")
+            task['status'] = 'waiting_text_input'
+            task['input_field'] = field_name
+        
+        elif action == "skip":
+            # 不修改此项
+            if field_name == 'name':
+                config.update_name = False
+                config.custom_names = []
+            elif field_name == 'photo':
+                config.update_photo = False
+                config.photo_action = 'keep'
+                config.custom_photos = []
+            elif field_name == 'bio':
+                config.update_bio = False
+                config.bio_action = 'keep'
+                config.custom_bios = []
+            elif field_name == 'username':
+                config.update_username = False
+                config.username_action = 'keep'
+                config.custom_usernames = []
+            
+            # 返回配置菜单
+            self._show_custom_config_menu(query, user_id, config)
+        
+        elif action == "clear":
+            # 清除设置
+            if field_name == 'name':
+                config.custom_names = []
+            elif field_name == 'photo':
+                config.custom_photos = []
+            elif field_name == 'bio':
+                config.custom_bios = []
+            elif field_name == 'username':
+                config.custom_usernames = []
+            
+            query.answer(t(user_id, 'profile_custom_cleared'))
+            self._show_custom_field_config(query, user_id, field_name, get_field_display(field_name))
+        
+        elif action == "view":
+            # 查看已设置的内容
+            field_display = get_field_display(field_name)
+            
+            items = []
+            if field_name == 'name':
+                items = config.custom_names
+            elif field_name == 'photo':
+                items = [os.path.basename(p) for p in config.custom_photos]
+            elif field_name == 'bio':
+                items = config.custom_bios
+            elif field_name == 'username':
+                items = config.custom_usernames
+            
+            # 只显示前N个（使用常量）
+            display_items = items[:self.MAX_DISPLAY_ITEMS]
+            text = f"<b>{t(user_id, 'profile_custom_view_title').format(field=field_display, count=len(items))}</b>\n\n"
+            
+            for i, item in enumerate(display_items, 1):
+                text += f"{i}. {item}\n"
+            
+            if len(items) > self.MAX_DISPLAY_ITEMS:
+                text += f"\n{t(user_id, 'profile_custom_view_more').format(count=len(items) - self.MAX_DISPLAY_ITEMS)}"
+            
+            query.answer(text[:self.ALERT_TEXT_MAX_LENGTH], show_alert=True)
+        
+        elif action == "delete":
+            # 删除头像
+            if field_name == 'photo':
+                config.update_photo = True
+                config.photo_action = 'delete_all'
+                config.custom_photos = []
+                self._show_custom_config_menu(query, user_id, config)
+        
+        elif action == "clear_bio":
+            # 清空简介
+            config.update_bio = True
+            config.bio_action = 'clear'
+            config.custom_bios = []
+            self._show_custom_config_menu(query, user_id, config)
+        
+        elif action == "delete_username":
+            # 删除用户名
+            config.update_username = True
+            config.username_action = 'delete'
+            config.custom_usernames = []
+            self._show_custom_config_menu(query, user_id, config)
+    
+    def handle_profile_custom_text_input(self, update: Update, context: CallbackContext, user_id: int, field_name: str, text: str):
+        """处理自定义资料的文本输入"""
+        if user_id not in self.pending_profile_update:
+            self.safe_send_message(update, t(user_id, 'profile_custom_session_expired_restart'), 'HTML')
+            return
+        
+        config = self.pending_profile_update[user_id]['config']
+        
+        # 解析输入的文本（按行分割）
+        lines = [line.strip() for line in text.split('\n') if line.strip()]
+        
+        if not lines:
+            self.safe_send_message(update, t(user_id, 'profile_custom_input_empty'), 'HTML')
+            return
+        
+        # Helper function to get translated field display name
+        def get_field_display(field):
+            field_map = {
+                'name': 'profile_field_name',
+                'bio': 'profile_field_bio',
+                'username': 'profile_field_username'
+            }
+            return t(user_id, field_map.get(field, 'profile_field_name'))
+        
+        field_display = get_field_display(field_name)
+        
+        if field_name == 'name':
+            config.custom_names = lines
+            config.update_name = True
+        elif field_name == 'bio':
+            config.custom_bios = lines
+            config.update_bio = True
+            config.bio_action = 'custom'
+        elif field_name == 'username':
+            config.custom_usernames = lines
+            config.update_username = True
+            config.username_action = 'custom'
+        
+        # 清除用户状态
+        self.db.save_user(user_id, "", "", "profile_custom_config")
+        
+        # 发送确认消息和返回按钮
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton(t(user_id, 'profile_custom_field_back_to_menu'), callback_data="profile_custom_back")
+        ]])
+        
+        self.safe_send_message(
+            update,
+            t(user_id, 'profile_custom_configured').format(count=len(lines), field=field_display),
+            'HTML',
+            reply_markup=keyboard
+        )
+    
+    def _create_avatar_upload_dir(self, user_id: int) -> str:
+        """创建头像上传目录并返回路径"""
+        upload_dir = os.path.join(config.UPLOADS_DIR, f"avatars_{user_id}_{int(time.time())}")
+        os.makedirs(upload_dir, exist_ok=True)
+        return upload_dir
+    
+    def handle_profile_photo_upload(self, update: Update, context: CallbackContext, user_id: int):
+        """处理资料头像的单张图片上传"""
+        if user_id not in self.pending_profile_update:
+            self.safe_send_message(update, t(user_id, 'profile_custom_session_expired_restart'), 'HTML')
+            return
+        
+        config = self.pending_profile_update[user_id]['config']
+        
+        progress_msg = self.safe_send_message(update, t(user_id, 'profile_photo_processing'), 'HTML')
+        if not progress_msg:
+            return
+        
+        try:
+            # 获取最大尺寸的图片
+            photo = update.message.photo[-1]
+            
+            # 创建上传目录
+            upload_dir = self._create_avatar_upload_dir(user_id)
+            
+            # 下载图片
+            file = photo.get_file()
+            file_path = os.path.join(upload_dir, f"avatar_{user_id}.jpg")
+            file.download(file_path)
+            
+            # 保存到配置
+            config.custom_photos = [file_path]
+            config.update_photo = True
+            config.photo_action = 'custom'
+            
+            # 清除用户状态
+            self.db.save_user(user_id, "", "", "profile_custom_config")
+            
+            # 显示确认消息
+            keyboard = InlineKeyboardMarkup([[
+                InlineKeyboardButton(t(user_id, 'profile_custom_field_back_to_menu'), callback_data="profile_custom_back")
+            ]])
+            
+            self.safe_edit_message_text(
+                progress_msg,
+                t(user_id, 'profile_photo_uploaded_success'),
+                reply_markup=keyboard,
+                parse_mode='HTML'
+            )
+            
+        except Exception as e:
+            logger.error(f"处理资料头像上传失败: {e}")
+            import traceback
+            traceback.print_exc()
+            
+            self.safe_edit_message_text(
+                progress_msg,
+                t(user_id, 'profile_photo_upload_failed').format(error=str(e)),
+                parse_mode='HTML'
+            )
+    
+    def handle_profile_custom_file_upload(self, update: Update, context: CallbackContext, user_id: int, field_name: str, document):
+        """处理自定义资料的文件上传"""
+        if user_id not in self.pending_profile_update:
+            self.safe_send_message(update, t(user_id, 'profile_custom_session_expired_restart'), 'HTML')
+            return
+        
+        config = self.pending_profile_update[user_id]['config']
+        
+        progress_msg = self.safe_send_message(update, t(user_id, 'processing_your_file'), 'HTML')
+        if not progress_msg:
+            return
+        
+        try:
+            # 创建临时目录
+            temp_dir = tempfile.mkdtemp(prefix=f"profile_custom_{field_name}_")
+            temp_file = os.path.join(temp_dir, document.file_name)
+            
+            # 下载文件
+            document.get_file().download(temp_file)
+            
+            # Helper function to get translated field display name
+            def get_field_display(field):
+                field_map = {
+                    'name': 'profile_field_name',
+                    'photo': 'profile_field_avatar',
+                    'bio': 'profile_field_bio',
+                    'username': 'profile_field_username'
+                }
+                return t(user_id, field_map.get(field, 'profile_field_name'))
+            
+            field_display = get_field_display(field_name)
+            
+            if field_name == 'photo':
+                # 处理图片文件
+                items = []
+                
+                # 检查是否是图片文件
+                if temp_file.lower().endswith(('.jpg', '.jpeg', '.png', '.webp', '.gif')):
+                    # 单个图片文件
+                    upload_dir = self._create_avatar_upload_dir(user_id)
+                    dest_path = os.path.join(upload_dir, document.file_name)
+                    shutil.copy(temp_file, dest_path)
+                    items.append(dest_path)
+                    
+                elif temp_file.lower().endswith('.zip'):
+                    # ZIP文件，解压并提取图片
+                    extract_dir = os.path.join(temp_dir, "extracted")
+                    os.makedirs(extract_dir, exist_ok=True)
+                    
+                    with zipfile.ZipFile(temp_file, 'r') as zip_ref:
+                        zip_ref.extractall(extract_dir)
+                    
+                    # 查找所有图片文件
+                    upload_dir = self._create_avatar_upload_dir(user_id)
+                    for root, dirs, files in os.walk(extract_dir):
+                        for file in files:
+                            if file.lower().endswith(('.jpg', '.jpeg', '.png', '.webp', '.gif')):
+                                file_path = os.path.join(root, file)
+                                dest_path = os.path.join(upload_dir, file)
+                                shutil.copy(file_path, dest_path)
+                                items.append(dest_path)
+                
+                if not items:
+                    self.safe_edit_message_text(
+                        progress_msg,
+                        t(user_id, 'profile_custom_no_images'),
+                        parse_mode='HTML'
+                    )
+                    return
+                
+                config.custom_photos = items
+                config.update_photo = True
+                config.photo_action = 'custom'
+                
+            else:
+                # 处理文本文件（姓名、简介、用户名）
+                # 验证是否为 .txt 文件
+                if not temp_file.lower().endswith('.txt'):
+                    self.safe_edit_message_text(
+                        progress_msg,
+                        f"❌ <b>文件格式错误</b>\n\n请上传 .txt 文本文件，当前文件: {document.file_name}",
+                        parse_mode='HTML'
+                    )
+                    return
+                
+                try:
+                    with open(temp_file, 'r', encoding='utf-8') as f:
+                        lines = [line.strip() for line in f if line.strip()]
+                except UnicodeDecodeError:
+                    # 尝试其他编码
+                    try:
+                        with open(temp_file, 'r', encoding='gbk') as f:
+                            lines = [line.strip() for line in f if line.strip()]
+                    except:
+                        self.safe_edit_message_text(
+                            progress_msg,
+                            t(user_id, 'profile_custom_encoding_error'),
+                            parse_mode='HTML'
+                        )
+                        return
+                
+                if not lines:
+                    self.safe_edit_message_text(
+                        progress_msg,
+                        t(user_id, 'profile_custom_file_empty'),
+                        parse_mode='HTML'
+                    )
+                    return
+                
+                # 根据字段类型保存
+                if field_name == 'name':
+                    config.custom_names = lines
+                    config.update_name = True
+                elif field_name == 'bio':
+                    config.custom_bios = lines
+                    config.update_bio = True
+                    config.bio_action = 'custom'
+                elif field_name == 'username':
+                    config.custom_usernames = lines
+                    config.update_username = True
+                    config.username_action = 'custom'
+                
+                items = lines
+            
+            # 清除用户状态
+            self.db.save_user(user_id, "", "", "profile_custom_config")
+            
+            # 显示确认消息
+            keyboard = InlineKeyboardMarkup([[
+                InlineKeyboardButton(t(user_id, 'profile_custom_field_back_to_menu'), callback_data="profile_custom_back")
+            ]])
+            
+            self.safe_edit_message_text(
+                progress_msg,
+                t(user_id, 'profile_custom_configured').format(count=len(items), field=field_display),
+                reply_markup=keyboard,
+                parse_mode='HTML'
+            )
+            
+        except Exception as e:
+            logger.error(f"处理自定义资料文件上传失败: {e}")
+            import traceback
+            traceback.print_exc()
+            
+            self.safe_edit_message_text(
+                progress_msg,
+                t(user_id, 'profile_custom_processing_failed').format(error=str(e)),
+                parse_mode='HTML'
+            )
+        finally:
+            # 清理临时文件
+            if temp_dir and os.path.exists(temp_dir):
+                shutil.rmtree(temp_dir, ignore_errors=True)
+    
+    def handle_profile_confirm_execute(self, update: Update, context: CallbackContext, query, user_id: int):
+        """处理确认执行资料修改"""
+        query.answer()
+        
+        if user_id not in self.pending_profile_update:
+            self.safe_edit_message(query, t(user_id, 'profile_custom_task_expired'))
+            return
+        
+        task = self.pending_profile_update[user_id]
+        
+        # 检查是否有文件信息
+        if 'files' not in task or 'file_type' not in task or 'progress_msg' not in task:
+            self.safe_edit_message(query, "❌ 任务信息不完整，请重新上传文件")
+            return
+        
+        files = task['files']
+        file_type = task['file_type']
+        config = task['config']
+        progress_msg = task['progress_msg']
+        
+        # 开始执行（使用线程运行异步任务，避免事件循环错误）
+        def execute_profile_update():
+            try:
+                asyncio.run(self._execute_profile_update(user_id, files, file_type, config, context, progress_msg))
+            except asyncio.CancelledError:
+                logger.info(f"[profile_update] 任务被取消")
+            except Exception as e:
+                logger.error(f"[profile_update] 处理异常: {e}")
+                import traceback
+                traceback.print_exc()
+        
+        thread = threading.Thread(target=execute_profile_update, daemon=True)
+        thread.start()
+    
+    def handle_profile_update_execute(self, update: Update, context: CallbackContext, query, user_id: int):
+        """开始执行资料修改"""
+        query.answer()
+        
+        if user_id not in self.pending_profile_update:
+            self.safe_edit_message(query, t(user_id, 'profile_session_expired'))
+            return
+        
+        task = self.pending_profile_update[user_id]
+        config = task['config']
+        
+        text = f"""
+<b>{t(user_id, 'profile_upload_title')}</b>
+
+<b>{t(user_id, 'profile_upload_format')}</b>
+{t(user_id, 'profile_upload_session')}
+{t(user_id, 'profile_upload_tdata')}
+
+<b>{t(user_id, 'profile_upload_timeout')}</b>
+
+{t(user_id, 'profile_upload_cancel')}
+        """
+        
+        query.edit_message_text(
+            text=text,
+            parse_mode='HTML',
+            reply_markup=get_back_to_menu_keyboard(user_id)
+        )
+        
+        # 设置用户状态为等待文件上传
+        self.db.save_user(user_id, "", "", "profile_update_upload")
+        task['status'] = 'waiting_file'
+    
+    def cleanup_profile_update_task(self, user_id: int):
+        """清理资料修改任务"""
+        if user_id in self.pending_profile_update:
+            task = self.pending_profile_update[user_id]
+            if task.get('temp_dir') and os.path.exists(task['temp_dir']):
+                shutil.rmtree(task['temp_dir'], ignore_errors=True)
+            del self.pending_profile_update[user_id]
+        
+        # 清除用户状态
+        self.db.save_user(user_id, "", "", "")
+    
+    # ================================
+    # 通讯录限制检测功能
+    # ================================
+    
+    def handle_check_contact_limit(self, query):
+        """处理检查通讯录限制按钮"""
+        query.answer()
+        user_id = query.from_user.id
+        
+        # 检查会员权限
+        if not self.db.is_admin(user_id):
+            is_member, level, expiry = self.db.check_membership(user_id)
+            if not is_member:
+                query.edit_message_text(
+                    text=f"{t(user_id, 'cleanup_need_member')}",
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton(t(user_id, 'btn_vip_menu'), callback_data="vip_menu"),
+                        InlineKeyboardButton(f"🔙 {t(user_id, 'btn_back_to_menu')}", callback_data="back_to_main")
+                    ]]),
+                    parse_mode='HTML'
+                )
+                return
+        
+        text = f"""
+<b>{t(user_id, 'contact_limit_title')}</b>
+
+{t(user_id, 'contact_limit_upload')}
+
+<b>{t(user_id, 'contact_limit_format_title')}</b>
+{t(user_id, 'contact_limit_format_session')}
+{t(user_id, 'contact_limit_format_tdata')}
+
+<b>{t(user_id, 'contact_limit_principle_title')}</b>
+{t(user_id, 'contact_limit_principle1')}
+{t(user_id, 'contact_limit_principle2')}
+{t(user_id, 'contact_limit_principle3')}
+
+<b>{t(user_id, 'contact_limit_wait')}</b>
+
+{t(user_id, 'contact_limit_cancel')}
+        """
+        
+        query.edit_message_text(
+            text=text,
+            parse_mode='HTML',
+            reply_markup=get_back_to_menu_keyboard(user_id)
+        )
+        
+        # 设置用户状态为等待上传
+        self.db.save_user(user_id, query.from_user.username or "", 
+                        query.from_user.first_name or "", "waiting_contact_check_file")
+    
+    async def check_contact_limit(self, client, phone):
+        """检查账号是否被通讯录限制
+        
+        检测逻辑：
+        1. 使用 ImportContactsRequest 导入真实存在的 Telegram 测试号码
+        2. 如果 result.users 有用户 → ✅ 账号正常（能看到联系人）
+        3. 如果 result.users 为空 → ⚠️ 账号受限（无法查看联系人，显示"not on Telegram"）
+        4. 触发 PeerFloodError / FloodWaitError → ⚠️ 受限
+        
+        注意：result.imported 不能作为判断依据，核心只看 result.users 是否为空
+        """
+        # 使用第一个测试号码（多个号码是为了冗余备份，单个号码足够检测）
+        test_phone = TEST_CONTACT_PHONES[0]
+        
+        # 开始检测时记录日志
+        logger.info(f"🔍 开始检测通讯录限制: {phone}")
+        
+        try:
+            # 导入测试联系人时记录日志
+            logger.info(f"📥 正在导入测试联系人: {test_phone}")
+            
+            # 1. 尝试添加测试联系人
+            result = await client(ImportContactsRequest([
+                InputPhoneContact(
+                    client_id=0,
+                    phone=test_phone,
+                    first_name="Test",
+                    last_name="CheckLimit"
+                )
+            ]))
+            
+            # API 调用结果记录日志
+            users_count = len(result.users) if result.users else 0
+            imported_count = len(result.imported) if result.imported else 0
+            logger.info(f"📊 API响应: users={users_count}, imported={imported_count}")
+            logger.info(f"📊 用户详情: {[u.first_name for u in result.users] if result.users else '无'}")
+            
+            # 2. 判断结果 - 核心逻辑：只看 result.users 是否为空
+            if result.users and len(result.users) > 0:
+                # 能找到用户 → 正常（无限制）
+                status = CONTACT_STATUS_NORMAL
+                message = '✅ 通讯录正常，能正常添加联系人'
+                
+                # 3. 清理：删除测试联系人
+                try:
+                    logger.info(f"🧹 清理测试联系人: {test_phone}")
+                    await client(DeleteContactsRequest(id=result.users))
+                except Exception as e:
+                    # 清理失败不影响检测结果，只记录日志
+                    logger.warning(f"清理测试联系人失败: {e}")
+                
+                # 检测结果记录日志
+                logger.info(f"✅ 检测完成 [{phone}]: {status} - {message}")
+                    
+                return {
+                    'status': status,
+                    'message': message,
+                    'phone': phone
+                }
+            else:
+                # 找不到用户（即使测试号码实际存在）→ 通讯录受限
+                status = CONTACT_STATUS_LIMITED
+                message = '⚠️ 通讯录受限，无法查看联系人'
+                logger.info(f"✅ 检测完成 [{phone}]: {status} - {message}")
+                return {
+                    'status': status,
+                    'message': message,
+                    'phone': phone
+                }
+                
+        except (PeerFloodError, FloodWaitError) as e:
+            # 明确的 Flood 错误 → 受限
+            error_type = type(e).__name__
+            logger.error(f"❌ 检测失败 [{phone}]: {error_type} - {str(e)}")
+            logger.debug(f"📋 完整错误堆栈:\n{traceback.format_exc()}")
+            return {
+                'status': CONTACT_STATUS_LIMITED,
+                'message': '⚠️ 通讯录受限 (FloodWait)',
+                'phone': phone
+            }
+        except (UserDeactivatedBanError, UserDeactivatedError, PhoneNumberBannedError) as e:
+            # 账号被封禁
+            error_type = type(e).__name__
+            logger.error(f"❌ 检测失败 [{phone}]: {error_type} - {str(e)}")
+            logger.debug(f"📋 完整错误堆栈:\n{traceback.format_exc()}")
+            return {
+                'status': CONTACT_STATUS_BANNED,
+                'message': '❌ 已封号',
+                'phone': phone
+            }
+        except Exception as e:
+            error_msg = str(e).lower()
+            error_type = type(e).__name__
+            
+            # 记录错误日志
+            logger.error(f"❌ 检测失败 [{phone}]: {error_type} - {str(e)}")
+            logger.debug(f"📋 完整错误堆栈:\n{traceback.format_exc()}")
+            
+            # 通过关键词判断错误类型
+            if 'flood' in error_msg or 'peerflood' in error_msg:
+                return {
+                    'status': CONTACT_STATUS_LIMITED,
+                    'message': '⚠️ 通讯录受限 (FloodWait)',
+                    'phone': phone
+                }
+            elif 'banned' in error_msg or 'deactivated' in error_msg:
+                return {
+                    'status': CONTACT_STATUS_BANNED,
+                    'message': '❌ 已封号',
+                    'phone': phone
+                }
+            else:
+                return {
+                    'status': CONTACT_STATUS_ERROR,
+                    'message': f'❌ 检测失败: {str(e)[:50]}',
+                    'phone': phone
+                }
+    
+    async def safe_check_contact_limit(self, account_path, api_id, api_hash, proxy_info):
+        """安全检测单个账号（带 session 隔离）"""
+        temp_dir = None
+        client = None
+        
+        # 判断是 session 还是 tdata，并提取手机号
+        is_tdata = not account_path.endswith('.session')
+        if is_tdata:
+            phone = extract_phone_from_tdata_path(account_path)
+            account_format = 'tdata'
+        else:
+            phone = extract_phone_from_path(account_path)
+            account_format = 'session'
+        
+        try:
+            # 复制 session 到临时目录避免 database locked
+            temp_dir = tempfile.mkdtemp()
+            temp_session = os.path.join(temp_dir, f"{uuid.uuid4().hex}.session")
+            
+            # 判断是 session 还是 tdata
+            if account_path.endswith('.session'):
+                shutil.copy(account_path, temp_session)
+            else:
+                # TData 先转换为 session
+                if OPENTELE_AVAILABLE:
+                    try:
+                        tdesk = TDesktop(account_path)
+                        temp_session = os.path.join(temp_dir, f"{uuid.uuid4().hex}.session")
+                        client = await tdesk.ToTelethon(session=temp_session, flag=UseCurrentSession)
+                        await client.disconnect()
+                        # Don't set client to None here - will be overwritten in _check_with_timeout()
+                    except Exception as e:
+                        return {
+                            'status': CONTACT_STATUS_ERROR,
+                            'message': f'❌ TData转换失败: {str(e)[:30]}',
+                            'phone': phone,
+                            'path': account_path,
+                            'original_path': account_path,
+                            'format': account_format
+                        }
+                else:
+                    return {
+                        'status': CONTACT_STATUS_ERROR,
+                        'message': '❌ TData转换功能不可用',
+                        'phone': phone,
+                        'path': account_path,
+                        'original_path': account_path,
+                        'format': account_format
+                    }
+            
+            # 转换代理格式为TelegramClient所需格式
+            proxy_dict = None
+            if proxy_info:
+                proxy_dict = self.checker.create_proxy_dict(proxy_info)
+            
+            # 连接并检测 - 添加超时保护
+            async def _check_with_timeout():
+                nonlocal client
+                # 连接并检测
+                client = TelegramClient(
+                    temp_session,
+                    api_id,
+                    api_hash,
+                    proxy=proxy_dict,
+                    timeout=10,
+                    connection_retries=3
+                )
+                
+                await client.connect()
+                
+                if not await client.is_user_authorized():
+                    return {
+                        'status': CONTACT_STATUS_UNAUTHORIZED,
+                        'message': '❌ 未授权/已失效',
+                        'phone': phone,
+                        'path': account_path,
+                        'original_path': account_path,
+                        'format': account_format
+                    }
+                
+                # 检测通讯录限制
+                result = await self.check_contact_limit(client, phone)
+                result['path'] = account_path
+                result['original_path'] = account_path
+                result['format'] = account_format
+                
+                await client.disconnect()
+                
+                return result
+            
+            # 添加单个账号超时保护
+            try:
+                result = await asyncio.wait_for(
+                    _check_with_timeout(),
+                    timeout=SINGLE_ACCOUNT_TIMEOUT
+                )
+                return result
+            except asyncio.TimeoutError:
+                logger.warning(f"⏱️ 账号 {phone} 检测超时（{SINGLE_ACCOUNT_TIMEOUT}秒），跳过")
+                return {
+                    'status': CONTACT_STATUS_ERROR,
+                    'message': f'⏱️ 检测超时（{SINGLE_ACCOUNT_TIMEOUT}秒），已跳过',
+                    'phone': phone,
+                    'path': account_path,
+                    'original_path': account_path,
+                    'format': account_format
+                }
+            
+        except (ConnectionError, TimeoutError, OSError) as e:
+            # 连接错误直接跳过
+            logger.warning(f"⚠️ 连接错误，跳过账号 {phone}: {e}")
+            return {
+                'status': CONTACT_STATUS_ERROR,
+                'message': f'⚠️ 连接错误: {str(e)[:30]}',
+                'phone': phone,
+                'path': account_path,
+                'original_path': account_path,
+                'format': account_format
+            }
+        except Exception as e:
+            logger.error(f"❌ 未知错误，跳过账号 {phone}: {e}")
+            return {
+                'status': CONTACT_STATUS_ERROR,
+                'message': f'❌ 检测失败: {str(e)[:50]}',
+                'phone': phone,
+                'path': account_path,
+                'original_path': account_path,
+                'format': account_format
+            }
+        finally:
+            # 确保清理资源
+            if client:
+                try:
+                    await client.disconnect()
+                except (ConnectionError, AttributeError, RuntimeError) as e:
+                    # 忽略断开连接时的常见错误
+                    logger.debug(f"断开连接失败（可忽略）: {e}")
+                except Exception as e:
+                    # 记录其他意外错误
+                    logger.warning(f"断开连接时发生意外错误: {e}")
+            if temp_dir and os.path.exists(temp_dir):
+                shutil.rmtree(temp_dir, ignore_errors=True)
+    
+    async def batch_check_contact_limit(self, accounts, api_id, api_hash, proxies, user_id, progress_callback=None):
+        """并发检测通讯录限制
+        
+        Args:
+            accounts: 账号列表
+            api_id: API ID
+            api_hash: API Hash
+            proxies: 代理列表
+            user_id: 用户ID（用于翻译）
+            progress_callback: 进度回调函数，接收(current, total, phone, status, message)参数
+        """
+        from itertools import cycle
+        
+        semaphore = asyncio.Semaphore(CONTACT_CHECK_MAX_CONCURRENT)
+        total = len(accounts)
+        completed = [0]  # 使用列表以便在闭包中修改
+        
+        async def check_with_limit(index, account, proxy):
+            async with semaphore:
+                await asyncio.sleep(CONTACT_CHECK_DELAY_BETWEEN)
+                result = await self.safe_check_contact_limit(account, api_id, api_hash, proxy)
+                
+                # 更新进度
+                completed[0] += 1
+                if progress_callback:
+                    phone = result.get('phone', 'unknown')
+                    # 格式化手机号显示（脱敏）
+                    if phone and phone != 'unknown' and len(phone) > 7:
+                        masked_phone = phone[:5] + '****' + phone[-4:]
+                    else:
+                        masked_phone = phone
+                    
+                    status = result.get('status', CONTACT_STATUS_ERROR)
+                    message = result.get('message', '未知')
+                    
+                    # 翻译状态消息
+                    translated_message = self.translate_contact_status_message(user_id, status, message)
+                    
+                    # 根据状态选择图标
+                    icon = '🔍'
+                    if status == CONTACT_STATUS_NORMAL:
+                        icon = '✅'
+                    elif status == CONTACT_STATUS_LIMITED:
+                        icon = '⚠️'
+                    elif status == CONTACT_STATUS_BANNED:
+                        icon = '❌'
+                    elif status == CONTACT_STATUS_ERROR:
+                        icon = '❌'
+                    
+                    try:
+                        await progress_callback(completed[0], total, masked_phone, icon, translated_message)
+                    except Exception as e:
+                        logger.warning(f"进度回调失败: {e}")
+                
+                return result
+        
+        # 分配代理 - 使用 cycle 更节省内存
+        if proxies:
+            proxy_cycle = cycle(proxies)
+            proxy_list = [next(proxy_cycle) for _ in accounts]
+        else:
+            proxy_list = [None] * len(accounts)
+        
+        tasks = [check_with_limit(i, acc, proxy) for i, (acc, proxy) in enumerate(zip(accounts, proxy_list))]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        # 处理异常结果 - 将异常对象转换为错误字典
+        processed_results = []
+        for i, result in enumerate(results):
+            if isinstance(result, Exception):
+                # 如果返回的是异常对象，转换为错误字典
+                account_path = accounts[i] if i < len(accounts) else ''
+                # 判断是 tdata 还是 session
+                is_tdata = not account_path.endswith('.session')
+                if is_tdata:
+                    phone = extract_phone_from_tdata_path(account_path)
+                    account_format = 'tdata'
+                else:
+                    phone = extract_phone_from_path(account_path)
+                    account_format = 'session'
+                
+                processed_results.append({
+                    'status': CONTACT_STATUS_ERROR,
+                    'message': f'❌ 检测异常: {str(result)[:50]}',
+                    'phone': phone,
+                    'path': account_path,
+                    'original_path': account_path,
+                    'format': account_format
+                })
+            else:
+                processed_results.append(result)
+        
+        return processed_results
+    
+    def translate_contact_status_message(self, user_id, status, original_message):
+        """翻译通讯录检测状态消息"""
+        # 根据状态码返回翻译的消息
+        if status == CONTACT_STATUS_NORMAL:
+            return t(user_id, 'contact_limit_status_normal')
+        elif status == CONTACT_STATUS_LIMITED:
+            # 检查是否是FloodWait
+            if 'FloodWait' in original_message or 'flood' in original_message.lower():
+                return t(user_id, 'contact_limit_status_flood_wait')
+            return t(user_id, 'contact_limit_status_limited')
+        elif status == CONTACT_STATUS_BANNED:
+            return t(user_id, 'contact_limit_status_banned')
+        elif status == CONTACT_STATUS_UNAUTHORIZED:
+            return t(user_id, 'contact_limit_status_auth_error')
+        elif status == CONTACT_STATUS_ERROR:
+            # 检查错误类型
+            if '连接错误' in original_message or 'Connection' in original_message:
+                # 提取错误信息
+                error_part = original_message.split(':')[-1].strip() if ':' in original_message else original_message
+                return t(user_id, 'contact_limit_status_connection_error').format(error=error_part[:30])
+            return original_message  # 保留原始错误消息
+        return original_message
+    
+    async def generate_contact_limit_report(self, results, output_dir, user_id):
+        """生成通讯录限制检测报告"""
+        
+        # 翻译所有结果中的status message
+        translated_results = []
+        for r in results:
+            translated_r = r.copy()
+            if 'message' in translated_r:
+                translated_r['message'] = self.translate_contact_status_message(
+                    user_id, 
+                    r.get('status'), 
+                    r.get('message', '')
+                )
+            translated_results.append(translated_r)
+        
+        # 分类统计 - 使用常量
+        normal = [r for r in translated_results if r.get('status') == CONTACT_STATUS_NORMAL]
+        limited = [r for r in translated_results if r.get('status') == CONTACT_STATUS_LIMITED]
+        banned = [r for r in translated_results if r.get('status') == CONTACT_STATUS_BANNED]
+        failed = [r for r in translated_results if r.get('status') in [CONTACT_STATUS_ERROR, CONTACT_STATUS_UNAUTHORIZED]]
+        
+        # 生成报告文本
+        report = f"""
+{t(user_id, 'contact_limit_report_title')}
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+{t(user_id, 'contact_limit_report_time').format(time=datetime.now(BEIJING_TZ).strftime('%Y-%m-%d %H:%M:%S'))}
+{t(user_id, 'contact_limit_report_total').format(count=len(results))}
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+{t(user_id, 'contact_limit_report_principle')}
+{t(user_id, 'contact_limit_report_normal_desc')}
+{t(user_id, 'contact_limit_report_limited_desc')}
+{t(user_id, 'contact_limit_report_banned_desc')}
+{t(user_id, 'contact_limit_report_failed_desc')}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+{t(user_id, 'contact_limit_report_stats')}
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+{t(user_id, 'contact_limit_report_normal_count').format(count=len(normal))}
+{t(user_id, 'contact_limit_report_limited_count').format(count=len(limited))}
+{t(user_id, 'contact_limit_report_banned_count').format(count=len(banned))}
+{t(user_id, 'contact_limit_report_failed_count').format(count=len(failed))}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+{t(user_id, 'contact_limit_report_detail')}
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+{t(user_id, 'contact_limit_report_normal_list')}
+{chr(10).join([f"  • {r['phone']}" for r in normal]) or f"  {t(user_id, 'contact_limit_report_none')}"}
+
+{t(user_id, 'contact_limit_report_limited_list')}
+{chr(10).join([f"  • {r['phone']} - {r.get('message', t(user_id, 'contact_limit_status_limited'))}" for r in limited]) or f"  {t(user_id, 'contact_limit_report_none')}"}
+
+{t(user_id, 'contact_limit_report_banned_list')}
+{chr(10).join([f"  • {r['phone']}" for r in banned]) or f"  {t(user_id, 'contact_limit_report_none')}"}
+
+{t(user_id, 'contact_limit_report_failed_list')}
+{chr(10).join([f"  • {r['phone']} - {r['message']}" for r in failed]) or f"  {t(user_id, 'contact_limit_report_none')}"}
+"""
+        
+        # 保存报告
+        timestamp = datetime.now(BEIJING_TZ).strftime('%Y%m%d_%H%M%S')
+        report_path = os.path.join(output_dir, f'contact_limit_report_{timestamp}.txt')
+        with open(report_path, 'w', encoding='utf-8') as f:
+            f.write(report)
+        
+        return report_path, {
+            'normal': normal,
+            'limited': limited,
+            'banned': banned,
+            'failed': failed
+        }
+    
+    async def pack_contact_limit_results(self, results_dict, output_dir, user_id):
+        """分类打包检测结果 - 每个分类单独一个ZIP，保留原始文件结构"""
+        timestamp = datetime.now(BEIJING_TZ).strftime('%Y%m%d_%H%M%S')
+        zip_files = {}
+        
+        # 文件命名：使用翻译后的名称
+        categories = {
+            'normal': (t(user_id, 'contact_limit_zip_normal'), results_dict['normal']),
+            'limited': (t(user_id, 'contact_limit_zip_limited'), results_dict['limited']),
+            'banned': (t(user_id, 'contact_limit_zip_failed'), results_dict['banned']),  # banned 归类为失败
+            'failed': (t(user_id, 'contact_limit_zip_failed'), results_dict['failed'])
+        }
+        
+        # 合并 banned 和 failed
+        combined_failed = results_dict['banned'] + results_dict['failed']
+        if combined_failed:
+            categories['failed'] = (t(user_id, 'contact_limit_zip_failed'), combined_failed)
+            categories.pop('banned', None)
+        
+        for key, (name, items) in categories.items():
+            if items:
+                count = len(items)
+                zip_path = os.path.join(output_dir, f'{name}-{count}_{timestamp}.zip')
+                
+                with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+                    added_paths = set()
+                    
+                    for item in items:
+                        original_path = item.get('original_path') or item.get('path')
+                        if original_path and os.path.exists(original_path):
+                            phone = item.get('phone', 'unknown')
+                            account_format = item.get('format', 'session')
+                            
+                            if account_format == 'tdata':
+                                # TData 格式：保留原始文件夹结构
+                                # 原始结构: +8613812345678/tdata/D877F783D5D3EF8C/...
+                                # 需要找到包含手机号的根目录
+                                
+                                # 从路径中找到以 + 或纯数字开头的目录作为根目录
+                                path_parts = original_path.replace('\\', '/').split('/')
+                                base_folder = None
+                                
+                                # 查找手机号目录
+                                for i, part in enumerate(path_parts):
+                                    if part.startswith('+') or (part.isdigit() and len(part) >= 10):
+                                        # 找到手机号目录，构建到这个目录的完整路径
+                                        base_folder = '/'.join(path_parts[:i+1])
+                                        break
+                                
+                                # 如果没找到手机号目录，使用 tdata 的父目录
+                                if not base_folder:
+                                    # 查找 tdata 目录
+                                    for i, part in enumerate(path_parts):
+                                        if part.lower() == 'tdata':
+                                            # 使用 tdata 的父目录
+                                            base_folder = '/'.join(path_parts[:i])
+                                            break
+                                
+                                # 如果还是没找到，使用 original_path 的父目录
+                                if not base_folder:
+                                    base_folder = os.path.dirname(original_path)
+                                
+                                # 遍历整个目录树并保留原始结构
+                                if os.path.isdir(base_folder):
+                                    for root, dirs, files in os.walk(base_folder):
+                                        for file in files:
+                                            file_path = os.path.join(root, file)
+                                            # 计算相对于 base_folder 父目录的路径，这样会包含手机号文件夹
+                                            rel_path = os.path.relpath(file_path, os.path.dirname(base_folder))
+                                            
+                                            if rel_path not in added_paths:
+                                                added_paths.add(rel_path)
+                                                zf.write(file_path, rel_path)
+                                                logger.debug(f"添加TData文件到ZIP: {rel_path}")
+                                else:
+                                    logger.warning(f"TData目录不存在: {base_folder}")
+                            else:
+                                # Session 格式：直接添加 session 文件（不带手机号子文件夹）
+                                session_basename = os.path.basename(original_path)
+                                if session_basename not in added_paths:
+                                    added_paths.add(session_basename)
+                                    zf.write(original_path, session_basename)
+                                    logger.debug(f"添加Session文件到ZIP: {session_basename}")
+                                
+                                # 同时添加 journal 文件（如果存在）
+                                journal_path = original_path + '-journal'
+                                if os.path.exists(journal_path):
+                                    journal_basename = session_basename + '-journal'
+                                    if journal_basename not in added_paths:
+                                        added_paths.add(journal_basename)
+                                        zf.write(journal_path, journal_basename)
+                                        logger.debug(f"添加Journal文件到ZIP: {journal_basename}")
+                
+                logger.info(f"✅ 创建ZIP文件: {os.path.basename(zip_path)}，共 {len(added_paths)} 个文件")
+                zip_files[key] = zip_path
+        
+        return zip_files
+    
+    async def process_contact_limit_check(self, update, context, document):
+        """处理通讯录限制检测"""
+        user_id = update.effective_user.id
+        start_time = time.time()
+        
+        progress_msg = self.safe_send_message(update, t(user_id, 'processing_your_file'), 'HTML')
+        if not progress_msg:
+            return
+        
+        temp_zip = None
+        temp_dir = None
+        
+        # 下载文件
+        try:
+            temp_dir = tempfile.mkdtemp(prefix="temp_contact_check_")
+            temp_zip = os.path.join(temp_dir, document.file_name)
+            document.get_file().download(temp_zip)
+        except Exception as e:
+            self.safe_edit_message_text(progress_msg, f"❌ 文件下载失败: {e}")
+            if temp_dir and os.path.exists(temp_dir):
+                shutil.rmtree(temp_dir, ignore_errors=True)
+            return
+        
+        # 解压文件
+        extract_dir = tempfile.mkdtemp()
+        try:
+            with zipfile.ZipFile(temp_zip, 'r') as zip_ref:
+                zip_ref.extractall(extract_dir)
+        except Exception as e:
+            self.safe_edit_message_text(progress_msg, f"❌ 文件解压失败: {e}")
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            shutil.rmtree(extract_dir, ignore_errors=True)
+            return
+        finally:
+            if temp_dir and os.path.exists(temp_dir):
+                shutil.rmtree(temp_dir, ignore_errors=True)
+        
+        # 扫描账号文件 - 使用统一的扫描逻辑
+        logger.info(f"📊 开始扫描账号文件...")
+        
+        # 先扫描 session 文件
+        session_accounts = []
+        for root, dirs, files in os.walk(extract_dir):
+            for file in files:
+                if file.endswith('.session') and not file.endswith('.session-journal'):
+                    # 过滤系统文件
+                    if file == 'tdata.session' or file.startswith('batch_validate_') or file.startswith('temp_') or file.startswith('user_'):
+                        continue
+                    session_accounts.append(os.path.join(root, file))
+        
+        # 使用统一的 tdata 扫描函数
+        tdata_accounts = scan_tdata_accounts(extract_dir)
+        
+        # 合并账号列表
+        accounts = []
+        
+        # 添加 session 账号
+        for session_path in session_accounts:
+            accounts.append(session_path)
+        
+        # 添加 tdata 账号（使用 tdata_path）
+        for tdata_account in tdata_accounts:
+            accounts.append(tdata_account['tdata_path'])
+        
+        if not accounts:
+            self.safe_edit_message_text(progress_msg, "❌ 未找到有效的账号文件")
+            shutil.rmtree(extract_dir, ignore_errors=True)
+            return
+        
+        # 构建账号字典列表用于去重
+        logger.info(f"📊 扫描到 {len(accounts)} 个账号文件，开始去重...")
+        account_list = []
+        
+        # 添加 session 账号到列表
+        for session_path in session_accounts:
+            phone = extract_phone_from_path(session_path)
+            account_list.append({
+                'phone': phone,
+                'session_path': session_path,
+                'original_path': session_path,
+                'format': 'session'
+            })
+        
+        # 添加 tdata 账号到列表
+        for tdata_account in tdata_accounts:
+            phone = tdata_account['phone']
+            account_list.append({
+                'phone': phone,
+                'session_path': tdata_account['tdata_path'],
+                'original_path': tdata_account['tdata_path'],
+                'format': 'tdata'
+            })
+        
+        # 去重：按手机号去重
+        unique_accounts = deduplicate_accounts_by_phone(account_list)
+        logger.info(f"✅ 去重完成：原始 {len(account_list)} 个，去重后 {len(unique_accounts)} 个")
+        
+        # 提取去重后的路径列表用于检测
+        deduplicated_paths = [acc['original_path'] for acc in unique_accounts]
+        
+        # 更新进度
+        user_id = update.effective_user.id
+        # 计算预计时间
+        estimated_minutes = len(deduplicated_paths) * 2 // 60 + 1
+        time_unit = t(user_id, 'contact_limit_minute')
+        
+        self.safe_edit_message_text(
+            progress_msg,
+            f"{t(user_id, 'contact_limit_found').format(total=len(accounts), unique=len(deduplicated_paths))}\n\n"
+            f"{t(user_id, 'contact_limit_estimate').format(time=f'{estimated_minutes} {time_unit}')}",
+            'HTML'
+        )
+        
+        # 获取API凭证
+        api_id = config.API_ID
+        api_hash = config.API_HASH
+        
+        # 获取代理列表（proxies已经是解析好的字典列表）
+        proxies = []
+        if config.USE_PROXY and self.proxy_manager.proxies:
+            proxies = self.proxy_manager.proxies
+        
+        # 定义进度回调函数
+        last_update_time = [time.time()]  # 使用列表以便在闭包中修改
+        
+        async def progress_callback(current, total, phone, icon, message):
+            """更新进度显示 - 限制更新频率避免被Telegram限流"""
+            # 限制更新频率，避免被Telegram限流
+            now = time.time()
+            if now - last_update_time[0] < UPDATE_INTERVAL:  # 使用配置的更新间隔
+                return
+            last_update_time[0] = now
+            
+            elapsed_seconds = int(now - start_time)
+            progress_text = f"""
+<b>{t(user_id, 'contact_limit_progress').format(current=current, total=total)}</b>
+
+{icon} <b>{t(user_id, 'contact_limit_current')}</b> {phone}
+<b>{t(user_id, 'contact_limit_status')}</b> {message}
+
+<b>{t(user_id, 'contact_limit_stats')}</b>
+{t(user_id, 'contact_limit_completed')} {current}
+{t(user_id, 'contact_limit_remaining')} {total - current}
+{t(user_id, 'contact_limit_percent')} {current * 100 // total}%
+
+{t(user_id, 'contact_limit_elapsed')} {elapsed_seconds}{t(user_id, 'contact_limit_second')}
+"""
+            
+            try:
+                self.safe_edit_message_text(
+                    progress_msg,
+                    progress_text,
+                    'HTML'
+                )
+            except Exception as e:
+                # 忽略编辑消息失败的错误（可能是因为内容未改变或FloodWait）
+                logger.debug(f"更新进度显示失败: {e}")
+        
+        # 并发检测 - 添加整体超时保护
+        try:
+            results = await asyncio.wait_for(
+                self.batch_check_contact_limit(
+                    deduplicated_paths, api_id, api_hash, proxies, user_id, progress_callback
+                ),
+                timeout=BATCH_TIMEOUT
+            )
+        except asyncio.TimeoutError:
+            logger.error(f"⏱️ 批量检测超时（{BATCH_TIMEOUT // 60}分钟），强制结束")
+            self.safe_edit_message_text(
+                progress_msg,
+                f"⚠️ <b>检测超时（{BATCH_TIMEOUT // 60}分钟），强制结束</b>\n\n"
+                f"已完成部分结果将发送...",
+                'HTML'
+            )
+            # 创建空结果列表，确保后续代码能继续执行
+            results = []
+        except Exception as e:
+            logger.error(f"❌ 检测失败: {e}")
+            self.safe_edit_message_text(progress_msg, f"❌ 检测失败: {e}")
+            shutil.rmtree(extract_dir, ignore_errors=True)
+            return
+        
+        # 生成报告 - 确保无论如何都发送结果文件
+        output_dir = tempfile.mkdtemp()
+        try:
+            report_path, results_dict = await self.generate_contact_limit_report(results, output_dir, user_id)
+            
+            # 发送报告文件
+            with open(report_path, 'rb') as f:
+                context.bot.send_document(
+                    chat_id=update.effective_chat.id,
+                    document=f,
+                    filename=os.path.basename(report_path),
+                    caption=f"{t(user_id, 'contact_limit_report_file')}\n\n"
+                           f"{t(user_id, 'contact_limit_normal').format(count=len(results_dict['normal']))}\n"
+                           f"{t(user_id, 'contact_limit_limited').format(count=len(results_dict['limited']))}\n"
+                           f"{t(user_id, 'contact_limit_banned').format(count=len(results_dict['banned']))}\n"
+                           f"{t(user_id, 'contact_limit_failed').format(count=len(results_dict['failed']))}"
+                )
+            
+            # 打包分类结果
+            zip_files = await self.pack_contact_limit_results(results_dict, output_dir, user_id)
+            
+            # 发送分类打包文件
+            for key, zip_path in zip_files.items():
+                if os.path.exists(zip_path):
+                    with open(zip_path, 'rb') as f:
+                        context.bot.send_document(
+                            chat_id=update.effective_chat.id,
+                            document=f,
+                            filename=os.path.basename(zip_path),
+                            caption=f"📦 {os.path.basename(zip_path)}"
+                        )
+            
+            # 完成提示
+            elapsed = time.time() - start_time
+            self.safe_edit_message_text(
+                progress_msg,
+                f"{t(user_id, 'contact_limit_complete')}\n\n"
+                f"{t(user_id, 'contact_limit_time').format(time=f'{elapsed:.1f}')}\n"
+                f"{t(user_id, 'contact_limit_report_sent')}",
+                'HTML'
+            )
+            
+        except Exception as e:
+            self.safe_edit_message_text(progress_msg, f"❌ 报告生成失败: {e}")
+        finally:
+            shutil.rmtree(extract_dir, ignore_errors=True)
+            shutil.rmtree(output_dir, ignore_errors=True)
+    
+    def _generate_registration_report(self, context: CallbackContext, user_id: int, results: Dict, progress_msg):
+        """生成注册时间查询报告和打包结果（按年-月-日分类）"""
+        logger.info("📊 开始生成报告和打包结果...")
+        print("📊 开始生成报告和打包结果...", flush=True)
+        
+        timestamp = datetime.now(BEIJING_TZ).strftime("%Y%m%d_%H%M%S")
+        
+        # 统计
+        total = sum(len(v) for v in results.values())
+        success_count = len(results['success'])
+        error_count = len(results['error']) + len(results['frozen']) + len(results['banned'])
+        
+        # 按年-月-日（完整日期）分类
+        by_date = {}
+        for file_path, file_name, result in results['success']:
+            reg_date = result.get('registration_date', '未知')
+            if reg_date not in by_date:
+                by_date[reg_date] = []
+            by_date[reg_date].append((file_path, file_name, result))
+        
+        # 生成文本报告
+        report_filename = f"registration_report_{timestamp}.txt"
+        report_path = os.path.join(config.RESULTS_DIR, report_filename)
+        
+        try:
+            with open(report_path, 'w', encoding='utf-8') as f:
+                f.write("=" * 80 + "\n")
+                f.write(f"{t(user_id, 'regtime_report_title')}\n")
+                f.write("=" * 80 + "\n")
+                f.write(f"{t(user_id, 'regtime_report_time')} {datetime.now(BEIJING_TZ).strftime('%Y-%m-%d %H:%M:%S CST')}\n")
+                f.write(f"{t(user_id, 'regtime_report_total')} {total}\n")
+                f.write(f"{t(user_id, 'regtime_report_success')} {success_count}\n")
+                f.write(f"{t(user_id, 'regtime_report_failed')} {error_count}\n")
+                f.write("=" * 80 + "\n\n")
+                
+                # 按日期统计（排序）
+                f.write(f"{t(user_id, 'regtime_report_classify')}\n")
+                f.write("-" * 80 + "\n")
+                f.write(f"{t(user_id, 'regtime_source_title')}\n")
+                f.write(f"{t(user_id, 'regtime_source_api')}\n")
+                f.write(f"{t(user_id, 'regtime_source_all_chats')}\n")
+                f.write(f"{t(user_id, 'regtime_source_telegram')}\n")
+                f.write(f"{t(user_id, 'regtime_source_saved')}\n")
+                f.write(f"{t(user_id, 'regtime_source_estimated')}\n")
+                f.write("-" * 80 + "\n\n")
+                
+                for reg_date in sorted(by_date.keys()):
+                    f.write(f"\n{t(user_id, 'regtime_date_header').format(date=reg_date, count=len(by_date[reg_date]))}\n")
+                    f.write("-" * 40 + "\n")
+                    for file_path, file_name, result in by_date[reg_date]:
+                        f.write(f"{t(user_id, 'regtime_field_file')} {file_name}\n")
+                        f.write(f"{t(user_id, 'regtime_field_phone')} {result['phone']}\n")
+                        f.write(f"{t(user_id, 'regtime_field_userid')} {result['user_id']}\n")
+                        if result.get('username'):
+                            f.write(f"{t(user_id, 'regtime_field_username')} @{result['username']}\n")
+                        f.write(f"{t(user_id, 'regtime_field_name')} {result['first_name']} {result['last_name']}\n")
+                        f.write(f"{t(user_id, 'regtime_field_common_groups')} {result['common_chats']}\n")
+                        
+                        # 显示数据来源，区分官方数据和估算数据
+                        source = result.get('registration_source', 'estimated')
+                        if source in ['telegram_api', 'full_user_api']:
+                            # 官方API数据 - 最准确
+                            source_display = t(user_id, 'regtime_source_api').replace('• telegram_api / full_user_api: ', '')
+                            f.write(f"{t(user_id, 'regtime_field_source')} {source_display}\n")
+                        elif source == 'all_chats':
+                            # 从所有对话扫描获取
+                            source_display = t(user_id, 'regtime_source_all_chats').replace('• all_chats: ', '')
+                            f.write(f"{t(user_id, 'regtime_field_source')} {source_display}\n")
+                        elif source == 'telegram_chat':
+                            # 从Telegram官方对话获取
+                            source_display = t(user_id, 'regtime_source_telegram').replace('• telegram_chat: ', '')
+                            f.write(f"{t(user_id, 'regtime_field_source')} {source_display}\n")
+                        elif source == 'saved_messages':
+                            # 从收藏夹获取
+                            source_display = t(user_id, 'regtime_source_saved').replace('• saved_messages: ', '')
+                            f.write(f"{t(user_id, 'regtime_field_source')} {source_display}\n")
+                        else:
+                            # ID估算 - 不准确，添加警告
+                            source_display = t(user_id, 'regtime_source_estimated').replace('• estimated: ', '')
+                            f.write(f"{t(user_id, 'regtime_field_source')} {source_display}\n")
+                        f.write("\n")
+                
+                # 失败的账号
+                if error_count > 0:
+                    f.write(f"\n{t(user_id, 'regtime_failed_accounts')}\n")
+                    f.write("-" * 80 + "\n")
+                    for category in ['error', 'frozen', 'banned']:
+                        if results[category]:
+                            f.write(f"\n{t(user_id, 'regtime_error_label')} {category.upper()}:\n")
+                            for file_path, file_name, result in results[category]:
+                                f.write(f"{t(user_id, 'regtime_field_file')} {file_name}\n")
+                                f.write(f"{t(user_id, 'regtime_error_field')} {result.get('error', '未知错误')}\n\n")
+            
+            logger.info(f"✅ 报告文件已生成: {report_path}")
+            print(f"✅ 报告文件已生成: {report_path}", flush=True)
+        except Exception as e:
+            logger.error(f"❌ 生成报告文件失败: {e}")
+            print(f"❌ 生成报告文件失败: {e}", flush=True)
+        
+        # 按日期打包成功的账号 - 统一打包到一个ZIP文件中
+        logger.info(f"📦 开始打包所有账号到单个ZIP文件...")
+        print(f"📦 开始打包所有账号到单个ZIP文件...", flush=True)
+        
+        # 创建一个统一的ZIP文件
+        all_accounts_zip = os.path.join(config.RESULTS_DIR, f"registration_all_{timestamp}.zip")
+        
+        try:
+            with zipfile.ZipFile(all_accounts_zip, 'w', zipfile.ZIP_DEFLATED) as zipf:
+                # 遍历每个日期
+                for reg_date, items in sorted(by_date.items()):
+                    if items:
+                        logger.info(f"📦 打包 {reg_date} 的 {len(items)} 个账号...")
+                        print(f"📦 打包 {reg_date} 的 {len(items)} 个账号...", flush=True)
+                        
+                        # 创建日期文件夹名称：如 "2025-09-26 注册的账号 (16 个)"
+                        date_folder = t(user_id, 'regtime_folder_name').format(date=reg_date, count=len(items))
+                        
+                        for file_path, file_name, result in items:
+                            phone = result.get('phone', 'unknown')
+                            result_file_type = result.get('file_type', 'session')
+                            # 使用原始文件路径进行打包
+                            original_path = result.get('original_file_path', file_path)
+                            
+                            try:
+                                if result_file_type == 'tdata':
+                                    # TData格式：使用原始上传的文件，保持原始文件结构
+                                    # 结构: ZIP/日期文件夹/手机号/tdata/D877.../文件
+                                    if os.path.isdir(original_path):
+                                        # 我们需要找到包含tdata结构的正确父目录
+                                        # original_path 可能是以下几种情况：
+                                        # 1. /path/to/phone/tdata/D877... (最常见)
+                                        # 2. /path/to/phone/D877... (无tdata包装)
+                                        # 3. /path/to/tdata/D877... (tdata在根)
+                                        # 4. /path/to/D877... (直接D877)
+                                        
+                                        # 向上查找以确定结构
+                                        tdata_parent = None
+                                        current = original_path
+                                        
+                                        # 最多向上查找3层
+                                        for _ in range(3):
+                                            parent = os.path.dirname(current)
+                                            parent_name = os.path.basename(parent)
+                                            current_name = os.path.basename(current)
+                                            
+                                            # 检查是否找到tdata目录
+                                            if current_name.lower() == 'tdata':
+                                                # 找到tdata目录，使用其父目录作为基准
+                                                tdata_parent = parent
+                                                break
+                                            
+                                            # 检查当前目录的父目录是否是tdata
+                                            if parent_name.lower() == 'tdata':
+                                                # 当前是D877，父目录是tdata
+                                                # 使用tdata的父目录作为基准
+                                                tdata_parent = os.path.dirname(parent)
+                                                break
+                                            
+                                            current = parent
+                                        
+                                        # 如果没有找到tdata结构，使用original_path的父目录
+                                        if not tdata_parent:
+                                            # 没有tdata包装，从D877的父目录开始
+                                            # 结构变成: ZIP/日期文件夹/手机号/D877.../文件
+                                            tdata_parent = os.path.dirname(original_path)
+                                        
+                                        # 遍历所有文件并保持相对结构
+                                        for root, dirs, files in os.walk(original_path):
+                                            for file in files:
+                                                file_full_path = os.path.join(root, file)
+                                                # 计算相对于tdata_parent的路径
+                                                try:
+                                                    rel_path = os.path.relpath(file_full_path, tdata_parent)
+                                                except ValueError:
+                                                    # 如果路径在不同驱动器，使用从original_path开始的相对路径
+                                                    rel_path = os.path.relpath(file_full_path, os.path.dirname(original_path))
+                                                
+                                                # 构建压缩包内的路径：日期文件夹/手机号/rel_path
+                                                # rel_path 现在应该包含 tdata/D877... 或 D877... 结构
+                                                arc_path = os.path.join(date_folder, phone, rel_path)
+                                                zipf.write(file_full_path, arc_path)
+                                else:
+                                    # Session格式：使用原始上传的文件
+                                    # 结构: ZIP/日期文件夹/session文件和json文件（不用手机号子文件夹）
+                                    if os.path.exists(original_path):
+                                        # 直接将session文件放在日期文件夹下
+                                        arc_path = os.path.join(date_folder, file_name)
+                                        zipf.write(original_path, arc_path)
+                                    
+                                    # Journal文件
+                                    journal_path = original_path + '-journal'
+                                    if os.path.exists(journal_path):
+                                        arc_path = os.path.join(date_folder, file_name + '-journal')
+                                        zipf.write(journal_path, arc_path)
+                                    
+                                    # JSON文件
+                                    json_path = os.path.splitext(original_path)[0] + '.json'
+                                    if os.path.exists(json_path):
+                                        json_name = os.path.splitext(file_name)[0] + '.json'
+                                        arc_path = os.path.join(date_folder, json_name)
+                                        zipf.write(json_path, arc_path)
+                            except Exception as e:
+                                logger.error(f"❌ 打包文件失败 {file_name}: {e}")
+                                print(f"❌ 打包文件失败 {file_name}: {e}", flush=True)
+            
+            logger.info(f"✅ 所有账号已打包到: {all_accounts_zip}")
+            print(f"✅ 所有账号已打包到: {all_accounts_zip}", flush=True)
+            
+            # 准备发送的ZIP文件信息
+            zip_files = [("all", all_accounts_zip, success_count)]
+            
+        except Exception as e:
+            logger.error(f"❌ 打包失败: {e}")
+            print(f"❌ 打包失败: {e}", flush=True)
+            zip_files = []
+        
+        # 打包失败的账号到单独的ZIP文件
+        if error_count > 0:
+            logger.info(f"📦 开始打包失败的账号...")
+            print(f"📦 开始打包失败的账号...", flush=True)
+            
+            failed_zip = os.path.join(config.RESULTS_DIR, f"{t(user_id, 'regtime_fail_zip_name')}_{timestamp}.zip")
+            failed_details = []
+            
+            try:
+                with zipfile.ZipFile(failed_zip, 'w', zipfile.ZIP_DEFLATED) as zipf:
+                    # 创建详细失败原因文件
+                    for category in ['frozen', 'banned', 'error']:
+                        if results[category]:
+                            for file_path, file_name, result in results[category]:
+                                error_msg = result.get('error', '未知错误')
+                                result_file_type = result.get('file_type', 'session')
+                                # 使用原始文件路径（与成功账号相同）
+                                original_path = result.get('original_file_path', file_path)
+                                
+                                # 记录失败信息
+                                failed_details.append({
+                                    'file_name': file_name,
+                                    'category': category,
+                                    'error': error_msg,
+                                    'file_type': result_file_type
+                                })
+                                
+                                # 打包原始文件
+                                try:
+                                    if result_file_type == 'tdata':
+                                        # TData格式：打包整个目录，保持tdata结构
+                                        if os.path.isdir(original_path):
+                                            # 查找tdata结构的父目录（与成功账号相同的逻辑）
+                                            tdata_parent = None
+                                            current = original_path
+                                            
+                                            for _ in range(3):
+                                                parent = os.path.dirname(current)
+                                                parent_name = os.path.basename(parent)
+                                                current_name = os.path.basename(current)
+                                                
+                                                if current_name.lower() == 'tdata':
+                                                    tdata_parent = parent
+                                                    break
+                                                
+                                                if parent_name.lower() == 'tdata':
+                                                    tdata_parent = os.path.dirname(parent)
+                                                    break
+                                                
+                                                current = parent
+                                            
+                                            if not tdata_parent:
+                                                tdata_parent = os.path.dirname(original_path)
+                                            
+                                            for root, dirs, files in os.walk(original_path):
+                                                for file in files:
+                                                    file_full_path = os.path.join(root, file)
+                                                    try:
+                                                        rel_path = os.path.relpath(file_full_path, tdata_parent)
+                                                    except ValueError:
+                                                        rel_path = os.path.relpath(file_full_path, os.path.dirname(original_path))
+                                                    
+                                                    arc_path = os.path.join(file_name, rel_path)
+                                                    zipf.write(file_full_path, arc_path)
+                                    else:
+                                        # Session格式：打包session及相关文件
+                                        if os.path.exists(original_path):
+                                            zipf.write(original_path, file_name)
+                                        
+                                        # Journal文件
+                                        journal_path = original_path + '-journal'
+                                        if os.path.exists(journal_path):
+                                            zipf.write(journal_path, file_name + '-journal')
+                                        
+                                        # JSON文件
+                                        json_path = os.path.splitext(original_path)[0] + '.json'
+                                        if os.path.exists(json_path):
+                                            json_name = os.path.splitext(file_name)[0] + '.json'
+                                            zipf.write(json_path, json_name)
+                                except Exception as e:
+                                    logger.warning(f"⚠️ 打包失败文件失败 {file_name}: {e}")
+                    
+                    # 创建失败原因详细说明文件
+                    failed_report = f"{t(user_id, 'regtime_fail_report_title')}\n"
+                    failed_report += "=" * 80 + "\n"
+                    failed_report += f"{t(user_id, 'regtime_report_time')} {datetime.now(BEIJING_TZ).strftime('%Y-%m-%d %H:%M:%S CST')}\n"
+                    failed_report += f"{t(user_id, 'regtime_fail_total')} {error_count}\n"
+                    failed_report += "=" * 80 + "\n\n"
+                    
+                    # 按类别分组
+                    category_keys = {
+                        'frozen': 'regtime_fail_frozen',
+                        'banned': 'regtime_fail_banned',
+                        'error': 'regtime_fail_other_errors'
+                    }
+                    
+                    for category in ['frozen', 'banned', 'error']:
+                        category_items = [d for d in failed_details if d['category'] == category]
+                        if category_items:
+                            failed_report += f"\n{t(user_id, category_keys[category]).format(count=len(category_items))}\n"
+                            failed_report += "-" * 80 + "\n"
+                            for item in category_items:
+                                failed_report += f"{t(user_id, 'regtime_field_file')} {item['file_name']}\n"
+                                failed_report += f"{t(user_id, 'regtime_fail_type')} {item['file_type']}\n"
+                                failed_report += f"{t(user_id, 'regtime_fail_reason')} {item['error']}\n"
+                                failed_report += "\n"
+                    
+                    # 将失败原因文件添加到ZIP
+                    zipf.writestr(t(user_id, 'regtime_fail_detail_file'), failed_report.encode('utf-8'))
+                
+                logger.info(f"✅ 失败账号已打包到: {failed_zip}")
+                print(f"✅ 失败账号已打包到: {failed_zip}", flush=True)
+                
+                # 添加到发送列表
+                zip_files.append(("failed", failed_zip, error_count))
+                
+            except Exception as e:
+                logger.error(f"❌ 打包失败账号失败: {e}")
+                print(f"❌ 打包失败账号失败: {e}", flush=True)
+        
+        # 发送统计信息
+        summary = f"""
+{t(user_id, 'regtime_complete')}
+
+<b>{t(user_id, 'regtime_stats_title')}</b>
+{t(user_id, 'regtime_stats_total').format(count=total)}
+{t(user_id, 'regtime_stats_success').format(count=success_count)}
+{t(user_id, 'regtime_stats_failed').format(count=error_count)}
+
+<b>{t(user_id, 'regtime_classify_title')}</b>
+"""
+        # 显示前10个日期的统计
+        sorted_dates = sorted(by_date.keys())
+        for i, reg_date in enumerate(sorted_dates[:10]):
+            summary += t(user_id, 'regtime_classify_item').format(date=reg_date, count=len(by_date[reg_date])) + "\n"
+        
+        if len(sorted_dates) > 10:
+            summary += f"• ... {len(sorted_dates) - 10} more dates\n"
+        
+        summary += f"\n{t(user_id, 'regtime_see_report')}"
+        
+        try:
+            context.bot.edit_message_text(
+                chat_id=user_id,
+                message_id=progress_msg.message_id,
+                text=summary,
+                parse_mode='HTML'
+            )
+            logger.info("✅ 统计信息已更新")
+            print("✅ 统计信息已更新", flush=True)
+        except Exception as e:
+            logger.error(f"❌ 更新统计信息失败: {e}")
+            print(f"❌ 更新统计信息失败: {e}", flush=True)
+        
+        # 发送报告文件
+        if os.path.exists(report_path):
+            logger.info("📤 开始发送报告文件...")
+            print("📤 开始发送报告文件...", flush=True)
+            try:
+                with open(report_path, 'rb') as f:
+                    context.bot.send_document(
+                        chat_id=user_id,
+                        document=f,
+                        filename=report_filename,
+                        caption=t(user_id, 'regtime_file_report'),
+                        timeout=60
+                    )
+                logger.info("✅ 报告文件已发送")
+                print("✅ 报告文件已发送", flush=True)
+            except Exception as e:
+                logger.error(f"❌ 发送报告文件失败: {e}")
+                print(f"❌ 发送报告文件失败: {e}", flush=True)
+        
+        # 发送ZIP文件
+        logger.info(f"📤 准备发送ZIP文件...")
+        print(f"📤 准备发送ZIP文件...", flush=True)
+        
+        sent_count = 0
+        for zip_type, zip_path, count in zip_files:
+            if not os.path.exists(zip_path):
+                logger.warning(f"⚠️ ZIP文件不存在: {zip_path}")
+                print(f"⚠️ ZIP文件不存在: {zip_path}", flush=True)
+                continue
+            
+            logger.info(f"📤 发送ZIP文件: {os.path.basename(zip_path)}")
+            print(f"📤 发送ZIP文件: {os.path.basename(zip_path)}", flush=True)
+            
+            try:
+                # 根据ZIP类型设置不同的标题
+                if zip_type == "failed":
+                    caption = t(user_id, 'regtime_file_failed').format(count=count)
+                else:
+                    caption = t(user_id, 'regtime_file_classified').format(count=count)
+                
+                max_retries = 3
+                for attempt in range(max_retries):
+                    try:
+                        with open(zip_path, 'rb') as f:
+                            context.bot.send_document(
+                                chat_id=user_id,
+                                document=f,
+                                caption=caption,
+                                filename=os.path.basename(zip_path),
+                                timeout=120
+                            )
+                        sent_count += 1
+                        logger.info(f"✅ ZIP文件已发送: {os.path.basename(zip_path)}")
+                        print(f"✅ ZIP文件已发送: {os.path.basename(zip_path)}", flush=True)
+                        break
+                    except RetryAfter as e:
+                        wait_time = e.retry_after + 1
+                        logger.warning(f"⚠️ 被限流，等待 {wait_time} 秒后重试...")
+                        print(f"⚠️ 被限流，等待 {wait_time} 秒后重试...", flush=True)
+                        time.sleep(wait_time)
+                    except Exception as e:
+                        if attempt < max_retries - 1:
+                            logger.warning(f"⚠️ 发送失败，重试 {attempt + 1}/{max_retries}: {e}")
+                            print(f"⚠️ 发送失败，重试 {attempt + 1}/{max_retries}: {e}", flush=True)
+                            time.sleep(2)
+                        else:
+                            logger.error(f"❌ 发送ZIP失败（已重试{max_retries}次）: {e}")
+                            print(f"❌ 发送ZIP失败（已重试{max_retries}次）: {e}", flush=True)
+                
+                if sent_count < len(zip_files):
+                    time.sleep(1)
+                    
+            except Exception as e:
+                logger.error(f"❌ 处理ZIP文件失败: {e}")
+                print(f"❌ 处理ZIP文件失败: {e}", flush=True)
+        
+        logger.info(f"✅ 报告生成完成！成功发送 {sent_count}/{len(zip_files)} 个ZIP文件")
+        print(f"✅ 报告生成完成！成功发送 {sent_count}/{len(zip_files)} 个ZIP文件", flush=True)
+    
+    def run(self):
+        print("🚀 启动增强版机器人（速度优化版）...")
+        print(f"📡 代理模式: {'启用' if config.USE_PROXY else '禁用'}")
+        print(f"🔢 可用代理: {len(self.proxy_manager.proxies)}个")
+        print(f"⚡ 快速模式: {'开启' if config.PROXY_FAST_MODE else '关闭'}")
+        print(f"🚀 并发数: {config.PROXY_CHECK_CONCURRENT if config.PROXY_FAST_MODE else config.MAX_CONCURRENT_CHECKS}个")
+        print(f"⏱️ 检测超时: {config.PROXY_CHECK_TIMEOUT if config.PROXY_FAST_MODE else config.CHECK_TIMEOUT}秒")
+        print(f"🔄 智能重试: {config.PROXY_RETRY_COUNT}次")
+        print(f"🧹 自动清理: {'启用' if config.PROXY_AUTO_CLEANUP else '禁用'}")
+        print("✅ 管理员系统: 启用")
+        print("✅ 速度优化: 预计提升3-5倍")
+        print("🛑 按 Ctrl+C 停止机器人")
+        print("-" * 50)
+        
+        try:
+            self.updater.start_polling()
+            self.updater.idle()
+        except KeyboardInterrupt:
+            print("\n👋 机器人已停止")
+        except Exception as e:
+            print(f"\n❌ 运行错误: {e}")
+
+# ================================
+# 创建示例代理文件
+# ================================
+
+
+def create_sample_proxy_file():
+    """创建示例代理文件"""
+    proxy_file = "proxy.txt"
+    if not os.path.exists(proxy_file):
+        sample_content = """# 代理配置文件示例
+# 支持的格式:
+# HTTP代理: ip:port
+# HTTP认证: ip:port:username:password
+# SOCKS5: socks5:ip:port:username:password
+# SOCKS4: socks4:ip:port
+# ABCProxy住宅代理: host.abcproxy.vip:port:username:password
+
+# 示例（请替换为真实代理）:
+# 1.2.3.4:8080
+# 1.2.3.4:8080:username:password
+# socks5:1.2.3.4:1080:username:password
+# socks4:1.2.3.4:1080
+
+# ABCProxy住宅代理示例:
+# f01a4db3d3952561.abcproxy.vip:4950:FlBaKtPm7l-zone-abc:00937128
+
+# 注意:
+# - 住宅代理（如ABCProxy）会自动检测并使用更长的超时时间（30秒）
+# - 系统会自动优化住宅代理的连接参数
+"""
+        with open(proxy_file, 'w', encoding='utf-8') as f:
+            f.write(sample_content)
+        print(f"✅ 已创建示例代理文件: {proxy_file}")
+
+# ================================
+# Session文件管理系统
+# ================================
+
+def setup_session_directory():
+    """确保sessions目录和sessions/sessions_bak目录存在，并移动任何残留的session文件和JSON文件"""
+    # 获取脚本目录（与Config类使用相同的方式）
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    sessions_dir = os.path.join(script_dir, "sessions")
+    sessions_bak_dir = os.path.join(sessions_dir, "sessions_bak")
+    
+    # 创建sessions目录（用户上传的session文件）和sessions/sessions_bak目录（临时处理文件）
+    if not os.path.exists(sessions_dir):
+        os.makedirs(sessions_dir)
+        print(f"📁 创建sessions目录: {sessions_dir}")
+    
+    if not os.path.exists(sessions_bak_dir):
+        os.makedirs(sessions_bak_dir)
+        print(f"📁 创建sessions/sessions_bak目录: {sessions_bak_dir}")
+    
+    # 移动根目录中的session文件和JSON文件到sessions目录
+    moved_count = 0
+    
+    # 系统必需文件，不移动
+    system_files = ['tdata.session', 'tdata.session-journal']
+    
+    for filename in os.listdir(script_dir):
+        # 检查是否是session文件或journal文件或对应的JSON文件
+        should_move = False
+        
+        if filename.endswith('.session') or filename.endswith('.session-journal'):
+            if filename not in system_files:
+                should_move = True
+        elif filename.endswith('.json'):
+            # 检查是否是账号相关的JSON文件（通常以手机号命名）
+            # 排除配置文件等
+            if filename not in ['package.json', 'config.json', 'settings.json']:
+                # 如果JSON文件名看起来像手机号或账号ID，则移动
+                base_name = filename.replace('.json', '')
+                if base_name.replace('_', '').isdigit() or len(base_name) > 8:
+                    should_move = True
+        
+        if should_move:
+            file_path = os.path.join(script_dir, filename)
+            if os.path.isfile(file_path):
+                new_path = os.path.join(sessions_dir, filename)
+                try:
+                    shutil.move(file_path, new_path)
+                    print(f"📁 移动文件: {filename} -> sessions/")
+                    moved_count += 1
+                except Exception as e:
+                    print(f"⚠️ 移动文件失败 {filename}: {e}")
+    
+    if moved_count > 0:
+        print(f"✅ 已移动 {moved_count} 个文件到sessions目录")
+    
+    return sessions_dir
+
+# ================================
+# 启动脚本
+# ================================
+
+
+
+def run_bot():
+    """Start the bot - extracted from tdata.py main()"""
+    setup_session_directory()
+    create_sample_proxy_file()
+    try:
+        bot = EnhancedBot()
+        bot.run()
+    except KeyboardInterrupt:
+        print("\n\U0001f44b 再见！")
+    except Exception as e:
+        print(f"\n\u274c 启动失败: {e}")

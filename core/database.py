@@ -13,17 +13,9 @@ from core.constants import BEIJING_TZ
 
 logger = logging.getLogger(__name__)
 
-# Lazy import to avoid circular imports
-def _get_config():
-    from core.config import Config
-    return Config()
+from core.config import Config
 
-try:
-    import tdata as _tdata_module
-    config = _tdata_module.config
-except ImportError:
-    from core.config import Config
-    config = Config()
+config = Config()
 
 
 class Database:

@@ -36,17 +36,14 @@ except ImportError:
     TDesktop = None
     OpenTeleClient = None
 
+from core.config import Config
+from services.forget_2fa_manager import Forget2FAManager
 try:
-    import tdata as _tdata_module
-    config = _tdata_module.config
-    t = _tdata_module.t
-    Forget2FAManager = _tdata_module.Forget2FAManager
+    from i18n import get_text as t
 except ImportError:
-    from core.config import Config
-    config = Config()
-    def t(user_id, key, **kwargs):
-        return key
-    Forget2FAManager = None
+    def t(user_id, key, **kwargs): return key
+
+config = Config()
 
 
 class FormatConverter:

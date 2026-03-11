@@ -36,22 +36,11 @@ try:
 except ImportError:
     PROXY_SUPPORT = False
 
-try:
-    import tdata as _tdata_module
-    config = _tdata_module.config
-    ProxyManager = _tdata_module.ProxyManager
-    ProxyUsageRecord = _tdata_module.ProxyUsageRecord
-    TDesktop = _tdata_module.TDesktop if hasattr(_tdata_module, 'TDesktop') else None
-    UseCurrentSession = _tdata_module.UseCurrentSession if hasattr(_tdata_module, 'UseCurrentSession') else None
-    API = _tdata_module.API if hasattr(_tdata_module, 'API') else None
-    OPENTELE_AVAILABLE = _tdata_module.OPENTELE_AVAILABLE
-except ImportError:
-    from core.config import Config
-    config = Config()
-    OPENTELE_AVAILABLE = False
-    TDesktop = None
-    UseCurrentSession = None
-    API = None
+from core.config import Config
+from managers.proxy_manager import ProxyManager
+from models.dataclasses import ProxyUsageRecord
+
+config = Config()
 
 
 class SpamBotChecker:

@@ -39,20 +39,16 @@ except ImportError:
     UseCurrentSession = None
     TDesktop = None
 
+from core.config import Config
+from managers.proxy_manager import ProxyManager
+from testers.proxy_tester import ProxyRotator
+from utils.helpers import utc_to_beijing
 try:
-    import tdata as _tdata_module
-    config = _tdata_module.config
-    t = _tdata_module.t
-    ProxyManager = _tdata_module.ProxyManager
-    ProxyRotator = _tdata_module.ProxyRotator
-    utc_to_beijing = _tdata_module.utc_to_beijing
+    from i18n import get_text as t
 except ImportError:
-    from core.config import Config
-    config = Config()
     def t(user_id, key, **kwargs): return key
-    ProxyManager = None
-    ProxyRotator = None
-    def utc_to_beijing(dt): return str(dt)
+
+config = Config()
 
 class Forget2FAManager:
     """忘记2FA管理器 - 官方密码重置流程（高速+防封混合模式）"""

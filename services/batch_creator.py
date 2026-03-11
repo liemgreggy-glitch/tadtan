@@ -36,20 +36,14 @@ except ImportError:
     UseCurrentSession = None
     TDesktop = None
 
+from core.config import Config
+from models.dataclasses import BatchAccountInfo, BatchCreationConfig, BatchCreationResult
 try:
-    import tdata as _tdata_module
-    config = _tdata_module.config
-    t = _tdata_module.t
-    BatchAccountInfo = _tdata_module.BatchAccountInfo
-    BatchCreationConfig = _tdata_module.BatchCreationConfig
-    BatchCreationResult = _tdata_module.BatchCreationResult
+    from i18n import get_text as t
 except ImportError:
-    from core.config import Config
-    config = Config()
     def t(user_id, key, **kwargs): return key
-    BatchAccountInfo = None
-    BatchCreationConfig = None
-    BatchCreationResult = None
+
+config = Config()
 
 class BatchCreatorService:
     """批量创建服务"""

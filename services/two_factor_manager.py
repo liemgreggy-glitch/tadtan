@@ -31,19 +31,22 @@ except ImportError:
     PROXY_SUPPORT = False
 
 try:
-    import tdata as _tdata_module
-    config = _tdata_module.config
-    t = _tdata_module.t
-    FormatConverter = _tdata_module.FormatConverter
-    PROGRESS_UPDATE_INTERVAL = _tdata_module.PROGRESS_UPDATE_INTERVAL
-    PROGRESS_UPDATE_MIN_PERCENT = _tdata_module.PROGRESS_UPDATE_MIN_PERCENT
-    PROGRESS_UPDATE_MIN_PERCENT_LARGE = _tdata_module.PROGRESS_UPDATE_MIN_PERCENT_LARGE
-    PROGRESS_LARGE_BATCH_THRESHOLD = _tdata_module.PROGRESS_LARGE_BATCH_THRESHOLD
+    pass  # no-op
 except ImportError:
-    from core.config import Config
-    config = Config()
+    pass
+
+from core.config import Config
+from core.constants import (
+    PROGRESS_UPDATE_INTERVAL, PROGRESS_UPDATE_MIN_PERCENT,
+    PROGRESS_UPDATE_MIN_PERCENT_LARGE, PROGRESS_LARGE_BATCH_THRESHOLD,
+)
+from services.format_converter import FormatConverter
+try:
+    from i18n import get_text as t
+except ImportError:
     def t(user_id, key, **kwargs): return key
-    FormatConverter = None
+
+config = Config()
 
 class TwoFactorManager:
     """二级密码管理器 - 批量修改2FA密码"""

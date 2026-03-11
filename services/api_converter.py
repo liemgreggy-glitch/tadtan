@@ -42,16 +42,11 @@ except ImportError:
     UseCurrentSession = None
     TDesktop = None
 
-try:
-    import tdata as _tdata_module
-    config = _tdata_module.config
-    PasswordDetector = _tdata_module.PasswordDetector
-    _find_available_port = _tdata_module._find_available_port
-except ImportError:
-    from core.config import Config
-    config = Config()
-    PasswordDetector = None
-    def _find_available_port(port): return port
+from core.config import Config
+from detectors.password_detector import PasswordDetector
+from utils.helpers import _find_available_port
+
+config = Config()
 
 class APIFormatConverter:
     def __init__(self, *args, **kwargs):

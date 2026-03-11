@@ -25,6 +25,13 @@ try:
     TELETHON_AVAILABLE = True
 except ImportError:
     TELETHON_AVAILABLE = False
+    TelegramClient = None  # type: ignore
+    functions = None       # type: ignore
+    types = None           # type: ignore
+    class FloodWaitError(Exception): seconds = 0  # type: ignore
+    class RPCError(Exception): pass               # type: ignore
+    class UsernameOccupiedError(Exception): pass  # type: ignore
+    class UsernameInvalidError(Exception): pass   # type: ignore
 
 try:
     from opentele.api import API, UseCurrentSession

@@ -224,11 +224,11 @@ class TwoFactorManager:
             
             if update_success:
                 if has_json:
-                    return True, f"{user_info} | {proxy_used} | {t(user_id, 'report_2fa_success_updated')}"
+                    return True, f"{user_info} | {proxy_used} | {t(None, 'report_2fa_success_updated')}"
                 else:
-                    return True, f"{user_info} | {proxy_used} | {t(user_id, 'report_2fa_success_updated')} {t(user_id, 'status_no_json_found')}"
+                    return True, f"{user_info} | {proxy_used} | {t(None, 'report_2fa_success_updated')} {t(None, 'status_no_json_found')}"
             else:
-                return True, f"{user_info} | {proxy_used} | {t(user_id, 'report_2fa_success_updated')} {t(user_id, 'status_file_update_failed')}"
+                return True, f"{user_info} | {proxy_used} | {t(None, 'report_2fa_success_updated')} {t(None, 'status_file_update_failed')}"
             
         except Exception as e:
             return False, f"{user_info} | {proxy_used} | 手动修改失败: {str(e)[:50]}"

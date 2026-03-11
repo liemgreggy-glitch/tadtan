@@ -1,0 +1,3 @@
+"""
+detectors - Detector classes module
+"""

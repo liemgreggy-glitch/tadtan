@@ -52,7 +52,6 @@ class Config:
         # 新增：对外访问的基础地址，用于生成验证码网页链接
         # 例如: http://45.147.196.113:5000 或 https://your.domain
         self.BASE_URL = os.getenv("BASE_URL", "http://127.0.0.1:5000")
-        ...
         print(f"🌐 验证码网页 BASE_URL: {self.BASE_URL}")
         # 新增速度优化配置
         self.PROXY_CHECK_CONCURRENT = int(os.getenv("PROXY_CHECK_CONCURRENT", "100"))
@@ -103,8 +102,8 @@ class Config:
         self.BATCH_CREATE_MAX_INTERVAL = int(os.getenv("BATCH_CREATE_MAX_INTERVAL", "120"))  # 创建间隔最大秒数
         self.BATCH_CREATE_MAX_FLOOD_WAIT = int(os.getenv("BATCH_CREATE_MAX_FLOOD_WAIT", "60"))  # 最大可接受的flood等待时间（秒）
 
-        # 获取当前脚本目录
-        self.SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+        # 获取项目根目录（core/ 的父目录，等同于原 tdata.py 所在目录）
+        self.SCRIPT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
         # 文件管理配置
         self.RESULTS_DIR = os.getenv("RESULTS_DIR") or os.path.join(self.SCRIPT_DIR, "results")

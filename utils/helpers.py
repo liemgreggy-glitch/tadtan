@@ -423,3 +423,145 @@ def create_zip_with_unique_paths(accounts: List[Tuple[str, str]], output_path: s
     except Exception as e:
         logger.error(f"创建ZIP失败: {e}")
         return False
+
+
+# ================================
+# Helper functions extracted from tdata.py
+# ================================
+
+def normalize_phone(phone: Any, default_country_prefix: str = None) -> str:
+    """
+    规范化电话号码格式，确保返回字符串类型
+    
+    Args:
+        phone: 电话号码（可以是 int、str 或其他类型）
+        default_country_prefix: 默认国家前缀（如 '+62'），如果号码缺少国际前缀则添加
+    
+    Returns:
+        规范化后的电话号码字符串
+    """
+    # 获取默认前缀
+    if default_country_prefix is None:
+        default_country_prefix = getattr(config, 'FORGET2FA_DEFAULT_COUNTRY_PREFIX', '+62')
+    
+    # 处理 None 和空值
+    if phone is None or phone == "":
+        return "unknown"
+    
+    # 转换为字符串
+    phone_str = str(phone).strip()
+    
+    # 移除空白字符
+    phone_str = phone_str.replace(" ", "").replace("-", "").replace("(", "").replace(")", "")
+    
+    # 如果为空或是 "unknown"，直接返回
+    if not phone_str or phone_str.lower() == "unknown":
+        return "unknown"
+    
+    # 如果已经有 + 前缀，直接返回
+    if phone_str.startswith("+"):
+        return phone_str
+    
+    # 如果是纯数字且长度合理（通常手机号10-15位）
+    if phone_str.isdigit() and len(phone_str) >= 10:
+        # 如果数字很长（可能已包含国家代码），直接添加+
+        # 否则使用配置的国家前缀
+        if len(phone_str) >= 11:  # 国际号码通常11-15位
+            return f"+{phone_str}"
+        else:
+            # 短号码可能缺少国家代码，使用配置的前缀
+            # 去除前缀中的+，然后添加
+            prefix = default_country_prefix.lstrip('+')
+            return f"+{prefix}{phone_str}"
+    
+    # 其他情况尝试提取数字
+    digits_only = ''.join(c for c in phone_str if c.isdigit())
+    if digits_only and len(digits_only) >= 10:
+        if len(digits_only) >= 11:
+            return f"+{digits_only}"
+        else:
+            prefix = default_country_prefix.lstrip('+')
+            return f"+{prefix}{digits_only}"
+    
+    # 无法规范化，返回原始字符串
+    return phone_str
+
+def _find_available_port(preferred: int = 8080, max_tries: int = 20) -> Optional[int]:
+    """
+    查找可用端口
+    
+    Args:
+        preferred: 首选端口
+        max_tries: 最多尝试次数
+    
+    Returns:
+        可用端口号，如果找不到则返回 None
+    """
+    import socket
+    
+    for port in range(preferred, preferred + max_tries):
+        sock = None
+        try:
+            # 尝试绑定端口
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(1)
+            # 尝试绑定到端口（而不是连接）
+            sock.bind(('127.0.0.1', port))
+            # 绑定成功，说明端口可用
+            return port
+        except OSError:
+            # 绑定失败（端口被占用），尝试下一个
+            continue
+        except Exception:
+            continue
+        finally:
+            # 确保socket总是被关闭
+            if sock:
+                try:
+                    sock.close()
+                except:
+                    pass
+    
+    return None
+
+# ================================
+# 忘记2FA管理器
+# ================================
+
+class ProxyRotator:
+    """代理轮换器 - 用于2FA重置防封"""
+    def __init__(self, proxies: list):
+        self.proxies = proxies
+        self.index = 0
+        self.lock = None  # 将在异步环境中初始化
+    
+    def get_next_proxy(self):
+        """获取下一个代理，用完后循环复用（线程安全）"""
+        if not self.proxies:
+            return None
+        
+        proxy = self.proxies[self.index]
+        self.index = (self.index + 1) % len(self.proxies)
+        return proxy
+
+
+def utc_to_beijing(utc_time):
+    """将 UTC 时间转换为北京时间 (UTC+8)"""
+    if utc_time is None:
+        return "N/A"
+    
+    # 如果是字符串，先转换为 datetime
+    if isinstance(utc_time, str):
+        utc_time = datetime.fromisoformat(utc_time.replace('Z', '+00:00'))
+    
+    # 如果没有时区信息，假设是 UTC
+    if utc_time.tzinfo is None:
+        utc_time = utc_time.replace(tzinfo=timezone.utc)
+    
+    # 转换为北京时间 (UTC+8)
+    beijing_tz = timezone(timedelta(hours=8))
+    beijing_time = utc_time.astimezone(beijing_tz)
+    
+    return beijing_time.strftime('%Y-%m-%d %H:%M:%S')
+
+

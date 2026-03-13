@@ -1,9 +1,3 @@
-Copilot said: 好的！直接给你完整的 `testers/proxy_tester.py` 文件： ```bash cd /www/sessionbot/sessiontdata cat > testers/proxy_tester.py <<
-好的！直接给你完整的 testers/proxy_tester.py 文件：
-
-bash
-cd /www/sessionbot/sessiontdata
-cat > testers/proxy_tester.py << 'EOF'
 """
 testers.proxy_tester - Proxy testing and rotation module
 """

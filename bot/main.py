@@ -37,7 +37,7 @@ from services.api_converter import APIFormatConverter
 from services.forget_2fa_manager import Forget2FAManager
 from services.batch_creator import BatchCreatorService
 from detectors.password_detector import PasswordDetector
-from models.dataclasses import SessionInfo, ProfileUpdateConfig
+from models.dataclasses import ProfileUpdateConfig
 from utils.helpers import generate_progress_bar, format_time, utc_to_beijing
 
 logger = logging.getLogger(__name__)
@@ -49,6 +49,21 @@ try:
     TELEGRAM_AVAILABLE = True
 except ImportError:
     TELEGRAM_AVAILABLE = False
+    Update = None
+    InlineKeyboardButton = None
+    InlineKeyboardMarkup = None
+    Bot = None
+    InputFile = None
+    Updater = None
+    CommandHandler = None
+    CallbackQueryHandler = None
+    MessageHandler = None
+    Filters = None
+    CallbackContext = None
+    RetryAfter = None
+    TimedOut = None
+    NetworkError = None
+    BadRequest = None
 
 try:
     from telethon import TelegramClient, functions, types
@@ -68,6 +83,33 @@ try:
     TELETHON_AVAILABLE = True
 except ImportError:
     TELETHON_AVAILABLE = False
+    TelegramClient = None
+    functions = None
+    types = None
+    FloodWaitError = None
+    SessionPasswordNeededError = None
+    RPCError = None
+    UserDeactivatedBanError = None
+    UserDeactivatedError = None
+    AuthKeyUnregisteredError = None
+    PhoneNumberBannedError = None
+    UserBannedInChannelError = None
+    UsernameOccupiedError = None
+    UsernameInvalidError = None
+    PeerFloodError = None
+    User = None
+    CodeSettings = None
+    InputPhoneContact = None
+    SendMessageRequest = None
+    GetHistoryRequest = None
+    GetPeerSettingsRequest = None
+    GetPasswordRequest = None
+    GetAuthorizationsRequest = None
+    ResetAuthorizationsRequest = None
+    SendCodeRequest = None
+    GetFullUserRequest = None
+    ImportContactsRequest = None
+    DeleteContactsRequest = None
     class PasswordHashInvalidError(Exception): pass
     class PhoneCodeInvalidError(Exception): pass
     class AuthRestartError(Exception): pass
@@ -79,6 +121,7 @@ try:
     OPENTELE_AVAILABLE = True
 except ImportError:
     OPENTELE_AVAILABLE = False
+    OpenTeleClient = None
     class TDesktop:
         pass
     class UseCurrentSession:

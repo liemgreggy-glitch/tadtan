@@ -26,8 +26,6 @@ except ImportError:
 
 try:
     import tdata as _tdata_module
-    config = _tdata_module.config
-except ImportError:
     from core.config import Config
     config = Config()
 

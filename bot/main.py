@@ -37,6 +37,7 @@ from services.api_converter import APIFormatConverter
 from services.forget_2fa_manager import Forget2FAManager
 from services.batch_creator import BatchCreatorService
 from detectors.password_detector import PasswordDetector
+from models.dataclasses import SessionInfo, ProfileUpdateConfig
 from utils.helpers import generate_progress_bar, format_time, utc_to_beijing
 
 logger = logging.getLogger(__name__)

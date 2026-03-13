@@ -36,10 +36,12 @@ except ImportError:
     pass
 
 from core.config import Config
+from core.database import Database
 from core.constants import (
     PROGRESS_UPDATE_INTERVAL, PROGRESS_UPDATE_MIN_PERCENT,
     PROGRESS_UPDATE_MIN_PERCENT_LARGE, PROGRESS_LARGE_BATCH_THRESHOLD,
 )
+from detectors.password_detector import PasswordDetector
 from services.format_converter import FormatConverter
 try:
     from i18n import get_text as t

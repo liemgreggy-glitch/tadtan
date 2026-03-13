@@ -22,6 +22,7 @@ try:
     TELETHON_AVAILABLE = True
 except ImportError:
     TELETHON_AVAILABLE = False
+    TelegramClient = None
 
 try:
     import socks

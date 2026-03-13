@@ -40,6 +40,7 @@ except ImportError:
     TDesktop = None
 
 from core.config import Config
+from core.database import Database
 from managers.proxy_manager import ProxyManager
 from testers.proxy_tester import ProxyRotator
 from utils.helpers import utc_to_beijing
